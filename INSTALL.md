@@ -13,14 +13,29 @@
 | `gir1.2-gtk-3.0` | Ubuntu 20.04 软件源版本 | GTK 3 图形界面 |
 | `git` | Ubuntu 20.04 软件源版本 | 保存、切换和导出版本 |
 
-联网时可以先在终端执行：
+这些依赖已经写入 `.deb` 安装包的 `Depends` 字段。使用 APT 安装本软件时，系统会自动执行以下流程：
+
+1. 检查 Python 版本以及 `python3-gi`、GTK 3、Git 是否已经安装。
+2. 已经满足要求的软件包不会重复安装。
+3. 缺少的软件包会从 Ubuntu 软件源下载并安装。
+4. 所有依赖满足后再安装“工作空间版本管理”。
+
+不需要提前逐个安装依赖，直接执行：
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-gi gir1.2-gtk-3.0 git
+sudo apt install ./fetch-version-manager_2.4.6_all.deb
 ```
 
-使用 `apt` 安装本软件的 `.deb` 包时，上述依赖通常会由系统自动检查并安装，因此不必重复安装已经存在的软件包。
+自动安装缺失依赖需要电脑能够访问 Ubuntu 软件源。如果电脑离线，必须先准备好缺少的依赖安装包。
+
+不要使用下面的命令进行首次安装：
+
+```bash
+sudo dpkg -i fetch-version-manager_2.4.6_all.deb
+```
+
+`dpkg -i` 只检查依赖，不会联网下载缺少的软件包；`apt install` 才会自动补齐依赖。
 
 ### 可选安装
 
@@ -59,10 +74,10 @@ python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository impo
 进入 `.deb` 文件所在目录后执行：
 
 ```bash
-sudo apt install ./fetch-version-manager_2.4.5_all.deb
+sudo apt install ./fetch-version-manager_2.4.6_all.deb
 ```
 
-使用 `apt install` 可以同时处理系统依赖，建议使用该命令，不要直接双击后忽略依赖错误。
+使用 `apt install` 可以自动检查并安装系统依赖。通过 Ubuntu 图形软件安装器打开 `.deb` 时也会检查依赖，但终端命令能够清楚显示下载和安装过程。
 
 安装完成后，在 Ubuntu 应用菜单中搜索并打开“工作空间版本管理”。也可以在终端执行：
 
@@ -79,7 +94,7 @@ fetch-version-manager
 ```bash
 sudo apt update
 sudo apt --fix-broken install
-sudo apt install ./fetch-version-manager_2.4.5_all.deb
+sudo apt install ./fetch-version-manager_2.4.6_all.deb
 ```
 
 ### 点击对比没有反应

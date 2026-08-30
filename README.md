@@ -24,5 +24,6 @@ sh build_deb.sh
 ```
 
 安装前需要的软件和完整安装步骤请查看 [INSTALL.md](INSTALL.md)。
+使用 `sudo apt install ./fetch-version-manager_2.4.6_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
 
 安装后从应用菜单打开 `工作空间版本管理`。
