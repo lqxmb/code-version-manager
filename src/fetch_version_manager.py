@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -249,16 +250,17 @@ class GitRepository:
             message = self.run(["show", "-s", "--format=%B", commit]).strip()
             sections.append((tag, version_date, normalize_changes(message)))
 
-        marker = "^" * 39
         workspace_name = self.path.name
-        lines = [marker, "", f"Changelog for {workspace_name}", "", marker, ""]
+        title = f"Changelog for {workspace_name}"
+        marker = "^" * max(39, len(title))
+        lines = [marker, title, marker, ""]
         for version, version_date, changes in sections:
             display_version = version[1:] if version.startswith("v") else version
-            heading = f"## {display_version} ({version_date})"
+            heading = f"{display_version} ({version_date})"
             lines.extend(
                 [
                     heading,
-                    "",
+                    "-" * len(heading),
                     *[f"* {change}" for change in changes],
                     "",
                 ]
@@ -385,11 +387,13 @@ class GitRepository:
                 self.materialize(right, right_directory)
             else:
                 self.materialize_current(right_directory)
+            config_home = prepare_bcompare_config(root)
+            environment = os.environ.copy()
+            environment["XDG_CONFIG_HOME"] = str(config_home)
             result = subprocess.run(
                 [
                     "bcompare",
                     "-solo",
-                    "-expandall",
                     "-readonly",
                     "-filters=*",
                     str(left_directory),
@@ -398,6 +402,7 @@ class GitRepository:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=environment,
             )
             if result.returncode not in (0, 1):
                 raise GitError(result.stderr.strip() or "Beyond Compare 启动失败。")
@@ -515,6 +520,56 @@ def validate_top_level_scopes(scopes: Sequence[str]) -> List[str]:
 def reference_folder_name(reference: str, fallback: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", reference).strip("._")
     return cleaned or fallback
+
+
+def prepare_bcompare_config(temporary_root: Path) -> Path:
+    config_home = temporary_root / "config"
+    target = config_home / "bcompare"
+    source_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    source = source_home / "bcompare"
+    if source.is_dir():
+        shutil.copytree(
+            source,
+            target,
+            ignore=shutil.ignore_patterns("BCLOCK_*", "BcCrashReport-*.log"),
+        )
+    else:
+        target.mkdir(parents=True, exist_ok=True)
+
+    sessions_path = target / "BCSessions.xml"
+    try:
+        tree = ET.parse(sessions_path)
+        root = tree.getroot()
+    except (OSError, ET.ParseError):
+        root = ET.Element("BCSessions", Version="1", MinVersion="1")
+        session_folder = ET.SubElement(root, "TSessionFolder")
+        items = ET.SubElement(session_folder, "Items")
+        session = ET.SubElement(items, "TDirCompareSession")
+        ET.SubElement(session, "Rules")
+        tree = ET.ElementTree(root)
+
+    rules_nodes = root.findall(".//TDirCompareSession/Rules")
+    if not rules_nodes:
+        session_folder = root.find("TSessionFolder")
+        if session_folder is None:
+            session_folder = ET.SubElement(root, "TSessionFolder")
+        items = session_folder.find("Items")
+        if items is None:
+            items = ET.SubElement(session_folder, "Items")
+        session = ET.SubElement(items, "TDirCompareSession")
+        rules_nodes = [ET.SubElement(session, "Rules")]
+
+    for rules in rules_nodes:
+        expand_all = rules.find("ExpandAllOnLoad")
+        if expand_all is None:
+            expand_all = ET.SubElement(rules, "ExpandAllOnLoad")
+        expand_all.set("Value", "False")
+        expand_differences = rules.find("ExpandDiffsOnLoad")
+        if expand_differences is not None:
+            expand_differences.set("Value", "False")
+
+    tree.write(sessions_path, encoding="UTF-8", xml_declaration=True)
+    return config_home
 
 
 def ensure_git_identity(repository: GitRepository) -> None:

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 SOURCE = Path(__file__).parents[1] / "src" / "fetch_version_manager.py"
@@ -47,17 +48,28 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("second", self.repository.history()[0].subject)
         manager_changelog = self.path / MODULE.MANAGER_CHANGELOG
         self.assertTrue(manager_changelog.exists())
-        self.assertIn("## 0.0.2 (", manager_changelog.read_text(encoding="utf-8"))
+        self.assertIn("0.0.2 (", manager_changelog.read_text(encoding="utf-8"))
         downloaded_changelog = self.path / "CHANGELOG.rst"
         self.repository.download_changelog(downloaded_changelog)
         changelog_text = downloaded_changelog.read_text(encoding="utf-8")
-        self.assertIn(f"Changelog for {self.path.name}", changelog_text)
-        self.assertIn("## 0.0.2 (", changelog_text)
+        changelog_lines = changelog_text.splitlines()
+        title = f"Changelog for {self.path.name}"
+        marker = "^" * max(39, len(title))
+        self.assertEqual([marker, title, marker, ""], changelog_lines[:4])
+        version_index = next(
+            index for index, line in enumerate(changelog_lines) if line.startswith("0.0.2 (")
+        )
+        self.assertEqual(
+            "-" * len(changelog_lines[version_index]),
+            changelog_lines[version_index + 1],
+        )
+        self.assertEqual("* second", changelog_lines[version_index + 2])
+        self.assertNotIn("##", changelog_text)
         self.assertNotIn("v0.0.2", changelog_text)
         self.assertIn("* second", changelog_text)
         self.assertIn("* 添加相机", changelog_text)
         self.assertIn("* 调整控制器", changelog_text)
-        self.assertIn("## 0.0.1 (", changelog_text)
+        self.assertIn("0.0.1 (", changelog_text)
         archive = self.path / "v0.0.2.zip"
         self.repository.export("v0.0.2", archive)
         with zipfile.ZipFile(archive) as bundle:
@@ -94,6 +106,55 @@ class GitRepositoryTest(unittest.TestCase):
             (left / "other.txt").read_text(encoding="utf-8"),
             (right / "other.txt").read_text(encoding="utf-8"),
         )
+
+    def test_compare_does_not_expand_directories_by_default(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(MODULE.shutil, "which", return_value="/usr/bin/bcompare"), \
+             mock.patch.object(self.repository, "materialize"), \
+             mock.patch.object(self.repository, "materialize_current"), \
+             mock.patch.object(
+                 MODULE, "prepare_bcompare_config", return_value=Path("/tmp/fvm-config")
+             ) as prepare_config, \
+             mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+            self.repository.compare("v0.0.1")
+
+        command = run.call_args.args[0]
+        self.assertEqual("bcompare", command[0])
+        self.assertNotIn("-expandall", command)
+        self.assertIn("-filters=*", command)
+        self.assertEqual("/tmp/fvm-config", run.call_args.kwargs["env"]["XDG_CONFIG_HOME"])
+        prepare_config.assert_called_once()
+
+    def test_bcompare_config_forces_saved_sessions_to_stay_collapsed(self):
+        source_home = self.path / "source-config"
+        source = source_home / "bcompare"
+        source.mkdir(parents=True)
+        sessions = source / "BCSessions.xml"
+        sessions.write_text(
+            """<?xml version="1.0" encoding="UTF-8"?>
+<BCSessions Version="1" MinVersion="1">
+  <TSessionFolder><Items><TDirCompareSession><Rules>
+    <ExpandAllOnLoad Value="True"/>
+    <ExpandDiffsOnLoad Value="True"/>
+  </Rules></TDirCompareSession></Items></TSessionFolder>
+</BCSessions>
+""",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(MODULE.os.environ, {"XDG_CONFIG_HOME": str(source_home)}):
+            config_home = MODULE.prepare_bcompare_config(self.path / "isolated")
+
+        copied = MODULE.ET.parse(config_home / "bcompare" / "BCSessions.xml")
+        self.assertEqual(
+            ["False"],
+            [node.get("Value") for node in copied.findall(".//ExpandAllOnLoad")],
+        )
+        self.assertEqual(
+            ["False"],
+            [node.get("Value") for node in copied.findall(".//ExpandDiffsOnLoad")],
+        )
+        original = MODULE.ET.parse(sessions)
+        self.assertEqual("True", original.find(".//ExpandAllOnLoad").get("Value"))
 
     def test_initialize_unversioned_workspace(self):
         other_root = Path(self.temp.name) / "new-workspace"

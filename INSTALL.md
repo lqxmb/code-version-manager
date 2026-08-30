@@ -59,7 +59,7 @@ python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository impo
 进入 `.deb` 文件所在目录后执行：
 
 ```bash
-sudo apt install ./fetch-version-manager_2.4.2_all.deb
+sudo apt install ./fetch-version-manager_2.4.5_all.deb
 ```
 
 使用 `apt install` 可以同时处理系统依赖，建议使用该命令，不要直接双击后忽略依赖错误。
@@ -79,7 +79,7 @@ fetch-version-manager
 ```bash
 sudo apt update
 sudo apt --fix-broken install
-sudo apt install ./fetch-version-manager_2.4.2_all.deb
+sudo apt install ./fetch-version-manager_2.4.5_all.deb
 ```
 
 ### 点击对比没有反应
