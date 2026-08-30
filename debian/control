@@ -1,5 +1,5 @@
 Package: fetch-version-manager
-Version: 2.4.6
+Version: 2.4.10
 Section: devel
 Priority: optional
 Architecture: all

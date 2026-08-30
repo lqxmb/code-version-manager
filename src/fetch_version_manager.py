@@ -25,7 +25,7 @@ from gi.repository import Gio, GLib, Gtk  # noqa: E402
 APP_ID = "cn.local.FetchVersionManager"
 APP_NAME = "工作空间版本管理"
 DEFAULT_REPOSITORY = Path.home() / "catkin_ws"
-VERSION_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+VERSION_PATTERN = re.compile(r"^v(\d+(?:\.\d+){2,})$")
 MANIFEST_DIRECTORY = ".fetch-version-manager/manifests"
 MANAGER_CHANGELOG = ".fetch-version-manager/CHANGELOG.rst"
 DEFAULT_EXCLUDED_DIRECTORIES = {
@@ -150,6 +150,10 @@ class GitRepository:
             paths.append(path)
         return sorted(set(paths))
 
+    def storage_size(self) -> int:
+        git_directory = self.run(["rev-parse", "--absolute-git-dir"]).strip()
+        return allocated_disk_usage(Path(git_directory)) if git_directory else 0
+
     def candidate_files(self) -> List[str]:
         raw = self.run(["ls-files", "-co", "--exclude-standard", "-z"])
         paths = []
@@ -192,21 +196,31 @@ class GitRepository:
             if len(fields) != 4:
                 continue
             commit, short_commit, date, subject = fields
-            entries.append(
-                HistoryEntry(commit, short_commit, date, subject, tuple(tags.get(commit, [])))
+            commit_tags = tuple(
+                tag for tag in tags.get(commit, []) if VERSION_PATTERN.match(tag)
             )
-        return entries
+            if not commit_tags:
+                continue
+            entries.append(
+                HistoryEntry(commit, short_commit, date, subject, commit_tags)
+            )
+        return sorted(
+            entries,
+            key=lambda entry: max(version_key(tag) for tag in entry.tags),
+            reverse=True,
+        )
 
     def next_version(self) -> str:
         versions = []
         for tag in self.tags():
             match = VERSION_PATTERN.match(tag)
             if match:
-                versions.append(tuple(int(value) for value in match.groups()))
+                versions.append(tuple(int(value) for value in match.group(1).split(".")))
         if not versions:
             return "v0.0.1"
-        major, minor, patch = max(versions)
-        return f"v{major}.{minor}.{patch + 1}"
+        latest = max(versions)
+        next_version = (*latest[:-1], latest[-1] + 1)
+        return "v" + ".".join(str(value) for value in next_version)
 
     def manifest(self, reference: str) -> Optional[List[str]]:
         tag = self._tag_for_reference(reference)
@@ -312,7 +326,7 @@ class GitRepository:
         if self.current_branch() is None:
             raise GitError("当前正在查看历史版本。请先返回 main，再保存新版本。")
         if not VERSION_PATTERN.match(version):
-            raise GitError("版本号格式应为 v0.0.9。")
+            raise GitError("版本号应以 v 开头并至少包含三段数字，例如 v1.7.8.9.7。")
         if version in self.tags():
             raise GitError(f"版本 {version} 已存在。")
         ensure_git_identity(self)
@@ -345,6 +359,13 @@ class GitRepository:
         if "main" not in branches:
             raise GitError("该仓库没有 main 分支。")
         self.run(["switch", "main"])
+
+    def delete_version(self, version: str) -> None:
+        if not VERSION_PATTERN.match(version):
+            raise GitError("只能删除以 v 开头且至少包含三段数字的版本标签。")
+        if version not in self.tags():
+            raise GitError(f"版本 {version} 不存在或已经删除。")
+        self.run(["tag", "--delete", version])
 
     def _archive_bytes(self, reference: str) -> bytes:
         paths = self.manifest(reference)
@@ -420,7 +441,36 @@ class GitRepository:
 
 def version_key(value: str):
     match = VERSION_PATTERN.match(value)
-    return tuple(int(item) for item in match.groups()) if match else (-1, -1, -1)
+    return tuple(int(item) for item in match.group(1).split(".")) if match else (-1,)
+
+
+def allocated_disk_usage(path: Path) -> int:
+    total = 0
+    seen = set()
+    for current, directories, filenames in os.walk(path, followlinks=False):
+        for candidate in [Path(current), *[Path(current) / name for name in directories + filenames]]:
+            try:
+                file_stat = candidate.lstat()
+            except OSError:
+                continue
+            identity = (file_stat.st_dev, file_stat.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            blocks = getattr(file_stat, "st_blocks", None)
+            total += blocks * 512 if blocks is not None else file_stat.st_size
+    return total
+
+
+def format_storage_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    value = float(size)
+    for unit in ("KB", "MB", "GB"):
+        value /= 1024
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+    return f"{value / 1024:.1f} TB"
 
 
 def normalize_changes(message: str) -> List[str]:
@@ -764,6 +814,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             "所选版本与当前", "document-open-recent-symbolic", self.on_compare_current
         )
         self.export_button = self._command_button("下载版本", "document-save-symbolic", self.on_download_version)
+        self.delete_button = self._icon_button(
+            "edit-delete-symbolic", "删除所选版本", self.on_delete_version
+        )
         self.changelog_button = self._command_button(
             "查看 CHANGELOG", "document-properties-symbolic", self.on_view_changelog
         )
@@ -775,6 +828,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.compare_button,
             self.current_button,
             self.export_button,
+            self.delete_button,
             self.changelog_button,
             self.download_changelog_button,
         ):
@@ -789,9 +843,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         footer.get_style_context().add_class("footer")
         self.repo_label = Gtk.Label(xalign=0, ellipsize=3)
+        self.storage_label = Gtk.Label(xalign=1)
+        self.storage_label.set_tooltip_text(
+            "当前工作空间 Git 增量版本历史实际占用的磁盘空间，不包含工作空间源文件"
+        )
         self.status_label = Gtk.Label(xalign=1)
         footer.pack_start(self.repo_label, True, True, 0)
         footer.pack_end(self.status_label, False, False, 0)
+        footer.pack_end(self.storage_label, False, False, 0)
         root.pack_end(footer, False, False, 0)
 
     def _build_history_view(self) -> Gtk.Widget:
@@ -874,9 +933,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.compare_button.set_sensitive(False)
             self.current_button.set_sensitive(False)
             self.export_button.set_sensitive(False)
+            self.delete_button.set_sensitive(False)
             self.changelog_button.set_sensitive(False)
             self.download_changelog_button.set_sensitive(False)
             self.repo_label.set_text(f"{self.workspace_path}  ·  未启用版本管理")
+            self.storage_label.set_text("版本存储 0 B")
             self.status_label.set_text("尚无版本")
             return
         try:
@@ -909,10 +970,15 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 self.save_button.set_sensitive(False)
                 branch_label = f"历史版本 {self.repository.head_label()}"
             self.repo_label.set_text(f"{self.repository.path}  ·  {branch_label}")
+            self.storage_label.set_text(
+                f"版本存储 {format_storage_size(self.repository.storage_size())}"
+            )
             self.status_label.set_text("工作区干净" if not changes else f"{len(changes)} 项修改")
-            self.current_button.set_sensitive(bool(self.history_entries))
-            self.compare_button.set_sensitive(True)
-            self.export_button.set_sensitive(True)
+            has_versions = bool(self.history_entries)
+            self.current_button.set_sensitive(has_versions)
+            self.compare_button.set_sensitive(len(self.history_entries) >= 2)
+            self.export_button.set_sensitive(has_versions)
+            self.delete_button.set_sensitive(has_versions)
             self.changelog_button.set_sensitive(True)
             self.download_changelog_button.set_sensitive(True)
         except GitError as error:
@@ -1122,6 +1188,43 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 lambda: self.repository.export(entry.reference, Path(filename)),
                 f"版本已下载到 {filename}",
             )
+
+    def on_delete_version(self, _button) -> None:
+        if not self.repository:
+            return
+        selected = self.selected_history()
+        if len(selected) != 1:
+            self.show_error("请在版本历史中选择一个需要删除的版本。")
+            return
+        entry = selected[0]
+        versions = [tag for tag in entry.tags if VERSION_PATTERN.match(tag)]
+        if len(versions) != 1:
+            self.show_error("所选记录没有唯一的版本标签，无法删除。")
+            return
+        version = versions[0]
+
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"确定删除版本 {version}？",
+        )
+        dialog.format_secondary_text(
+            "该版本将从版本列表和 CHANGELOG 中移除。Git 提交和工作空间文件不会删除。"
+        )
+        dialog.add_button("取消", Gtk.ResponseType.CANCEL)
+        delete_button = dialog.add_button("删除版本", Gtk.ResponseType.OK)
+        delete_button.get_style_context().add_class("destructive-action")
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        self.run_background(
+            "正在删除版本...",
+            lambda: self.repository.delete_version(version),
+            f"版本 {version} 已删除。",
+        )
 
     def on_view_changelog(self, _button) -> None:
         if not self.repository:

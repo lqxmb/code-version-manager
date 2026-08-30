@@ -3,7 +3,7 @@ set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 package_name=fetch-version-manager
-package_version=2.4.6
+package_version=2.4.10
 stage="$project_dir/build/${package_name}_${package_version}_all"
 output_dir="$project_dir/dist"
 

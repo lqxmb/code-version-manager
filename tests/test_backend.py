@@ -80,10 +80,64 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertTrue((snapshot / "robot.txt").exists())
         self.assertFalse((snapshot / "other.txt").exists())
 
+    def test_storage_size_reports_allocated_git_space(self):
+        initial_size = self.repository.storage_size()
+        git_directory = Path(
+            self.repository.run(["rev-parse", "--absolute-git-dir"]).strip()
+        )
+        (git_directory / "storage-probe.bin").write_bytes(b"x" * (128 * 1024))
+
+        self.assertGreater(initial_size, 0)
+        self.assertGreater(self.repository.storage_size(), initial_size)
+
+    def test_storage_size_format(self):
+        self.assertEqual("0 B", MODULE.format_storage_size(0))
+        self.assertEqual("1.0 KB", MODULE.format_storage_size(1024))
+        self.assertEqual("2.5 MB", MODULE.format_storage_size(5 * 1024 * 1024 // 2))
+
+    def test_multi_part_version_numbers(self):
+        self.git("tag", "v1.7.8.9.7")
+
+        self.assertEqual((1, 7, 8, 9, 7), MODULE.version_key("v1.7.8.9.7"))
+        self.assertEqual("v1.7.8.9.8", self.repository.next_version())
+        self.assertIsNotNone(MODULE.VERSION_PATTERN.match("v1.7.8.5"))
+        self.assertIsNotNone(MODULE.VERSION_PATTERN.match("v1.7.8.9.7"))
+        self.assertIsNone(MODULE.VERSION_PATTERN.match("v1.7"))
+
+    def test_history_is_sorted_by_version_number(self):
+        (self.path / "robot.txt").write_text("two\n", encoding="utf-8")
+        self.git("add", "robot.txt")
+        self.git("commit", "-q", "-m", "higher version")
+        self.git("tag", "v2.0.0")
+        (self.path / "robot.txt").write_text("three\n", encoding="utf-8")
+        self.git("add", "robot.txt")
+        self.git("commit", "-q", "-m", "later commit with lower version")
+        self.git("tag", "v1.0.0")
+
+        displayed_versions = [entry.tags[0] for entry in self.repository.history()]
+        self.assertEqual(["v2.0.0", "v1.0.0", "v0.0.1"], displayed_versions)
+
     def test_detached_head_cannot_save(self):
         self.git("checkout", "-q", "v0.0.1")
         with self.assertRaises(MODULE.GitError):
             self.repository.save_version("v0.0.2", "blocked", ["robot.txt"])
+
+    def test_delete_version_removes_tag_without_rewriting_commit(self):
+        commit = self.repository.run(["rev-parse", "v0.0.1"]).strip()
+        head_before = self.repository.run(["rev-parse", "HEAD"]).strip()
+
+        self.repository.delete_version("v0.0.1")
+
+        self.assertNotIn("v0.0.1", self.repository.tags())
+        self.assertEqual(head_before, self.repository.run(["rev-parse", "HEAD"]).strip())
+        self.assertEqual(commit, self.repository.run(["rev-parse", "HEAD"]).strip())
+        self.assertEqual([], self.repository.history())
+        self.assertTrue((self.path / "robot.txt").exists())
+        self.assertNotIn("0.0.1 (", self.repository.changelog_text())
+
+    def test_delete_version_rejects_unknown_version(self):
+        with self.assertRaises(MODULE.GitError):
+            self.repository.delete_version("v9.9.9")
 
     def test_full_snapshots_include_unchanged_files(self):
         (self.path / "robot.txt").write_text("two\n", encoding="utf-8")
