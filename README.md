@@ -10,7 +10,7 @@
 - 保存版本时自行勾选要封装的文件
 - 查看提交历史和版本标签
 - 使用 Beyond Compare 比较两个完整版本目录
-- 使用 Beyond Compare 比较完整当前工作空间
+- 选择一个历史版本，使用 Beyond Compare 与完整当前工作空间比较
 - 任意选择一个历史版本并下载为 ZIP
 - 查看或下载自动生成的版本管理 `CHANGELOG.rst`
 - CHANGELOG 标题使用工作空间目录名，每行改动自动输出为 `* 内容`
@@ -19,7 +19,9 @@
 构建安装包：
 
 ```bash
-./build_deb.sh
+sh build_deb.sh
 ```
 
-安装后从应用菜单打开 `Fetch Robot 版本管理`。
+安装前需要的软件和完整安装步骤请查看 [INSTALL.md](INSTALL.md)。
+
+安装后从应用菜单打开 `工作空间版本管理`。

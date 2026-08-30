@@ -3,7 +3,7 @@ set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 package_name=fetch-version-manager
-package_version=2.4.0
+package_version=2.4.2
 stage="$project_dir/build/${package_name}_${package_version}_all"
 output_dir="$project_dir/dist"
 
@@ -26,6 +26,7 @@ install -m 0644 "$project_dir/data/fetch-version-manager.desktop" \
 install -m 0644 "$project_dir/data/fetch-version-manager.svg" \
     "$stage/usr/share/icons/hicolor/scalable/apps/fetch-version-manager.svg"
 install -m 0644 "$project_dir/README.md" "$stage/usr/share/doc/$package_name/README.md"
+install -m 0644 "$project_dir/INSTALL.md" "$stage/usr/share/doc/$package_name/INSTALL.md"
 install -m 0755 "$project_dir/data/fetch-version-manager" \
     "$stage/usr/bin/fetch-version-manager"
 

@@ -164,5 +164,62 @@ class GitRepositoryTest(unittest.TestCase):
             self.assertNotIn("src/obsolete.txt", bundle.namelist())
 
 
+class CompareCurrentSelectionTest(unittest.TestCase):
+    def test_compares_selected_version_with_current_workspace(self):
+        entry = MODULE.HistoryEntry(
+            commit="a" * 40,
+            short_commit="aaaaaaa",
+            date="2026-08-29",
+            subject="selected version",
+            tags=("v0.0.1",),
+        )
+
+        class Repository:
+            def __init__(self):
+                self.comparisons = []
+
+            def compare(self, left, right=None):
+                self.comparisons.append((left, right))
+
+        class Window:
+            def __init__(self):
+                self.repository = Repository()
+                self.errors = []
+
+            def selected_history(self):
+                return [entry]
+
+            def show_error(self, message):
+                self.errors.append(message)
+
+            def run_background(self, _status, operation, _success):
+                operation()
+
+        window = Window()
+        MODULE.VersionManagerWindow.on_compare_current(window, None)
+
+        self.assertEqual([("v0.0.1", None)], window.repository.comparisons)
+        self.assertEqual([], window.errors)
+
+    def test_requires_exactly_one_selected_version(self):
+        class Window:
+            repository = object()
+
+            def __init__(self):
+                self.errors = []
+
+            def selected_history(self):
+                return []
+
+            def show_error(self, message):
+                self.errors.append(message)
+
+        window = Window()
+        MODULE.VersionManagerWindow.on_compare_current(window, None)
+
+        self.assertEqual(1, len(window.errors))
+        self.assertIn("选择一个", window.errors[0])
+
+
 if __name__ == "__main__":
     unittest.main()

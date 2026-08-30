@@ -705,7 +705,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         toolbar.get_style_context().add_class("command-bar")
         self.save_button = self._command_button("保存版本", "document-save-symbolic", self.on_save_version)
         self.compare_button = self._command_button("比较所选版本", "edit-copy-symbolic", self.on_compare_versions)
-        self.current_button = self._command_button("比较当前修改", "document-open-recent-symbolic", self.on_compare_current)
+        self.current_button = self._command_button(
+            "所选版本与当前", "document-open-recent-symbolic", self.on_compare_current
+        )
         self.export_button = self._command_button("下载版本", "document-save-symbolic", self.on_download_version)
         self.changelog_button = self._command_button(
             "查看 CHANGELOG", "document-properties-symbolic", self.on_view_changelog
@@ -853,7 +855,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 branch_label = f"历史版本 {self.repository.head_label()}"
             self.repo_label.set_text(f"{self.repository.path}  ·  {branch_label}")
             self.status_label.set_text("工作区干净" if not changes else f"{len(changes)} 项修改")
-            self.current_button.set_sensitive(bool(changes))
+            self.current_button.set_sensitive(bool(self.history_entries))
             self.compare_button.set_sensitive(True)
             self.export_button.set_sensitive(True)
             self.changelog_button.set_sensitive(True)
@@ -1028,12 +1030,18 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         )
 
     def on_compare_current(self, _button) -> None:
-        if self.repository:
-            self.run_background(
-                "Beyond Compare 已打开...",
-                lambda: self.repository.compare("HEAD"),
-                "当前修改比较已关闭。",
-            )
+        if not self.repository:
+            return
+        selected = self.selected_history()
+        if len(selected) != 1:
+            self.show_error("请在版本历史中选择一个要与当前工作空间比较的版本。")
+            return
+        entry = selected[0]
+        self.run_background(
+            "Beyond Compare 已打开...",
+            lambda: self.repository.compare(entry.reference),
+            "版本与当前工作空间的比较已关闭。",
+        )
 
     def on_download_version(self, _button) -> None:
         selected = self.selected_history()
