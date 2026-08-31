@@ -121,6 +121,15 @@ def save_workspace_history(
     return paths
 
 
+def clear_recent_workspaces(config_file: Optional[Path] = None) -> None:
+    config_file = config_file or settings_file_path()
+    parser = _read_settings(config_file)
+    parser["recent_workspaces"] = {"paths": "[]"}
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    with config_file.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+
+
 @dataclass(frozen=True)
 class Change:
     status: str
@@ -150,7 +159,7 @@ class GitRepository:
             raise GitError("所选目录不是 Git 工作区。")
         top = Path(top_output).resolve()
         if top != self.path:
-            self.path = top
+            raise GitError("所选目录没有独立的 Git 工作区。")
         git_directory = self.run(["rev-parse", "--absolute-git-dir"]).strip()
         if not git_directory:
             raise GitError("无法确定 Git 元数据目录。")
@@ -1139,6 +1148,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 button.connect("clicked", self.on_open_recent_workspace, path)
                 content.pack_start(button, False, False, 0)
 
+            content.pack_start(Gtk.Separator(), False, False, 4)
+            clear_button = Gtk.ModelButton(text="清空最近打开…")
+            clear_button.set_property("icon", Gio.ThemedIcon.new("edit-clear-symbolic"))
+            clear_button.connect("clicked", self.on_clear_recent_workspaces)
+            content.pack_start(clear_button, False, False, 0)
+
         popover.add(content)
         content.show_all()
 
@@ -1147,6 +1162,31 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if path == self.workspace_path:
             return
         self.load_workspace(path)
+
+    def on_clear_recent_workspaces(self, _button) -> None:
+        self.recent_popover.popdown()
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text="清空最近打开的工作空间？",
+        )
+        dialog.format_secondary_text(
+            "只会清空最近列表，不会删除工作空间或更改当前工作空间。"
+        )
+        dialog.add_button("取消", Gtk.ResponseType.CANCEL)
+        clear_button = dialog.add_button("清空", Gtk.ResponseType.OK)
+        clear_button.get_style_context().add_class("destructive-action")
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        try:
+            clear_recent_workspaces()
+            self.status_label.set_text("最近打开的工作空间已清空")
+        except OSError as error:
+            self.show_error(str(error))
 
     def on_refresh(self, _button) -> None:
         self.refresh()

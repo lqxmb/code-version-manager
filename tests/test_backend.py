@@ -109,7 +109,7 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("2.5 MB", MODULE.format_storage_size(5 * 1024 * 1024 // 2))
 
     def test_application_version_uses_project_version_file(self):
-        self.assertEqual("0.0.10", MODULE.APP_VERSION)
+        self.assertEqual("0.1.0", MODULE.APP_VERSION)
 
     def test_recent_workspaces_are_deduplicated_limited_and_persisted(self):
         config_file = self.path / "config" / "settings.ini"
@@ -153,6 +153,18 @@ class GitRepositoryTest(unittest.TestCase):
         MODULE.save_workspace_history(self.path, config_file)
 
         parser = MODULE._read_settings(config_file)
+        self.assertTrue(parser.getboolean("display", "compact"))
+
+    def test_clear_recent_workspaces_preserves_current_and_other_settings(self):
+        config_file = self.path / "settings.ini"
+        config_file.write_text("[display]\ncompact = true\n", encoding="utf-8")
+        MODULE.save_workspace_history(self.path, config_file)
+
+        MODULE.clear_recent_workspaces(config_file)
+
+        self.assertEqual([], MODULE.recent_workspaces(config_file))
+        parser = MODULE._read_settings(config_file)
+        self.assertEqual(str(self.path.resolve()), parser.get("repository", "path"))
         self.assertTrue(parser.getboolean("display", "compact"))
 
     def test_multi_part_version_numbers(self):
@@ -316,6 +328,23 @@ class GitRepositoryTest(unittest.TestCase):
             self.assertIn("src/config/robot.yaml", names)
             self.assertIn("src/main.txt", names)
             self.assertNotIn("src/vendor/ignored.bin", names)
+
+    def test_nested_workspace_does_not_use_parent_repository(self):
+        nested = self.path / "lane_editor" / "lane_editor_core"
+        nested.mkdir(parents=True)
+        (nested / "core.txt").write_text("core\n", encoding="utf-8")
+
+        with self.assertRaises(MODULE.GitError):
+            MODULE.GitRepository(nested)
+
+        repository = MODULE.initialize_repository(
+            nested, "v0.0.1", "initial", ["core.txt"]
+        )
+
+        self.assertEqual(nested.resolve(), repository.path)
+        self.assertTrue((nested / ".git").is_dir())
+        self.assertEqual("main", repository.current_branch())
+        self.assertIn("v0.0.1", repository.tags())
 
     def test_top_level_scope_records_nested_deletions(self):
         source = self.path / "src"
