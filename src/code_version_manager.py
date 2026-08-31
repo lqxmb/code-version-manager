@@ -22,8 +22,21 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 
+def load_application_version() -> str:
+    source = Path(__file__).resolve()
+    for version_file in (source.with_name("VERSION"), source.parents[1] / "VERSION"):
+        try:
+            version = version_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if version:
+            return version
+    return "unknown"
+
+
 APP_ID = "cn.local.CodeVersionManager"
 APP_NAME = "工作空间版本管理"
+APP_VERSION = load_application_version()
 DEFAULT_REPOSITORY = Path.home() / "catkin_ws"
 VERSION_PATTERN = re.compile(r"^v(\d+(?:\.\d+){2,})$")
 METADATA_DIRECTORY = "code-version-manager"
@@ -339,7 +352,7 @@ class GitRepository:
         selected_scopes: Optional[Sequence[str]] = None,
     ) -> None:
         if self.current_branch() is None:
-            raise GitError("当前正在查看历史版本。请先返回 main，再保存新版本。")
+            raise GitError("当前正在查看历史版本。请先返回 main，再发布新版本。")
         if not VERSION_PATTERN.match(version):
             raise GitError("版本号应以 v 开头并至少包含三段数字，例如 v1.7.8.9.7。")
         if version in self.tags():
@@ -357,7 +370,7 @@ class GitRepository:
             raise GitError("所选文件全部被 .gitignore 排除，无法创建版本。")
         staged = self.run(["diff", "--cached", "--name-only"]).strip()
         if staged:
-            raise GitError("Git 暂存区已有其他文件。请先处理这些暂存内容再保存版本。")
+            raise GitError("Git 暂存区已有其他文件。请先处理这些暂存内容再发布版本。")
         scopes = validate_top_level_scopes(selected_scopes or [])
         if scopes:
             self.run(["add", "-u", "--", *scopes])
@@ -801,6 +814,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         header.pack_start(open_button)
         refresh_button = self._icon_button("view-refresh-symbolic", "刷新", self.on_refresh)
         header.pack_end(refresh_button)
+        about_button = self._icon_button("help-about-symbolic", "关于", self.on_about)
+        header.pack_end(about_button)
 
     def _icon_button(self, icon: str, tooltip: str, callback) -> Gtk.Button:
         button = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
@@ -830,7 +845,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         toolbar.get_style_context().add_class("command-bar")
-        self.save_button = self._command_button("保存版本", "document-save-symbolic", self.on_save_version)
+        self.save_button = self._command_button("发布版本", "document-save-symbolic", self.on_save_version)
         self.compare_button = self._command_button("比较所选版本", "edit-copy-symbolic", self.on_compare_versions)
         self.current_button = self._command_button(
             "所选版本与当前", "document-open-recent-symbolic", self.on_compare_current
@@ -985,7 +1000,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 self.info_mode = "detached"
                 label = html.escape(self.repository.head_label())
                 self.info_label.set_markup(
-                    f"<b>当前正在查看历史版本 {label}</b>  保存版本已禁用，返回 main 不会强制覆盖文件。"
+                    f"<b>当前正在查看历史版本 {label}</b>  发布版本已禁用，返回 main 不会强制覆盖文件。"
                 )
                 self.info_action_button.set_label("返回 main")
                 self.info_bar.show_all()
@@ -1032,6 +1047,15 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def on_refresh(self, _button) -> None:
         self.refresh()
 
+    def on_about(self, _button) -> None:
+        dialog = Gtk.AboutDialog(transient_for=self, modal=True)
+        dialog.set_program_name("Code Version Manager")
+        dialog.set_version(APP_VERSION)
+        dialog.set_comments("本地 Git 工作空间版本管理器")
+        dialog.set_logo_icon_name("code-version-manager")
+        dialog.run()
+        dialog.destroy()
+
     def on_return_main(self, _bar, response) -> None:
         if response != Gtk.ResponseType.OK:
             return
@@ -1073,11 +1097,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             return
         selected = expand_package_groups(groups, selected_entries)
         self.run_background(
-            "正在保存版本...",
+            "正在发布版本...",
             lambda: self.repository.save_version(
                 version, message, selected, selected_scopes=selected_entries
             ),
-            f"版本 {version} 已保存。",
+            f"版本 {version} 已发布。",
         )
 
     def on_enable_versioning(self) -> None:
@@ -1106,7 +1130,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.run_background(
             "正在启用版本管理...",
             initialize,
-            f"首个版本 {version} 已保存。",
+            f"首个版本 {version} 已发布。",
             reload_workspace=True,
         )
 
@@ -1130,7 +1154,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         return selected
 
     def prompt_version_metadata(self, default_version: str):
-        dialog = Gtk.Dialog(title="版本信息", transient_for=self, modal=True)
+        dialog = Gtk.Dialog(title="发布版本", transient_for=self, modal=True)
         dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "继续", Gtk.ResponseType.OK)
         dialog.set_default_size(580, 340)
         grid = Gtk.Grid(column_spacing=12, row_spacing=10, margin=16)

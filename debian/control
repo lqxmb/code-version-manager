@@ -1,5 +1,5 @@
 Package: code-version-manager
-Version: 2.4.11
+Version: 0.0.9
 Section: devel
 Priority: optional
 Architecture: all

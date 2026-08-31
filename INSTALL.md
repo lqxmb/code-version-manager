@@ -24,7 +24,7 @@
 
 ```bash
 sudo apt update
-sudo apt install ./code-version-manager_2.4.11_all.deb
+sudo apt install ./code-version-manager_0.0.9_all.deb
 ```
 
 自动安装缺失依赖需要电脑能够访问 Ubuntu 软件源。如果电脑离线，必须先准备好缺少的依赖安装包。
@@ -32,14 +32,14 @@ sudo apt install ./code-version-manager_2.4.11_all.deb
 不要使用下面的命令进行首次安装：
 
 ```bash
-sudo dpkg -i code-version-manager_2.4.11_all.deb
+sudo dpkg -i code-version-manager_0.0.9_all.deb
 ```
 
 `dpkg -i` 只检查依赖，不会联网下载缺少的软件包；`apt install` 才会自动补齐依赖。
 
 ### 可选安装
 
-`Beyond Compare 4` 用于软件中的完整目录对比功能。只进行版本保存、查看、切换或下载时，可以不安装；需要点击“对比”时必须安装。
+`Beyond Compare 4` 用于软件中的完整目录对比功能。只进行版本发布、查看、切换或下载时，可以不安装；需要点击“对比”时必须安装。
 
 安装从 Beyond Compare 官方网站下载的 Ubuntu `.deb` 文件，例如：
 
@@ -74,7 +74,7 @@ python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository impo
 进入 `.deb` 文件所在目录后执行：
 
 ```bash
-sudo apt install ./code-version-manager_2.4.11_all.deb
+sudo apt install ./code-version-manager_0.0.9_all.deb
 ```
 
 使用 `apt install` 可以自动检查并安装系统依赖。通过 Ubuntu 图形软件安装器打开 `.deb` 时也会检查依赖，但终端命令能够清楚显示下载和安装过程。
@@ -94,7 +94,7 @@ code-version-manager
 ```bash
 sudo apt update
 sudo apt --fix-broken install
-sudo apt install ./code-version-manager_2.4.11_all.deb
+sudo apt install ./code-version-manager_0.0.9_all.deb
 ```
 
 ### 点击对比没有反应
@@ -107,9 +107,9 @@ bcompare
 
 Beyond Compare 不是 Ubuntu 默认自带软件，需要单独安装。
 
-### 无法保存版本
+### 无法发布版本
 
-确认当前用户对所选工作空间具有读写权限。软件会在该工作空间中创建本地 Git 版本记录，不需要互联网连接。
+确认当前用户对所选工作空间具有读写权限。软件发布版本时会在该工作空间中创建本地 Git 版本记录，不需要互联网连接。
 
 ## 5. 卸载
 

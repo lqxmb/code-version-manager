@@ -108,6 +108,9 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("1.0 KB", MODULE.format_storage_size(1024))
         self.assertEqual("2.5 MB", MODULE.format_storage_size(5 * 1024 * 1024 // 2))
 
+    def test_application_version_uses_project_version_file(self):
+        self.assertEqual("0.0.9", MODULE.APP_VERSION)
+
     def test_multi_part_version_numbers(self):
         self.git("tag", "v1.7.8.9.7")
 
