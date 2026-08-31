@@ -109,7 +109,51 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("2.5 MB", MODULE.format_storage_size(5 * 1024 * 1024 // 2))
 
     def test_application_version_uses_project_version_file(self):
-        self.assertEqual("0.0.9", MODULE.APP_VERSION)
+        self.assertEqual("0.0.10", MODULE.APP_VERSION)
+
+    def test_recent_workspaces_are_deduplicated_limited_and_persisted(self):
+        config_file = self.path / "config" / "settings.ini"
+        workspaces = []
+        for index in range(MODULE.RECENT_WORKSPACE_LIMIT + 2):
+            workspace = self.path / f"workspace-{index}"
+            workspace.mkdir()
+            workspaces.append(workspace.resolve())
+            MODULE.save_workspace_history(workspace, config_file)
+
+        MODULE.save_workspace_history(workspaces[5], config_file)
+
+        recent = MODULE.recent_workspaces(config_file)
+        self.assertEqual(MODULE.RECENT_WORKSPACE_LIMIT, len(recent))
+        self.assertEqual(workspaces[5], recent[0])
+        self.assertEqual(len(recent), len(set(recent)))
+        parser = MODULE._read_settings(config_file)
+        self.assertEqual(str(workspaces[5]), parser.get("repository", "path"))
+
+    def test_recent_workspaces_ignore_invalid_paths_and_malformed_settings(self):
+        config_file = self.path / "settings.ini"
+        valid = self.path / "valid"
+        valid.mkdir()
+        parser = MODULE.configparser.ConfigParser()
+        parser["recent_workspaces"] = {
+            "paths": MODULE.json.dumps(
+                [str(valid), str(self.path / "missing"), str(valid), 42]
+            )
+        }
+        with config_file.open("w", encoding="utf-8") as handle:
+            parser.write(handle)
+        self.assertEqual([valid.resolve()], MODULE.recent_workspaces(config_file))
+
+        config_file.write_text("[recent_workspaces]\npaths = not-json\n", encoding="utf-8")
+        self.assertEqual([], MODULE.recent_workspaces(config_file))
+
+    def test_workspace_history_preserves_other_settings_sections(self):
+        config_file = self.path / "settings.ini"
+        config_file.write_text("[display]\ncompact = true\n", encoding="utf-8")
+
+        MODULE.save_workspace_history(self.path, config_file)
+
+        parser = MODULE._read_settings(config_file)
+        self.assertTrue(parser.getboolean("display", "compact"))
 
     def test_multi_part_version_numbers(self):
         self.git("tag", "v1.7.8.9.7")

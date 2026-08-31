@@ -2,6 +2,7 @@
 import configparser
 import html
 import io
+import json
 import os
 import re
 import shutil
@@ -43,6 +44,7 @@ METADATA_DIRECTORY = "code-version-manager"
 MANIFEST_DIRECTORY = "versions"
 MANIFEST_SUFFIX = ".manifest"
 MANAGER_CHANGELOG = "CHANGELOG.rst"
+RECENT_WORKSPACE_LIMIT = 10
 DEFAULT_EXCLUDED_DIRECTORIES = {
     ".git",
     ".cache",
@@ -57,6 +59,66 @@ DEFAULT_EXCLUDED_DIRECTORIES = {
 
 class GitError(RuntimeError):
     pass
+
+
+def settings_file_path() -> Path:
+    return Path(GLib.get_user_config_dir()) / "code-version-manager" / "settings.ini"
+
+
+def _read_settings(config_file: Path) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(config_file, encoding="utf-8")
+    except (OSError, configparser.Error):
+        pass
+    return parser
+
+
+def recent_workspaces(config_file: Optional[Path] = None) -> List[Path]:
+    config_file = config_file or settings_file_path()
+    parser = _read_settings(config_file)
+    raw_paths = parser.get("recent_workspaces", "paths", fallback="[]")
+    try:
+        values = json.loads(raw_paths)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(values, list):
+        return []
+
+    paths = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        path = Path(value).expanduser().resolve()
+        key = str(path)
+        if key in seen or not path.is_dir():
+            continue
+        seen.add(key)
+        paths.append(path)
+        if len(paths) == RECENT_WORKSPACE_LIMIT:
+            break
+    return paths
+
+
+def save_workspace_history(
+    path: Path, config_file: Optional[Path] = None
+) -> List[Path]:
+    config_file = config_file or settings_file_path()
+    resolved = path.expanduser().resolve()
+    paths = [resolved]
+    paths.extend(candidate for candidate in recent_workspaces(config_file) if candidate != resolved)
+    paths = paths[:RECENT_WORKSPACE_LIMIT]
+
+    parser = _read_settings(config_file)
+    parser["repository"] = {"path": str(resolved)}
+    parser["recent_workspaces"] = {
+        "paths": json.dumps([str(candidate) for candidate in paths], ensure_ascii=False)
+    }
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    with config_file.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    return paths
 
 
 @dataclass(frozen=True)
@@ -812,6 +874,18 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             "打开工作空间", "folder-open-symbolic", self.on_open_workspace
         )
         header.pack_start(open_button)
+
+        self.recent_button = Gtk.MenuButton(label="最近工作空间")
+        self.recent_button.set_image(
+            Gtk.Image.new_from_icon_name("document-open-recent-symbolic", Gtk.IconSize.BUTTON)
+        )
+        self.recent_button.set_always_show_image(True)
+        self.recent_button.set_tooltip_text("打开最近工作空间")
+        self.recent_popover = Gtk.Popover.new(self.recent_button)
+        self.recent_popover.connect("show", self.on_recent_popover_show)
+        self.recent_button.set_popover(self.recent_popover)
+        header.pack_start(self.recent_button)
+
         refresh_button = self._icon_button("view-refresh-symbolic", "刷新", self.on_refresh)
         header.pack_end(refresh_button)
         about_button = self._icon_button("help-about-symbolic", "关于", self.on_about)
@@ -947,12 +1021,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.show_error("所选工作空间不存在。")
             return
         self.workspace_path = resolved
-        self._save_repository_path(resolved)
         try:
             self.repository = GitRepository(resolved)
             self.workspace_path = self.repository.path
         except GitError:
             self.repository = None
+        self._save_repository_path(self.workspace_path)
         self.refresh()
 
     def refresh(self) -> None:
@@ -1043,6 +1117,36 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.destroy()
         if response == Gtk.ResponseType.OK and filename:
             self.load_workspace(Path(filename))
+
+    def on_recent_popover_show(self, popover: Gtk.Popover) -> None:
+        child = popover.get_child()
+        if child:
+            popover.remove(child)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        content.set_border_width(6)
+        paths = recent_workspaces()
+        if not paths:
+            empty = Gtk.Label(label="暂无最近工作空间", xalign=0)
+            empty.set_sensitive(False)
+            content.pack_start(empty, False, False, 8)
+        else:
+            for path in paths:
+                label = f"当前  ·  {path}" if path == self.workspace_path else str(path)
+                # GtkModelButton always interprets underscores as mnemonic markers.
+                button = Gtk.ModelButton(text=label.replace("_", "__"))
+                button.set_tooltip_text(str(path))
+                button.connect("clicked", self.on_open_recent_workspace, path)
+                content.pack_start(button, False, False, 0)
+
+        popover.add(content)
+        content.show_all()
+
+    def on_open_recent_workspace(self, _button, path: Path) -> None:
+        self.recent_popover.popdown()
+        if path == self.workspace_path:
+            return
+        self.load_workspace(path)
 
     def on_refresh(self, _button) -> None:
         self.refresh()
@@ -1373,12 +1477,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     @staticmethod
     def _save_repository_path(path: Path) -> None:
-        config_dir = Path(GLib.get_user_config_dir()) / "code-version-manager"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        parser = configparser.ConfigParser()
-        parser["repository"] = {"path": str(path)}
-        with (config_dir / "settings.ini").open("w", encoding="utf-8") as handle:
-            parser.write(handle)
+        save_workspace_history(path)
 
 
 class VersionManagerApplication(Gtk.Application):
@@ -1398,10 +1497,9 @@ def configured_repository() -> Path:
     environment_path = os.environ.get("CODE_VERSION_MANAGER_REPOSITORY")
     if environment_path:
         return Path(environment_path)
-    config_file = Path(GLib.get_user_config_dir()) / "code-version-manager" / "settings.ini"
-    parser = configparser.ConfigParser()
+    config_file = settings_file_path()
+    parser = _read_settings(config_file)
     if config_file.exists():
-        parser.read(config_file, encoding="utf-8")
         saved = parser.get("repository", "path", fallback="")
         if saved and Path(saved).expanduser().is_dir():
             return Path(saved)

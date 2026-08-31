@@ -5,6 +5,7 @@
 主要功能：
 
 - 为尚未使用 Git 的目录启用版本管理
+- 记录最近打开的 10 个工作空间，可从标题栏快速切换
 - 首次启用时只显示工作空间第一层，勾选目录会递归封装其内容
 - 发布后续版本时同样只显示第一层，并记录所选目录内的删除
 - 发布版本时自行勾选要封装的文件
@@ -31,6 +32,6 @@ sh build_deb.sh
 
 安装前需要的软件和完整安装步骤请查看 [INSTALL.md](INSTALL.md)。
 版本变更记录请查看 [CHANGELOG.rst](CHANGELOG.rst)。
-使用 `sudo apt install ./code-version-manager_0.0.9_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
+使用 `sudo apt install ./code-version-manager_0.0.10_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
 
 安装后从应用菜单打开 `Code Version Manager`。
