@@ -46,15 +46,22 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual([], self.repository.status())
         self.assertIn("v0.0.2", self.repository.tags())
         self.assertEqual("second", self.repository.history()[0].subject)
-        manager_changelog = self.path / MODULE.MANAGER_CHANGELOG
+        git_directory = Path(
+            self.repository.run(["rev-parse", "--absolute-git-dir"]).strip()
+        )
+        manager_changelog = (
+            git_directory / MODULE.METADATA_DIRECTORY / MODULE.MANAGER_CHANGELOG
+        )
         self.assertTrue(manager_changelog.exists())
         self.assertIn("0.0.2 (", manager_changelog.read_text(encoding="utf-8"))
-        manifest = self.path / MODULE.MANIFEST_DIRECTORY / "v0.0.2.txt"
-        self.assertEqual("robot.txt\n", manifest.read_text(encoding="utf-8"))
-        self.assertEqual(
-            [".code-version-manager", ".git"],
-            sorted(path.name for path in self.path.glob(".*")),
+        manifest = (
+            git_directory
+            / MODULE.METADATA_DIRECTORY
+            / MODULE.MANIFEST_DIRECTORY
+            / f"v0.0.2{MODULE.MANIFEST_SUFFIX}"
         )
+        self.assertEqual("robot.txt\n", manifest.read_text(encoding="utf-8"))
+        self.assertEqual([".git"], sorted(path.name for path in self.path.glob(".*")))
         downloaded_changelog = self.path / "CHANGELOG.rst"
         self.repository.download_changelog(downloaded_changelog)
         changelog_text = downloaded_changelog.read_text(encoding="utf-8")

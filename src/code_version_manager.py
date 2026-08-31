@@ -26,8 +26,10 @@ APP_ID = "cn.local.CodeVersionManager"
 APP_NAME = "工作空间版本管理"
 DEFAULT_REPOSITORY = Path.home() / "catkin_ws"
 VERSION_PATTERN = re.compile(r"^v(\d+(?:\.\d+){2,})$")
-MANIFEST_DIRECTORY = ".code-version-manager/manifests"
-MANAGER_CHANGELOG = ".code-version-manager/CHANGELOG.rst"
+METADATA_DIRECTORY = "code-version-manager"
+MANIFEST_DIRECTORY = "versions"
+MANIFEST_SUFFIX = ".manifest"
+MANAGER_CHANGELOG = "CHANGELOG.rst"
 DEFAULT_EXCLUDED_DIRECTORIES = {
     ".git",
     ".cache",
@@ -74,6 +76,10 @@ class GitRepository:
         top = Path(top_output).resolve()
         if top != self.path:
             self.path = top
+        git_directory = self.run(["rev-parse", "--absolute-git-dir"]).strip()
+        if not git_directory:
+            raise GitError("无法确定 Git 元数据目录。")
+        self.metadata_path = Path(git_directory).resolve() / METADATA_DIRECTORY
 
     def run(self, args: Sequence[str], check: bool = True) -> str:
         result = subprocess.run(
@@ -158,7 +164,7 @@ class GitRepository:
         raw = self.run(["ls-files", "-co", "--exclude-standard", "-z"])
         paths = []
         for path in raw.split("\0"):
-            if not path or path.startswith(MANIFEST_DIRECTORY + "/"):
+            if not path:
                 continue
             absolute = self.path / path
             if absolute.is_file() or absolute.is_symlink():
@@ -226,9 +232,14 @@ class GitRepository:
         tag = self._tag_for_reference(reference)
         if not tag:
             return None
-        manifest_path = f"{MANIFEST_DIRECTORY}/{tag}.txt"
-        content = self.run(["show", f"{reference}:{manifest_path}"], check=False)
-        if not content:
+        manifest_path = (
+            self.metadata_path
+            / MANIFEST_DIRECTORY
+            / f"{tag}{MANIFEST_SUFFIX}"
+        )
+        try:
+            content = manifest_path.read_text(encoding="utf-8")
+        except OSError:
             return None
         return [line for line in content.splitlines() if line]
 
@@ -246,7 +257,11 @@ class GitRepository:
         return sorted((set(previous) | set(self.changed_files())) & candidates)
 
     def _write_manifest(self, version: str, selected_files: Sequence[str]) -> Path:
-        manifest_path = self.path / MANIFEST_DIRECTORY / f"{version}.txt"
+        manifest_path = (
+            self.metadata_path
+            / MANIFEST_DIRECTORY
+            / f"{version}{MANIFEST_SUFFIX}"
+        )
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text("".join(f"{path}\n" for path in sorted(selected_files)), encoding="utf-8")
         return manifest_path
@@ -284,7 +299,7 @@ class GitRepository:
         return "\n".join(lines)
 
     def _write_changelog(self, pending) -> Path:
-        changelog_path = self.path / MANAGER_CHANGELOG
+        changelog_path = self.metadata_path / MANAGER_CHANGELOG
         changelog_path.parent.mkdir(parents=True, exist_ok=True)
         changelog_path.write_text(self.changelog_text(pending), encoding="utf-8")
         return changelog_path
@@ -346,13 +361,12 @@ class GitRepository:
         scopes = validate_top_level_scopes(selected_scopes or [])
         if scopes:
             self.run(["add", "-u", "--", *scopes])
-        manifest_path = self._write_manifest(version, selected)
-        changelog_path = self._write_changelog((version, commit_message, len(selected)))
-        relative_manifest = manifest_path.relative_to(self.path).as_posix()
-        relative_changelog = changelog_path.relative_to(self.path).as_posix()
-        self._add_paths([*selected, relative_manifest, relative_changelog])
-        self.run(["commit", "-m", commit_message])
+        self._add_paths(selected)
+        self.metadata_path.mkdir(parents=True, exist_ok=True)
+        self.run(["commit", "--allow-empty", "-m", commit_message])
         self.run(["tag", "-a", version, "-m", commit_message])
+        self._write_manifest(version, selected)
+        self._write_changelog(None)
 
     def switch_main(self) -> None:
         branches = self.run(["for-each-ref", "--format=%(refname:short)", "refs/heads/"]).splitlines()
@@ -366,6 +380,16 @@ class GitRepository:
         if version not in self.tags():
             raise GitError(f"版本 {version} 不存在或已经删除。")
         self.run(["tag", "--delete", version])
+        manifest_path = (
+            self.metadata_path
+            / MANIFEST_DIRECTORY
+            / f"{version}{MANIFEST_SUFFIX}"
+        )
+        try:
+            manifest_path.unlink()
+        except FileNotFoundError:
+            pass
+        self._write_changelog(None)
 
     def _archive_bytes(self, reference: str) -> bytes:
         paths = self.manifest(reference)
@@ -511,8 +535,6 @@ def scan_workspace_files(path: Path) -> List[str]:
         for filename in filenames:
             absolute = current_path / filename
             relative = absolute.relative_to(root).as_posix()
-            if relative.startswith(MANIFEST_DIRECTORY + "/"):
-                continue
             files.append(relative)
     return sorted(files)
 
@@ -521,7 +543,7 @@ def top_level_package_groups(path: Path) -> Dict[str, List[str]]:
     root = path.resolve()
     groups: Dict[str, List[str]] = {}
     for entry in sorted(root.iterdir(), key=lambda item: item.name.lower()):
-        if entry.name in DEFAULT_EXCLUDED_DIRECTORIES or entry.name == ".code-version-manager":
+        if entry.name in DEFAULT_EXCLUDED_DIRECTORIES:
             continue
         if entry.is_dir() and not entry.is_symlink():
             nested = scan_workspace_files(entry)

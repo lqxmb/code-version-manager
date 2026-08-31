@@ -19,7 +19,7 @@
 - 在窗口底部显示当前 Git 增量版本历史占用的磁盘空间
 - 查看或下载自动生成的版本管理 `CHANGELOG.rst`
 - CHANGELOG 使用标准 RST 标题格式，每行改动自动输出为 `* 内容`
-- 工具元数据保存在工作空间根目录的 `.code-version-manager/`
+- 工具元数据保存在 `.git/code-version-manager/`，不会污染工作空间根目录
 - 在历史版本状态下阻止误提交
 
 构建安装包：
