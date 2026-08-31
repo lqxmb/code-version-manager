@@ -1,4 +1,4 @@
-# 工作空间版本管理 - 安装说明
+# Code Version Manager - 安装说明
 
 本文档适用于 Ubuntu 20.04。软件完全在本地管理版本，不要求安装 ROS、Catkin、VS Code，也不要求注册或连接 GitHub、Gitee 等网络代码托管平台。
 
@@ -24,7 +24,7 @@
 
 ```bash
 sudo apt update
-sudo apt install ./fetch-version-manager_2.4.10_all.deb
+sudo apt install ./code-version-manager_2.4.11_all.deb
 ```
 
 自动安装缺失依赖需要电脑能够访问 Ubuntu 软件源。如果电脑离线，必须先准备好缺少的依赖安装包。
@@ -32,7 +32,7 @@ sudo apt install ./fetch-version-manager_2.4.10_all.deb
 不要使用下面的命令进行首次安装：
 
 ```bash
-sudo dpkg -i fetch-version-manager_2.4.10_all.deb
+sudo dpkg -i code-version-manager_2.4.11_all.deb
 ```
 
 `dpkg -i` 只检查依赖，不会联网下载缺少的软件包；`apt install` 才会自动补齐依赖。
@@ -74,15 +74,15 @@ python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository impo
 进入 `.deb` 文件所在目录后执行：
 
 ```bash
-sudo apt install ./fetch-version-manager_2.4.10_all.deb
+sudo apt install ./code-version-manager_2.4.11_all.deb
 ```
 
 使用 `apt install` 可以自动检查并安装系统依赖。通过 Ubuntu 图形软件安装器打开 `.deb` 时也会检查依赖，但终端命令能够清楚显示下载和安装过程。
 
-安装完成后，在 Ubuntu 应用菜单中搜索并打开“工作空间版本管理”。也可以在终端执行：
+安装完成后，在 Ubuntu 应用菜单中搜索并打开“Code Version Manager”。也可以在终端执行：
 
 ```bash
-fetch-version-manager
+code-version-manager
 ```
 
 ## 4. 常见安装问题
@@ -94,7 +94,7 @@ fetch-version-manager
 ```bash
 sudo apt update
 sudo apt --fix-broken install
-sudo apt install ./fetch-version-manager_2.4.10_all.deb
+sudo apt install ./code-version-manager_2.4.11_all.deb
 ```
 
 ### 点击对比没有反应
@@ -114,7 +114,7 @@ Beyond Compare 不是 Ubuntu 默认自带软件，需要单独安装。
 ## 5. 卸载
 
 ```bash
-sudo apt remove fetch-version-manager
+sudo apt remove code-version-manager
 ```
 
 卸载软件不会删除各工作空间中已经保存的 Git 历史和文件。

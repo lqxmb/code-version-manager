@@ -1,4 +1,4 @@
-# 工作空间版本管理
+# Code Version Manager（工作空间版本管理）
 
 独立的本地 Git 图形版本管理器，可管理任意工作空间。
 
@@ -19,6 +19,7 @@
 - 在窗口底部显示当前 Git 增量版本历史占用的磁盘空间
 - 查看或下载自动生成的版本管理 `CHANGELOG.rst`
 - CHANGELOG 使用标准 RST 标题格式，每行改动自动输出为 `* 内容`
+- 工具元数据保存在工作空间根目录的 `.code-version-manager/`
 - 在历史版本状态下阻止误提交
 
 构建安装包：
@@ -28,6 +29,6 @@ sh build_deb.sh
 ```
 
 安装前需要的软件和完整安装步骤请查看 [INSTALL.md](INSTALL.md)。
-使用 `sudo apt install ./fetch-version-manager_2.4.10_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
+使用 `sudo apt install ./code-version-manager_2.4.11_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
 
-安装后从应用菜单打开 `工作空间版本管理`。
+安装后从应用菜单打开 `Code Version Manager`。

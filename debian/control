@@ -1,5 +1,5 @@
-Package: fetch-version-manager
-Version: 2.4.10
+Package: code-version-manager
+Version: 2.4.11
 Section: devel
 Priority: optional
 Architecture: all

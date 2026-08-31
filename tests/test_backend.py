@@ -8,8 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 
-SOURCE = Path(__file__).parents[1] / "src" / "fetch_version_manager.py"
-SPEC = importlib.util.spec_from_file_location("fetch_version_manager", SOURCE)
+SOURCE = Path(__file__).parents[1] / "src" / "code_version_manager.py"
+SPEC = importlib.util.spec_from_file_location("code_version_manager", SOURCE)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
@@ -49,6 +49,12 @@ class GitRepositoryTest(unittest.TestCase):
         manager_changelog = self.path / MODULE.MANAGER_CHANGELOG
         self.assertTrue(manager_changelog.exists())
         self.assertIn("0.0.2 (", manager_changelog.read_text(encoding="utf-8"))
+        manifest = self.path / MODULE.MANIFEST_DIRECTORY / "v0.0.2.txt"
+        self.assertEqual("robot.txt\n", manifest.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [".code-version-manager", ".git"],
+            sorted(path.name for path in self.path.glob(".*")),
+        )
         downloaded_changelog = self.path / "CHANGELOG.rst"
         self.repository.download_changelog(downloaded_changelog)
         changelog_text = downloaded_changelog.read_text(encoding="utf-8")
@@ -167,7 +173,9 @@ class GitRepositoryTest(unittest.TestCase):
              mock.patch.object(self.repository, "materialize"), \
              mock.patch.object(self.repository, "materialize_current"), \
              mock.patch.object(
-                 MODULE, "prepare_bcompare_config", return_value=Path("/tmp/fvm-config")
+                 MODULE,
+                 "prepare_bcompare_config",
+                 return_value=Path("/tmp/code-version-manager-config"),
              ) as prepare_config, \
              mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
             self.repository.compare("v0.0.1")
@@ -176,7 +184,10 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("bcompare", command[0])
         self.assertNotIn("-expandall", command)
         self.assertIn("-filters=*", command)
-        self.assertEqual("/tmp/fvm-config", run.call_args.kwargs["env"]["XDG_CONFIG_HOME"])
+        self.assertEqual(
+            "/tmp/code-version-manager-config",
+            run.call_args.kwargs["env"]["XDG_CONFIG_HOME"],
+        )
         prepare_config.assert_called_once()
 
     def test_bcompare_config_forces_saved_sessions_to_stay_collapsed(self):

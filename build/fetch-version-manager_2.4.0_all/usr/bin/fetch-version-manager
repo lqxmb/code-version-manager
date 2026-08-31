@@ -1,3 +1,0 @@
-#!/bin/sh
-exec /usr/bin/python3 /usr/lib/fetch-version-manager/fetch_version_manager.py "$@"
-
