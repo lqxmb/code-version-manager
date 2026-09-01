@@ -109,7 +109,7 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("2.5 MB", MODULE.format_storage_size(5 * 1024 * 1024 // 2))
 
     def test_application_version_uses_project_version_file(self):
-        self.assertEqual("0.1.2", MODULE.APP_VERSION)
+        self.assertEqual("0.1.3", MODULE.APP_VERSION)
 
     def test_recent_workspaces_are_deduplicated_limited_and_persisted(self):
         config_file = self.path / "config" / "settings.ini"
@@ -210,6 +210,40 @@ class GitRepositoryTest(unittest.TestCase):
     def test_delete_version_rejects_unknown_version(self):
         with self.assertRaises(MODULE.GitError):
             self.repository.delete_version("v9.9.9")
+
+    def test_update_version_message_updates_tag_without_rewriting_commit(self):
+        commit_before = self.repository.run(["rev-list", "-n", "1", "v0.0.1"]).strip()
+        head_before = self.repository.run(["rev-parse", "HEAD"]).strip()
+
+        self.repository.update_version_message(
+            "v0.0.1", "新的说明\n- 补充细节"
+        )
+
+        self.assertEqual(
+            commit_before,
+            self.repository.run(["rev-list", "-n", "1", "v0.0.1"]).strip(),
+        )
+        self.assertEqual(head_before, self.repository.run(["rev-parse", "HEAD"]).strip())
+        self.assertEqual("tag", self.repository.run(["cat-file", "-t", "v0.0.1"]).strip())
+        self.assertEqual("新的说明\n补充细节", self.repository.version_message("v0.0.1"))
+        self.assertEqual("新的说明", self.repository.history()[0].subject)
+        changelog = self.repository.changelog_text()
+        self.assertIn("* 新的说明", changelog)
+        self.assertIn("* 补充细节", changelog)
+        self.assertNotIn("* initial", changelog)
+        git_directory = Path(
+            self.repository.run(["rev-parse", "--absolute-git-dir"]).strip()
+        )
+        stored_changelog = (
+            git_directory / MODULE.METADATA_DIRECTORY / MODULE.MANAGER_CHANGELOG
+        ).read_text(encoding="utf-8")
+        self.assertIn("* 新的说明", stored_changelog)
+
+    def test_update_version_message_rejects_empty_or_unknown_version(self):
+        with self.assertRaises(MODULE.GitError):
+            self.repository.update_version_message("v0.0.1", "  \n")
+        with self.assertRaises(MODULE.GitError):
+            self.repository.update_version_message("v9.9.9", "missing")
 
     def test_full_snapshots_include_unchanged_files(self):
         (self.path / "robot.txt").write_text("two\n", encoding="utf-8")
@@ -452,6 +486,54 @@ class CompareCurrentSelectionTest(unittest.TestCase):
 
         self.assertEqual(1, len(window.errors))
         self.assertIn("选择一个", window.errors[0])
+
+
+class EditVersionMessageTest(unittest.TestCase):
+    def test_edits_selected_version_message(self):
+        entry = MODULE.HistoryEntry(
+            commit="a" * 40,
+            short_commit="aaaaaaa",
+            date="2026-09-01",
+            subject="before",
+            tags=("v1.2.3",),
+        )
+
+        class Repository:
+            def __init__(self):
+                self.updates = []
+
+            def version_message(self, version):
+                self.requested_version = version
+                return "before\ndetail"
+
+            def update_version_message(self, version, message):
+                self.updates.append((version, message))
+
+        class Window:
+            def __init__(self):
+                self.repository = Repository()
+                self.prompted = []
+                self.errors = []
+
+            def selected_history(self):
+                return [entry]
+
+            def prompt_version_message(self, version, current_message):
+                self.prompted.append((version, current_message))
+                return "after\nnew detail"
+
+            def run_background(self, _status, operation, _success):
+                operation()
+
+            def show_error(self, message):
+                self.errors.append(message)
+
+        window = Window()
+        MODULE.VersionManagerWindow.on_edit_version_message(window, None)
+
+        self.assertEqual([("v1.2.3", "before\ndetail")], window.prompted)
+        self.assertEqual([("v1.2.3", "after\nnew detail")], window.repository.updates)
+        self.assertEqual([], window.errors)
 
 
 if __name__ == "__main__":

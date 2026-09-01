@@ -24,7 +24,7 @@
 
 ```bash
 sudo apt update
-sudo apt install ./code-version-manager_0.1.2_all.deb
+sudo apt install ./code-version-manager_0.1.3_all.deb
 ```
 
 自动安装缺失依赖需要电脑能够访问 Ubuntu 软件源。如果电脑离线，必须先准备好缺少的依赖安装包。
@@ -32,7 +32,7 @@ sudo apt install ./code-version-manager_0.1.2_all.deb
 不要使用下面的命令进行首次安装：
 
 ```bash
-sudo dpkg -i code-version-manager_0.1.2_all.deb
+sudo dpkg -i code-version-manager_0.1.3_all.deb
 ```
 
 `dpkg -i` 只检查依赖，不会联网下载缺少的软件包；`apt install` 才会自动补齐依赖。
@@ -74,7 +74,7 @@ python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository impo
 进入 `.deb` 文件所在目录后执行：
 
 ```bash
-sudo apt install ./code-version-manager_0.1.2_all.deb
+sudo apt install ./code-version-manager_0.1.3_all.deb
 ```
 
 使用 `apt install` 可以自动检查并安装系统依赖。通过 Ubuntu 图形软件安装器打开 `.deb` 时也会检查依赖，但终端命令能够清楚显示下载和安装过程。
@@ -94,7 +94,7 @@ code-version-manager
 ```bash
 sudo apt update
 sudo apt --fix-broken install
-sudo apt install ./code-version-manager_0.1.2_all.deb
+sudo apt install ./code-version-manager_0.1.3_all.deb
 ```
 
 ### 点击对比没有反应

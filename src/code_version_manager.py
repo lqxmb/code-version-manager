@@ -261,6 +261,17 @@ class GitRepository:
         output = self.run(["tag", "--sort=version:refname"])
         return [line for line in output.splitlines() if line]
 
+    def version_message(self, version: str) -> str:
+        if not VERSION_PATTERN.match(version) or version not in self.tags():
+            raise GitError(f"版本 {version} 不存在。")
+        return self._version_message_unchecked(version)
+
+    def _version_message_unchecked(self, version: str) -> str:
+        message = self.run(
+            ["for-each-ref", "--format=%(contents)", f"refs/tags/{version}"]
+        ).strip()
+        return "\n".join(normalize_changes(message))
+
     def _tags_by_commit(self) -> Dict[str, List[str]]:
         mapping: Dict[str, List[str]] = {}
         for tag in self.tags():
@@ -293,6 +304,10 @@ class GitRepository:
             )
             if not commit_tags:
                 continue
+            primary_tag = max(commit_tags, key=version_key)
+            changes = normalize_changes(self._version_message_unchecked(primary_tag))
+            if changes:
+                subject = changes[0]
             entries.append(
                 HistoryEntry(commit, short_commit, date, subject, commit_tags)
             )
@@ -362,7 +377,7 @@ class GitRepository:
             version_date = self.run(
                 ["show", "-s", "--date=short", "--format=%ad", commit]
             ).strip()
-            message = self.run(["show", "-s", "--format=%B", commit]).strip()
+            message = self._version_message_unchecked(tag)
             sections.append((tag, version_date, normalize_changes(message)))
 
         workspace_name = self.path.name
@@ -452,6 +467,20 @@ class GitRepository:
         self.run(["commit", "--allow-empty", "-m", commit_message])
         self.run(["tag", "-a", version, "-m", commit_message])
         self._write_manifest(version, selected)
+        self._write_changelog(None)
+
+    def update_version_message(self, version: str, message: str) -> None:
+        if not VERSION_PATTERN.match(version) or version not in self.tags():
+            raise GitError(f"版本 {version} 不存在。")
+        changes = normalize_changes(message)
+        if not changes:
+            raise GitError("至少填写一条改动内容。")
+        commit_message = changes[0]
+        if len(changes) > 1:
+            commit_message += "\n\n" + "\n".join(changes[1:])
+        commit = self.run(["rev-list", "-n", "1", version]).strip()
+        ensure_git_identity(self)
+        self.run(["tag", "-f", "-a", version, "-m", commit_message, commit])
         self._write_changelog(None)
 
     def switch_main(self) -> None:
@@ -926,6 +955,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             "所选版本与当前", "document-open-recent-symbolic", self.on_compare_current
         )
         self.export_button = self._command_button("下载版本", "document-save-symbolic", self.on_download_version)
+        self.edit_message_button = self._command_button(
+            "修改说明", "document-edit-symbolic", self.on_edit_version_message
+        )
         self.delete_button = self._icon_button(
             "edit-delete-symbolic", "删除所选版本", self.on_delete_version
         )
@@ -940,6 +972,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.compare_button,
             self.current_button,
             self.export_button,
+            self.edit_message_button,
             self.delete_button,
             self.changelog_button,
             self.download_changelog_button,
@@ -1045,6 +1078,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.compare_button.set_sensitive(False)
             self.current_button.set_sensitive(False)
             self.export_button.set_sensitive(False)
+            self.edit_message_button.set_sensitive(False)
             self.delete_button.set_sensitive(False)
             self.changelog_button.set_sensitive(False)
             self.download_changelog_button.set_sensitive(False)
@@ -1090,6 +1124,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.current_button.set_sensitive(has_versions)
             self.compare_button.set_sensitive(len(self.history_entries) >= 2)
             self.export_button.set_sensitive(has_versions)
+            self.edit_message_button.set_sensitive(has_versions)
             self.delete_button.set_sensitive(has_versions)
             self.changelog_button.set_sensitive(True)
             self.download_changelog_button.set_sensitive(True)
@@ -1318,6 +1353,58 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             return None
         return result
 
+    def prompt_version_message(self, version: str, current_message: str) -> Optional[str]:
+        dialog = Gtk.Dialog(title=f"修改 {version} 的说明", transient_for=self, modal=True)
+        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "保存", Gtk.ResponseType.OK)
+        dialog.set_default_size(580, 320)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=16)
+        content.pack_start(Gtk.Label(label="改动内容（每行一条）", xalign=0), False, False, 0)
+        changes_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        changes_view.get_buffer().set_text(current_message)
+        changes_scroll = Gtk.ScrolledWindow()
+        changes_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        changes_scroll.set_min_content_height(190)
+        changes_scroll.add(changes_view)
+        content.pack_start(changes_scroll, True, True, 0)
+        dialog.get_content_area().add(content)
+        dialog.show_all()
+        response = dialog.run()
+        buffer = changes_view.get_buffer()
+        message = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True).strip()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return None
+        if not message:
+            self.show_error("请填写修改说明。")
+            return None
+        return message
+
+    def on_edit_version_message(self, _button) -> None:
+        if not self.repository:
+            return
+        selected = self.selected_history()
+        if len(selected) != 1:
+            self.show_error("请在版本历史中选择一个需要修改说明的版本。")
+            return
+        versions = [tag for tag in selected[0].tags if VERSION_PATTERN.match(tag)]
+        if len(versions) != 1:
+            self.show_error("所选记录没有唯一的版本标签，无法修改说明。")
+            return
+        version = versions[0]
+        try:
+            current_message = self.repository.version_message(version)
+        except GitError as error:
+            self.show_error(str(error))
+            return
+        message = self.prompt_version_message(version, current_message)
+        if message is None:
+            return
+        self.run_background(
+            "正在更新修改说明...",
+            lambda: self.repository.update_version_message(version, message),
+            f"版本 {version} 的修改说明已更新。",
+        )
+
     def on_compare_versions(self, _button) -> None:
         selected = self.selected_history()
         if len(selected) != 2:
@@ -1451,7 +1538,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             return
         entry = self.history_entries[index]
         try:
-            details = self.repository.commit_details(entry.commit)
+            details = self.repository.commit_details(entry.reference)
         except GitError as error:
             self.show_error(str(error))
             return
