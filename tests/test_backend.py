@@ -109,7 +109,7 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("2.5 MB", MODULE.format_storage_size(5 * 1024 * 1024 // 2))
 
     def test_application_version_uses_project_version_file(self):
-        self.assertEqual("0.1.1", MODULE.APP_VERSION)
+        self.assertEqual("0.1.2", MODULE.APP_VERSION)
 
     def test_recent_workspaces_are_deduplicated_limited_and_persisted(self):
         config_file = self.path / "config" / "settings.ini"
@@ -250,7 +250,9 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertNotIn("-expandall", command)
         self.assertIn("-leftreadonly", command)
         self.assertNotIn("-readonly", command)
-        self.assertIn("-filters=*;-.git\\", command)
+        filter_option = next(item for item in command if item.startswith("-filters="))
+        self.assertEqual(f"-filters={MODULE.BCOMPARE_FILTER}", filter_option)
+        self.assertFalse(filter_option.endswith("\\"))
         self.assertEqual(str(self.path), command[-1])
         self.assertEqual(
             "/tmp/code-version-manager-config",
@@ -269,6 +271,9 @@ class GitRepositoryTest(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("-readonly", command)
         self.assertNotIn("-leftreadonly", command)
+        self.assertFalse(
+            next(item for item in command if item.startswith("-filters=")).endswith("\\")
+        )
         self.assertNotEqual(str(self.path), command[-1])
         self.assertEqual(
             ["v0.0.1", "v0.0.2"],

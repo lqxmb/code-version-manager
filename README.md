@@ -33,6 +33,6 @@ sh build_deb.sh
 
 安装前需要的软件和完整安装步骤请查看 [INSTALL.md](INSTALL.md)。
 版本变更记录请查看 [CHANGELOG.rst](CHANGELOG.rst)。
-使用 `sudo apt install ./code-version-manager_0.1.1_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
+使用 `sudo apt install ./code-version-manager_0.1.2_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
 
 安装后从应用菜单打开 `Code Version Manager`。

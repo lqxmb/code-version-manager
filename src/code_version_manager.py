@@ -55,6 +55,8 @@ DEFAULT_EXCLUDED_DIRECTORIES = {
     "log",
     "logs",
 }
+# Ubuntu's bcompare launcher re-quotes arguments, so this must not end in a backslash.
+BCOMPARE_FILTER = "*;-.git\\;*"
 
 
 class GitError(RuntimeError):
@@ -514,7 +516,7 @@ class GitRepository:
                     "bcompare",
                     "-solo",
                     read_only_option,
-                    "-filters=*;-.git\\",
+                    f"-filters={BCOMPARE_FILTER}",
                     str(left_directory),
                     str(right_directory),
                 ],
