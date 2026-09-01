@@ -45,6 +45,8 @@ MANIFEST_DIRECTORY = "versions"
 MANIFEST_SUFFIX = ".manifest"
 MANAGER_CHANGELOG = "CHANGELOG.rst"
 RECENT_WORKSPACE_LIMIT = 10
+DELETE_TAG_RESPONSE = 1
+DELETE_COMMIT_RESPONSE = 2
 DEFAULT_EXCLUDED_DIRECTORIES = {
     ".git",
     ".cache",
@@ -495,6 +497,30 @@ class GitRepository:
         if version not in self.tags():
             raise GitError(f"版本 {version} 不存在或已经删除。")
         self.run(["tag", "--delete", version])
+        self._remove_version_metadata(version)
+
+    def delete_latest_version_commit(self, version: str) -> None:
+        if not VERSION_PATTERN.match(version) or version not in self.tags():
+            raise GitError(f"版本 {version} 不存在或已经删除。")
+        if self.current_branch() != "main":
+            raise GitError("只能在 main 分支上删除最新版本的 Git 提交。")
+        commit = self.run(["rev-list", "-n", "1", version]).strip()
+        head = self.run(["rev-parse", "HEAD"]).strip()
+        if commit != head:
+            raise GitError("所选版本不是 main 的最新提交。为避免改写后续历史，不能删除该提交。")
+        tags_at_head = self.run(["tag", "--points-at", commit]).splitlines()
+        if tags_at_head != [version]:
+            raise GitError("该提交还有其他标签，不能直接删除。")
+        parent = self.run(["rev-parse", f"{commit}^"], check=False).strip()
+        if not parent:
+            raise GitError("首个 Git 提交不能用此方式删除。")
+        if self.run(["diff", "--cached", "--name-only"]).strip():
+            raise GitError("暂存区已有文件。请先处理暂存内容再删除提交。")
+        self.run(["reset", "--mixed", parent])
+        self.run(["tag", "--delete", version])
+        self._remove_version_metadata(version)
+
+    def _remove_version_metadata(self, version: str) -> None:
         manifest_path = (
             self.metadata_path
             / MANIFEST_DIRECTORY
@@ -1327,20 +1353,27 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def prompt_version_metadata(self, default_version: str):
         dialog = Gtk.Dialog(title="发布版本", transient_for=self, modal=True)
         dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "继续", Gtk.ResponseType.OK)
-        dialog.set_default_size(580, 340)
-        grid = Gtk.Grid(column_spacing=12, row_spacing=10, margin=16)
+        dialog.set_default_size(720, 500)
+        dialog.set_size_request(560, 360)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=18)
+        content.set_hexpand(True)
+        content.set_vexpand(True)
+        version_row = Gtk.Grid(column_spacing=12)
+        version_row.set_hexpand(True)
         version_entry = Gtk.Entry(text=default_version)
-        changes_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
-        changes_scroll = Gtk.ScrolledWindow()
-        changes_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        changes_scroll.set_min_content_height(170)
-        changes_scroll.add(changes_view)
-        grid.attach(Gtk.Label(label="版本号", xalign=0), 0, 0, 1, 1)
-        grid.attach(version_entry, 1, 0, 1, 1)
-        grid.attach(Gtk.Label(label="改动内容（每行一条）", xalign=0, yalign=0), 0, 1, 1, 1)
-        grid.attach(changes_scroll, 1, 1, 1, 1)
-        dialog.get_content_area().add(grid)
+        version_entry.set_hexpand(True)
+        version_row.attach(Gtk.Label(label="版本号", xalign=0), 0, 0, 1, 1)
+        version_row.attach(version_entry, 1, 0, 1, 1)
+        changes_view, changes_scroll = self._build_changes_editor()
+        content.pack_start(version_row, False, False, 0)
+        content.pack_start(
+            Gtk.Label(label="改动内容（每行一条）", xalign=0), False, False, 0
+        )
+        content.pack_start(changes_scroll, True, True, 0)
+        dialog.get_content_area().pack_start(content, True, True, 0)
         dialog.show_all()
+        version_entry.grab_focus()
+        version_entry.select_region(0, -1)
         response = dialog.run()
         buffer = changes_view.get_buffer()
         message = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True).strip()
@@ -1356,18 +1389,17 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def prompt_version_message(self, version: str, current_message: str) -> Optional[str]:
         dialog = Gtk.Dialog(title=f"修改 {version} 的说明", transient_for=self, modal=True)
         dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "保存", Gtk.ResponseType.OK)
-        dialog.set_default_size(580, 320)
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=16)
+        dialog.set_default_size(720, 500)
+        dialog.set_size_request(560, 360)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=18)
+        content.set_hexpand(True)
+        content.set_vexpand(True)
         content.pack_start(Gtk.Label(label="改动内容（每行一条）", xalign=0), False, False, 0)
-        changes_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
-        changes_view.get_buffer().set_text(current_message)
-        changes_scroll = Gtk.ScrolledWindow()
-        changes_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        changes_scroll.set_min_content_height(190)
-        changes_scroll.add(changes_view)
+        changes_view, changes_scroll = self._build_changes_editor(current_message)
         content.pack_start(changes_scroll, True, True, 0)
-        dialog.get_content_area().add(content)
+        dialog.get_content_area().pack_start(content, True, True, 0)
         dialog.show_all()
+        changes_view.grab_focus()
         response = dialog.run()
         buffer = changes_view.get_buffer()
         message = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True).strip()
@@ -1378,6 +1410,25 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.show_error("请填写修改说明。")
             return None
         return message
+
+    @staticmethod
+    def _build_changes_editor(initial_message: str = ""):
+        changes_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        changes_view.set_hexpand(True)
+        changes_view.set_vexpand(True)
+        changes_view.set_left_margin(10)
+        changes_view.set_right_margin(10)
+        changes_view.set_top_margin(8)
+        changes_view.set_bottom_margin(8)
+        changes_view.get_buffer().set_text(initial_message)
+        changes_scroll = Gtk.ScrolledWindow()
+        changes_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        changes_scroll.set_shadow_type(Gtk.ShadowType.IN)
+        changes_scroll.set_min_content_height(280)
+        changes_scroll.set_hexpand(True)
+        changes_scroll.set_vexpand(True)
+        changes_scroll.add(changes_view)
+        return changes_view, changes_scroll
 
     def on_edit_version_message(self, _button) -> None:
         if not self.repository:
@@ -1480,20 +1531,30 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             text=f"确定删除版本 {version}？",
         )
         dialog.format_secondary_text(
-            "该版本将从版本列表和 CHANGELOG 中移除。Git 提交和工作空间文件不会删除。"
+            "“仅删除版本”保留 Git 提交。\n"
+            "“删除版本及提交”仅适用于 main 的最新版本；"
+            "main 将退回上一提交，当前文件保留为未提交修改。"
         )
         dialog.add_button("取消", Gtk.ResponseType.CANCEL)
-        delete_button = dialog.add_button("删除版本", Gtk.ResponseType.OK)
-        delete_button.get_style_context().add_class("destructive-action")
+        delete_tag_button = dialog.add_button("仅删除版本", DELETE_TAG_RESPONSE)
+        delete_tag_button.get_style_context().add_class("destructive-action")
+        delete_commit_button = dialog.add_button(
+            "删除版本及提交", DELETE_COMMIT_RESPONSE
+        )
+        delete_commit_button.get_style_context().add_class("destructive-action")
         response = dialog.run()
         dialog.destroy()
-        if response != Gtk.ResponseType.OK:
+        if response == DELETE_TAG_RESPONSE:
+            operation = lambda: self.repository.delete_version(version)
+            busy = "正在删除版本..."
+            success = f"版本 {version} 已删除，Git 提交已保留。"
+        elif response == DELETE_COMMIT_RESPONSE:
+            operation = lambda: self.repository.delete_latest_version_commit(version)
+            busy = "正在删除版本及提交..."
+            success = f"版本 {version} 及其 Git 提交已删除。"
+        else:
             return
-        self.run_background(
-            "正在删除版本...",
-            lambda: self.repository.delete_version(version),
-            f"版本 {version} 已删除。",
-        )
+        self.run_background(busy, operation, success)
 
     def on_view_changelog(self, _button) -> None:
         if not self.repository:

@@ -19,6 +19,7 @@
 - Beyond Compare 使用独立临时配置，默认不展开下级目录
 - 任意选择一个历史版本并下载为 ZIP
 - 删除所选版本标签，不改写提交历史或删除工作空间文件
+- 删除 main 的最新版本及 Git 提交，分支退回上一提交并保留文件为当前修改
 - 在窗口底部显示当前 Git 增量版本历史占用的磁盘空间
 - 查看或下载自动生成的版本管理 `CHANGELOG.rst`
 - CHANGELOG 使用标准 RST 标题格式，每行改动自动输出为 `* 内容`
@@ -34,6 +35,6 @@ sh build_deb.sh
 
 安装前需要的软件和完整安装步骤请查看 [INSTALL.md](INSTALL.md)。
 版本变更记录请查看 [CHANGELOG.rst](CHANGELOG.rst)。
-使用 `sudo apt install ./code-version-manager_0.1.3_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
+使用 `sudo apt install ./code-version-manager_0.1.4_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
 
 安装后从应用菜单打开 `Code Version Manager`。

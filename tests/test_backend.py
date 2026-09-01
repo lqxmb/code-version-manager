@@ -109,7 +109,7 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("2.5 MB", MODULE.format_storage_size(5 * 1024 * 1024 // 2))
 
     def test_application_version_uses_project_version_file(self):
-        self.assertEqual("0.1.3", MODULE.APP_VERSION)
+        self.assertEqual("0.1.5", MODULE.APP_VERSION)
 
     def test_recent_workspaces_are_deduplicated_limited_and_persisted(self):
         config_file = self.path / "config" / "settings.ini"
@@ -210,6 +210,61 @@ class GitRepositoryTest(unittest.TestCase):
     def test_delete_version_rejects_unknown_version(self):
         with self.assertRaises(MODULE.GitError):
             self.repository.delete_version("v9.9.9")
+
+    def test_delete_latest_version_commit_keeps_files_as_current_changes(self):
+        self.git("branch", "-m", "main")
+        (self.path / "robot.txt").write_text("bad version\n", encoding="utf-8")
+        self.repository.save_version("v0.0.2", "bad version", ["robot.txt"])
+        bad_commit = self.repository.run(["rev-parse", "HEAD"]).strip()
+        parent = self.repository.run(["rev-parse", "HEAD^"]).strip()
+        manifest = (
+            self.repository.metadata_path
+            / MODULE.MANIFEST_DIRECTORY
+            / f"v0.0.2{MODULE.MANIFEST_SUFFIX}"
+        )
+        self.assertTrue(manifest.exists())
+        (self.path / "robot.txt").write_text("local fix\n", encoding="utf-8")
+
+        self.repository.delete_latest_version_commit("v0.0.2")
+
+        self.assertEqual("main", self.repository.current_branch())
+        self.assertEqual(parent, self.repository.run(["rev-parse", "HEAD"]).strip())
+        self.assertNotEqual(bad_commit, self.repository.run(["rev-parse", "HEAD"]).strip())
+        self.assertNotIn("v0.0.2", self.repository.tags())
+        self.assertFalse(manifest.exists())
+        self.assertEqual("local fix\n", (self.path / "robot.txt").read_text(encoding="utf-8"))
+        self.assertIn("robot.txt", self.repository.changed_paths())
+        self.assertNotIn("0.0.2 (", self.repository.changelog_text())
+
+    def test_delete_latest_version_commit_rejects_older_version(self):
+        self.git("branch", "-m", "main")
+        (self.path / "robot.txt").write_text("two\n", encoding="utf-8")
+        self.repository.save_version("v0.0.2", "second", ["robot.txt"])
+
+        with self.assertRaises(MODULE.GitError):
+            self.repository.delete_latest_version_commit("v0.0.1")
+
+        self.assertIn("v0.0.1", self.repository.tags())
+        self.assertIn("v0.0.2", self.repository.tags())
+
+    def test_delete_latest_version_commit_rejects_staged_changes(self):
+        self.git("branch", "-m", "main")
+        (self.path / "robot.txt").write_text("two\n", encoding="utf-8")
+        self.repository.save_version("v0.0.2", "second", ["robot.txt"])
+        (self.path / "other.txt").write_text("staged\n", encoding="utf-8")
+        self.repository.run(["add", "other.txt"])
+
+        with self.assertRaises(MODULE.GitError):
+            self.repository.delete_latest_version_commit("v0.0.2")
+
+        self.assertIn("v0.0.2", self.repository.tags())
+
+    def test_delete_latest_version_commit_rejects_initial_commit(self):
+        self.git("branch", "-m", "main")
+        with self.assertRaises(MODULE.GitError):
+            self.repository.delete_latest_version_commit("v0.0.1")
+
+        self.assertIn("v0.0.1", self.repository.tags())
 
     def test_update_version_message_updates_tag_without_rewriting_commit(self):
         commit_before = self.repository.run(["rev-list", "-n", "1", "v0.0.1"]).strip()
