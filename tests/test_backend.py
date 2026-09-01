@@ -591,5 +591,24 @@ class EditVersionMessageTest(unittest.TestCase):
         self.assertEqual([], window.errors)
 
 
+class DialogMaximizeTest(unittest.TestCase):
+    def test_maximize_button_toggles_window_state(self):
+        dialog = mock.Mock()
+        dialog.is_maximized.return_value = False
+
+        MODULE.VersionManagerWindow._on_toggle_dialog_maximized(None, dialog)
+
+        dialog.maximize.assert_called_once_with()
+        dialog.unmaximize.assert_not_called()
+
+        dialog.reset_mock()
+        dialog.is_maximized.return_value = True
+
+        MODULE.VersionManagerWindow._on_toggle_dialog_maximized(None, dialog)
+
+        dialog.unmaximize.assert_called_once_with()
+        dialog.maximize.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

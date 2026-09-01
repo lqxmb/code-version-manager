@@ -21,7 +21,7 @@
 - 删除所选版本标签，不改写提交历史或删除工作空间文件
 - 删除 main 的最新版本及 Git 提交，分支退回上一提交并保留文件为当前修改
 - 在窗口底部显示当前 Git 增量版本历史占用的磁盘空间
-- 查看或下载自动生成的版本管理 `CHANGELOG.rst`
+- 查看或下载自动生成的版本管理 `CHANGELOG.rst`，查看窗口支持一键最大化和还原
 - CHANGELOG 使用标准 RST 标题格式，每行改动自动输出为 `* 内容`
 - 工具元数据保存在 `.git/code-version-manager/`，不会污染工作空间根目录
 - 在历史版本状态下阻止误提交
@@ -35,6 +35,6 @@ sh build_deb.sh
 
 安装前需要的软件和完整安装步骤请查看 [INSTALL.md](INSTALL.md)。
 版本变更记录请查看 [CHANGELOG.rst](CHANGELOG.rst)。
-使用 `sudo apt install ./code-version-manager_0.1.4_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
+使用 `sudo apt install ./code-version-manager_0.1.5_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
 
 安装后从应用菜单打开 `Code Version Manager`。

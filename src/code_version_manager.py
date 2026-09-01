@@ -20,7 +20,8 @@ from typing import Dict, List, Optional, Sequence
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 
 def load_application_version() -> str:
@@ -960,6 +961,42 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         button.connect("clicked", callback)
         return button
 
+    @staticmethod
+    def _add_maximize_button(dialog: Gtk.Dialog) -> Gtk.Button:
+        dialog.set_type_hint(Gdk.WindowTypeHint.NORMAL)
+        header = Gtk.HeaderBar()
+        header.set_title(dialog.get_title())
+        header.set_show_close_button(True)
+        button = Gtk.Button.new_from_icon_name(
+            "view-fullscreen-symbolic", Gtk.IconSize.BUTTON
+        )
+        button.set_tooltip_text("最大化窗口")
+        button.connect(
+            "clicked", VersionManagerWindow._on_toggle_dialog_maximized, dialog
+        )
+        dialog.connect(
+            "window-state-event", VersionManagerWindow._on_dialog_window_state, button
+        )
+        header.pack_end(button)
+        dialog.set_titlebar(header)
+        return button
+
+    @staticmethod
+    def _on_toggle_dialog_maximized(_button, dialog: Gtk.Dialog) -> None:
+        if dialog.is_maximized():
+            dialog.unmaximize()
+        else:
+            dialog.maximize()
+
+    @staticmethod
+    def _on_dialog_window_state(_dialog, event, button: Gtk.Button) -> bool:
+        maximized = bool(event.new_window_state & Gdk.WindowState.MAXIMIZED)
+        icon = "view-restore-symbolic" if maximized else "view-fullscreen-symbolic"
+        tooltip = "还原窗口" if maximized else "最大化窗口"
+        button.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
+        button.set_tooltip_text(tooltip)
+        return False
+
     def _build_content(self) -> None:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(root)
@@ -1562,6 +1599,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog = Gtk.Dialog(title="版本管理 CHANGELOG", transient_for=self, modal=True)
         dialog.add_button("关闭", Gtk.ResponseType.CLOSE)
         dialog.set_default_size(760, 560)
+        self._add_maximize_button(dialog)
         text = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
         text.get_buffer().set_text(self.repository.changelog_text())
         scroll = Gtk.ScrolledWindow()
