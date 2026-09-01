@@ -14,7 +14,7 @@
 - 版本历史按多段版本号从新到旧排序，不受文件日期影响
 - 查看版本历史和版本标签
 - 使用 Beyond Compare 比较两个完整版本目录
-- 选择一个历史版本，使用 Beyond Compare 与完整当前工作空间比较
+- 选择一个历史版本，使用 Beyond Compare 与完整当前工作空间比较并修改当前文件
 - Beyond Compare 使用独立临时配置，默认不展开下级目录
 - 任意选择一个历史版本并下载为 ZIP
 - 删除所选版本标签，不改写提交历史或删除工作空间文件
@@ -33,6 +33,6 @@ sh build_deb.sh
 
 安装前需要的软件和完整安装步骤请查看 [INSTALL.md](INSTALL.md)。
 版本变更记录请查看 [CHANGELOG.rst](CHANGELOG.rst)。
-使用 `sudo apt install ./code-version-manager_0.1.0_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
+使用 `sudo apt install ./code-version-manager_0.1.1_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
 
 安装后从应用菜单打开 `Code Version Manager`。

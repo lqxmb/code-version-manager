@@ -109,7 +109,7 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("2.5 MB", MODULE.format_storage_size(5 * 1024 * 1024 // 2))
 
     def test_application_version_uses_project_version_file(self):
-        self.assertEqual("0.1.0", MODULE.APP_VERSION)
+        self.assertEqual("0.1.1", MODULE.APP_VERSION)
 
     def test_recent_workspaces_are_deduplicated_limited_and_persisted(self):
         config_file = self.path / "config" / "settings.ini"
@@ -233,11 +233,10 @@ class GitRepositoryTest(unittest.TestCase):
             (right / "other.txt").read_text(encoding="utf-8"),
         )
 
-    def test_compare_does_not_expand_directories_by_default(self):
+    def test_compare_current_uses_editable_workspace(self):
         completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with mock.patch.object(MODULE.shutil, "which", return_value="/usr/bin/bcompare"), \
              mock.patch.object(self.repository, "materialize"), \
-             mock.patch.object(self.repository, "materialize_current"), \
              mock.patch.object(
                  MODULE,
                  "prepare_bcompare_config",
@@ -249,12 +248,32 @@ class GitRepositoryTest(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual("bcompare", command[0])
         self.assertNotIn("-expandall", command)
-        self.assertIn("-filters=*", command)
+        self.assertIn("-leftreadonly", command)
+        self.assertNotIn("-readonly", command)
+        self.assertIn("-filters=*;-.git\\", command)
+        self.assertEqual(str(self.path), command[-1])
         self.assertEqual(
             "/tmp/code-version-manager-config",
             run.call_args.kwargs["env"]["XDG_CONFIG_HOME"],
         )
         prepare_config.assert_called_once()
+
+    def test_compare_versions_keeps_both_snapshots_read_only(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(MODULE.shutil, "which", return_value="/usr/bin/bcompare"), \
+             mock.patch.object(self.repository, "materialize") as materialize, \
+             mock.patch.object(MODULE, "prepare_bcompare_config"), \
+             mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+            self.repository.compare("v0.0.1", "v0.0.2")
+
+        command = run.call_args.args[0]
+        self.assertIn("-readonly", command)
+        self.assertNotIn("-leftreadonly", command)
+        self.assertNotEqual(str(self.path), command[-1])
+        self.assertEqual(
+            ["v0.0.1", "v0.0.2"],
+            [call.args[0] for call in materialize.call_args_list],
+        )
 
     def test_bcompare_config_forces_saved_sessions_to_stay_collapsed(self):
         source_home = self.path / "source-config"

@@ -492,30 +492,20 @@ class GitRepository:
                     raise GitError("版本包包含不安全的文件路径。")
             bundle.extractall(destination)
 
-    def materialize_current(self, destination: Path) -> None:
-        destination.mkdir(parents=True, exist_ok=True)
-        for relative in self.candidate_files():
-            source = self.path / relative
-            target = destination / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if source.is_symlink():
-                target.symlink_to(os.readlink(source))
-            else:
-                shutil.copy2(source, target)
-
     def compare(self, left: str, right: Optional[str] = None) -> None:
         if not shutil.which("bcompare"):
             raise GitError("没有找到 Beyond Compare。")
         with tempfile.TemporaryDirectory(prefix="code-version-manager-compare-") as temporary:
             root = Path(temporary)
             left_directory = root / reference_folder_name(left, "left")
-            right_label = right or "current"
-            right_directory = root / reference_folder_name(right_label, "right")
             self.materialize(left, left_directory)
             if right:
+                right_directory = root / reference_folder_name(right, "right")
                 self.materialize(right, right_directory)
+                read_only_option = "-readonly"
             else:
-                self.materialize_current(right_directory)
+                right_directory = self.path
+                read_only_option = "-leftreadonly"
             config_home = prepare_bcompare_config(root)
             environment = os.environ.copy()
             environment["XDG_CONFIG_HOME"] = str(config_home)
@@ -523,8 +513,8 @@ class GitRepository:
                 [
                     "bcompare",
                     "-solo",
-                    "-readonly",
-                    "-filters=*",
+                    read_only_option,
+                    "-filters=*;-.git\\",
                     str(left_directory),
                     str(right_directory),
                 ],
