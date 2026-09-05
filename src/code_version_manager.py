@@ -11,7 +11,6 @@ import sys
 import tarfile
 import tempfile
 import threading
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -59,8 +58,9 @@ DEFAULT_EXCLUDED_DIRECTORIES = {
     "logs",
 }
 # Ubuntu's bcompare launcher re-quotes arguments, so this must not end in a backslash.
-BCOMPARE_FILTER = "*;-.git\\;*"
-
+# The order is the same as Beyond Compare's Name Filters view: include files,
+# include folders, then the excluded file/folder masks.
+BCOMPARE_FILTER = "*;*;-.git\\;-*.zip;-__pycache__/"
 
 class GitError(RuntimeError):
     pass
@@ -726,7 +726,23 @@ def reference_folder_name(reference: str, fallback: str) -> str:
     return cleaned or fallback
 
 
+def bundled_bcompare_sessions_path() -> Path:
+    """Locate the BCSessions.xml shipped with the source tree or package."""
+    source = Path(__file__).resolve()
+    candidates = (
+        source.parent / "bcompare" / "BCSessions.xml",
+        source.parents[1] / "data" / "bcompare" / "BCSessions.xml",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise GitError("软件缺少 Beyond Compare 默认配置文件。")
+
+
 def prepare_bcompare_config(temporary_root: Path) -> Path:
+    # BCSessions.xml is shipped with this application so the comparison rules
+    # do not depend on whichever workspace or user session was opened first.
+    template = bundled_bcompare_sessions_path()
     config_home = temporary_root / "config"
     target = config_home / "bcompare"
     source_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
@@ -735,44 +751,20 @@ def prepare_bcompare_config(temporary_root: Path) -> Path:
         shutil.copytree(
             source,
             target,
-            ignore=shutil.ignore_patterns("BCLOCK_*", "BcCrashReport-*.log"),
+            # Sessions contain user-specific paths and rules.  They are
+            # replaced below so every workspace gets the same compare setup.
+            ignore=shutil.ignore_patterns(
+                "BCLOCK_*",
+                "BcCrashReport-*.log",
+                "BCSessions.xml",
+                "BCSessions.xml.bak",
+            ),
         )
     else:
         target.mkdir(parents=True, exist_ok=True)
 
     sessions_path = target / "BCSessions.xml"
-    try:
-        tree = ET.parse(sessions_path)
-        root = tree.getroot()
-    except (OSError, ET.ParseError):
-        root = ET.Element("BCSessions", Version="1", MinVersion="1")
-        session_folder = ET.SubElement(root, "TSessionFolder")
-        items = ET.SubElement(session_folder, "Items")
-        session = ET.SubElement(items, "TDirCompareSession")
-        ET.SubElement(session, "Rules")
-        tree = ET.ElementTree(root)
-
-    rules_nodes = root.findall(".//TDirCompareSession/Rules")
-    if not rules_nodes:
-        session_folder = root.find("TSessionFolder")
-        if session_folder is None:
-            session_folder = ET.SubElement(root, "TSessionFolder")
-        items = session_folder.find("Items")
-        if items is None:
-            items = ET.SubElement(session_folder, "Items")
-        session = ET.SubElement(items, "TDirCompareSession")
-        rules_nodes = [ET.SubElement(session, "Rules")]
-
-    for rules in rules_nodes:
-        expand_all = rules.find("ExpandAllOnLoad")
-        if expand_all is None:
-            expand_all = ET.SubElement(rules, "ExpandAllOnLoad")
-        expand_all.set("Value", "False")
-        expand_differences = rules.find("ExpandDiffsOnLoad")
-        if expand_differences is not None:
-            expand_differences.set("Value", "False")
-
-    tree.write(sessions_path, encoding="UTF-8", xml_declaration=True)
+    shutil.copyfile(template, sessions_path)
     return config_home
 
 

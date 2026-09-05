@@ -16,7 +16,7 @@
 - 手动修改已发布版本的修改说明，并同步更新 Git 标签和 CHANGELOG
 - 使用 Beyond Compare 比较两个完整版本目录
 - 选择一个历史版本，使用 Beyond Compare 与完整当前工作空间比较并修改当前文件
-- Beyond Compare 使用独立临时配置，默认不展开下级目录
+- Beyond Compare 每次比较都加载软件内置的 `BCSessions.xml` 默认配置：按文件大小比较、关闭时间戳和内容快速比较、启用 Unicode 规范化，排除 `.git`、`*.zip` 和 `__pycache__`，目录树默认折叠
 - 任意选择一个历史版本并下载为 ZIP
 - 删除所选版本标签，不改写提交历史或删除工作空间文件
 - 删除 main 的最新版本及 Git 提交，分支退回上一提交并保留文件为当前修改
@@ -35,6 +35,6 @@ sh build_deb.sh
 
 安装前需要的软件和完整安装步骤请查看 [INSTALL.md](INSTALL.md)。
 版本变更记录请查看 [CHANGELOG.rst](CHANGELOG.rst)。
-使用 `sudo apt install ./code-version-manager_0.1.5_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
+使用 `sudo apt install ./code-version-manager_0.1.6_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
 
 安装后从应用菜单打开 `Code Version Manager`。

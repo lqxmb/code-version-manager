@@ -17,6 +17,7 @@ mkdir -p \
     "$stage/DEBIAN" \
     "$stage/usr/bin" \
     "$stage/usr/lib/$package_name" \
+    "$stage/usr/lib/$package_name/bcompare" \
     "$stage/usr/share/applications" \
     "$stage/usr/share/icons/hicolor/scalable/apps" \
     "$stage/usr/share/doc/$package_name" \
@@ -28,6 +29,8 @@ install -m 0755 "$project_dir/debian/postrm" "$stage/DEBIAN/postrm"
 install -m 0755 "$project_dir/src/code_version_manager.py" \
     "$stage/usr/lib/$package_name/code_version_manager.py"
 install -m 0644 "$project_dir/VERSION" "$stage/usr/lib/$package_name/VERSION"
+install -m 0644 "$project_dir/data/bcompare/BCSessions.xml" \
+    "$stage/usr/lib/$package_name/bcompare/BCSessions.xml"
 install -m 0644 "$project_dir/data/code-version-manager.desktop" \
     "$stage/usr/share/applications/code-version-manager.desktop"
 install -m 0644 "$project_dir/data/code-version-manager.svg" \

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Produced by Beyond Compare 4 from Scooter Software -->
+<BCSessions Version="1" MinVersion="1">
+	<TSessionFolder>
+		<Items>
+			<TDirCompareSession>
+				<Filters>
+					<NameFilter Value="*;*;-.git\;-*.zip;-__pycache__/"/>
+				</Filters>
+				<Rules>
+					<UseSizeComparison Value="True"/>
+					<UseTimestampComparison Value="False"/>
+					<TimestampTolerance Value="2"/>
+					<IgnoreDST Value="False"/>
+					<IgnoreTimeZone Value="False"/>
+					<UseCaseSensitiveComparison Value="False"/>
+					<IgnoreFileExts Value="False"/>
+					<NormalizedAlignment Value="True"/>
+					<UseContentComparison Value="False"/>
+					<ContentCompareKind Value="ccRulesBased"/>
+					<ContentCompareSkipSame Value="False"/>
+					<ContentCompareOverrides Value="True"/>
+					<ExpandAllOnLoad Value="False"/>
+					<ExpandDiffsOnLoad Value="False"/>
+				</Rules>
+			</TDirCompareSession>
+		</Items>
+	</TSessionFolder>
+</BCSessions>

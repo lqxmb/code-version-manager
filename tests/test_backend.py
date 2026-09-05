@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
@@ -109,7 +110,7 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("2.5 MB", MODULE.format_storage_size(5 * 1024 * 1024 // 2))
 
     def test_application_version_uses_project_version_file(self):
-        self.assertEqual("0.1.5", MODULE.APP_VERSION)
+        self.assertEqual("0.1.6", MODULE.APP_VERSION)
 
     def test_recent_workspaces_are_deduplicated_limited_and_persisted(self):
         config_file = self.path / "config" / "settings.ini"
@@ -369,7 +370,15 @@ class GitRepositoryTest(unittest.TestCase):
             [call.args[0] for call in materialize.call_args_list],
         )
 
-    def test_bcompare_config_forces_saved_sessions_to_stay_collapsed(self):
+    def test_compare_requires_beyond_compare_before_loading_config(self):
+        with mock.patch.object(MODULE.shutil, "which", return_value=None), \
+             mock.patch.object(MODULE, "prepare_bcompare_config") as prepare_config:
+            with self.assertRaises(MODULE.GitError):
+                self.repository.compare("v0.0.1")
+
+        prepare_config.assert_not_called()
+
+    def test_bcompare_config_uses_bundled_defaults_and_stays_collapsed(self):
         source_home = self.path / "source-config"
         source = source_home / "bcompare"
         source.mkdir(parents=True)
@@ -377,7 +386,8 @@ class GitRepositoryTest(unittest.TestCase):
         sessions.write_text(
             """<?xml version="1.0" encoding="UTF-8"?>
 <BCSessions Version="1" MinVersion="1">
-  <TSessionFolder><Items><TDirCompareSession><Rules>
+  <TSessionFolder><Items><TDirCompareSession>
+  <Filters><NameFilter Value="*.txt"/></Filters><Rules>
     <ExpandAllOnLoad Value="True"/>
     <ExpandDiffsOnLoad Value="True"/>
   </Rules></TDirCompareSession></Items></TSessionFolder>
@@ -388,7 +398,12 @@ class GitRepositoryTest(unittest.TestCase):
         with mock.patch.dict(MODULE.os.environ, {"XDG_CONFIG_HOME": str(source_home)}):
             config_home = MODULE.prepare_bcompare_config(self.path / "isolated")
 
-        copied = MODULE.ET.parse(config_home / "bcompare" / "BCSessions.xml")
+        copied_path = config_home / "bcompare" / "BCSessions.xml"
+        self.assertEqual(
+            MODULE.bundled_bcompare_sessions_path().read_bytes(),
+            copied_path.read_bytes(),
+        )
+        copied = ET.parse(copied_path)
         self.assertEqual(
             ["False"],
             [node.get("Value") for node in copied.findall(".//ExpandAllOnLoad")],
@@ -397,7 +412,36 @@ class GitRepositoryTest(unittest.TestCase):
             ["False"],
             [node.get("Value") for node in copied.findall(".//ExpandDiffsOnLoad")],
         )
-        original = MODULE.ET.parse(sessions)
+        session = copied.find(".//TDirCompareSession")
+        self.assertIsNotNone(session)
+        self.assertEqual(
+            MODULE.BCOMPARE_FILTER,
+            session.find("./Filters/NameFilter").get("Value"),
+        )
+        rules = session.find("./Rules")
+        self.assertIsNotNone(rules)
+        self.assertEqual(
+            {
+                "UseSizeComparison": "True",
+                "UseTimestampComparison": "False",
+                "TimestampTolerance": "2",
+                "IgnoreDST": "False",
+                "IgnoreTimeZone": "False",
+                "UseCaseSensitiveComparison": "False",
+                "IgnoreFileExts": "False",
+                "NormalizedAlignment": "True",
+                "UseContentComparison": "False",
+                "ContentCompareKind": "ccRulesBased",
+                "ContentCompareSkipSame": "False",
+                "ContentCompareOverrides": "True",
+                "ExpandAllOnLoad": "False",
+                "ExpandDiffsOnLoad": "False",
+            },
+            {
+                node.tag: node.get("Value") for node in rules
+            },
+        )
+        original = ET.parse(sessions)
         self.assertEqual("True", original.find(".//ExpandAllOnLoad").get("Value"))
 
     def test_initialize_unversioned_workspace(self):
