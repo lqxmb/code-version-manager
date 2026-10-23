@@ -587,6 +587,43 @@ class CompareCurrentSelectionTest(unittest.TestCase):
         self.assertIn("选择一个", window.errors[0])
 
 
+class DownloadVersionTest(unittest.TestCase):
+    def test_download_name_includes_workspace_name(self):
+        for tags, expected_name in (
+            (("v1.2.0",), "m9_ws_v1.2.0.zip"),
+            ((), "m9_ws_aaaaaaa.zip"),
+        ):
+            with self.subTest(tags=tags):
+                entry = MODULE.HistoryEntry(
+                    commit="a" * 40,
+                    short_commit="aaaaaaa",
+                    date="2026-10-23",
+                    subject="selected version",
+                    tags=tags,
+                )
+                destination = Path("/downloads/custom-name.zip")
+                window = mock.Mock()
+                window.workspace_path = Path("/workspaces/m9_ws")
+                window.selected_history.return_value = [entry]
+                window.run_background.side_effect = (
+                    lambda _status, operation, _success: operation()
+                )
+                dialog = mock.Mock()
+                dialog.run.return_value = MODULE.Gtk.ResponseType.OK
+                dialog.get_filename.return_value = str(destination)
+
+                with mock.patch.object(
+                    MODULE.Gtk, "FileChooserDialog", return_value=dialog
+                ):
+                    MODULE.VersionManagerWindow.on_download_version(window, None)
+
+                dialog.set_current_name.assert_called_once_with(expected_name)
+                window.repository.export.assert_called_once_with(
+                    entry.reference, destination
+                )
+                window.show_error.assert_not_called()
+
+
 class EditVersionMessageTest(unittest.TestCase):
     def test_edits_selected_version_message(self):
         entry = MODULE.HistoryEntry(

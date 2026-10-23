@@ -1519,7 +1519,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.show_error("请在版本历史中选择一个需要下载的版本。")
             return
         entry = selected[0]
-        default_name = (entry.tags[0] if entry.tags else entry.short_commit) + ".zip"
+        version_name = entry.tags[0] if entry.tags else entry.short_commit
+        default_name = f"{self.workspace_path.name}_{version_name}.zip"
         dialog = Gtk.FileChooserDialog(
             title="下载版本",
             parent=self,

@@ -17,7 +17,7 @@
 - 使用 Beyond Compare 比较两个完整版本目录
 - 选择一个历史版本，使用 Beyond Compare 与完整当前工作空间比较并修改当前文件
 - Beyond Compare 每次比较都加载软件内置的 `BCSessions.xml` 默认配置：按文件大小比较、关闭时间戳和内容快速比较、启用 Unicode 规范化，排除 `.git`、`*.zip` 和 `__pycache__`，目录树默认折叠
-- 任意选择一个历史版本并下载为 ZIP
+- 任意选择一个历史版本并下载为 ZIP，默认文件名为 `工作空间名_版本号.zip`（如 `m9_ws_v1.2.0.zip`）
 - 删除所选版本标签，不改写提交历史或删除工作空间文件
 - 删除 main 的最新版本及 Git 提交，分支退回上一提交并保留文件为当前修改
 - 在窗口底部显示当前 Git 增量版本历史占用的磁盘空间
@@ -27,14 +27,27 @@
 - 在历史版本状态下阻止误提交
 - 通过窗口标题栏的“关于”按钮查看当前软件版本
 
-构建安装包：
+## 构建 0.1.7 安装包
+
+构建脚本要求 `VERSION` 和 `debian/control` 中的版本号一致。执行以下命令同步版本号并打包：
 
 ```bash
+cd /home/qm/Tool/code-version-manager
+printf '0.1.7\n' > VERSION
+sed -i 's/^Version:.*/Version: 0.1.7/' debian/control
 sh build_deb.sh
+```
+
+生成的安装包为 `dist/code-version-manager_0.1.7_all.deb`。
+
+在项目目录中执行以下命令安装或升级：
+
+```bash
+sudo apt install ./dist/code-version-manager_0.1.7_all.deb
 ```
 
 安装前需要的软件和完整安装步骤请查看 [INSTALL.md](INSTALL.md)。
 版本变更记录请查看 [CHANGELOG.rst](CHANGELOG.rst)。
-使用 `sudo apt install ./code-version-manager_0.1.6_all.deb` 安装时，APT 会自动检查并安装缺少的必需依赖。
+使用 `apt install` 安装时，APT 会自动检查并安装缺少的必需依赖。
 
 安装后从应用菜单打开 `Code Version Manager`。
