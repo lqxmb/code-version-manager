@@ -609,9 +609,9 @@ class RemoteRepositoryTest(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         ).stdout.strip()
 
-    def configure(self, remote=None, auto_sync=True):
+    def configure(self, remote=None):
         self.repository.configure_remote(
-            str(remote or self.remote), "Test User", "test@example.com", auto_sync
+            str(remote or self.remote), "Test User", "test@example.com"
         )
 
     def publish(self, version):
@@ -621,10 +621,11 @@ class RemoteRepositoryTest(unittest.TestCase):
     def test_configure_is_local_and_preserves_unrelated_remotes(self):
         self.repository.run(["remote", "add", "backup", str(self.root / "backup.git")])
         self.repository.run(["config", "--local", "codeversionmanager.username", "old-account"])
+        self.repository.run(["config", "--local", "codeversionmanager.autoSync", "true"])
         self.configure()
 
         self.assertEqual(str(self.remote), self.repository.remote_url())
-        self.assertTrue(self.repository.auto_sync_enabled())
+        self.assertEqual("", self.repository.run(["config", "--local", "--get", "codeversionmanager.autoSync"], check=False))
         self.assertEqual("Test User", self.git(self.path, "config", "--local", "user.name"))
         self.assertEqual("", self.repository.run(["config", "--local", "--get", "codeversionmanager.username"], check=False))
         self.assertEqual(["backup", "origin"], self.git(self.path, "remote").splitlines())
@@ -676,7 +677,7 @@ class RemoteRepositoryTest(unittest.TestCase):
         self.git(empty, "init", "-q")
         repository = MODULE.GitRepository(empty)
         repository.configure_remote(
-            str(self.remote), "Test", "test@example.com", False
+            str(self.remote), "Test", "test@example.com"
         )
         completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with mock.patch.object(MODULE, "run_remote_process", return_value=completed) as run:
@@ -709,9 +710,11 @@ class RemoteRepositoryTest(unittest.TestCase):
 
         self.assertEqual(str(self.remote), self.repository._sync_target())
 
-    def test_release_pushes_branch_all_versions_and_sets_upstream(self):
+    def test_manual_sync_pushes_branch_all_versions_and_sets_upstream(self):
         self.configure()
         self.publish("v0.0.2")
+        self.assertEqual("", self.git(self.remote, "for-each-ref"))
+        self.repository.sync_remote()
 
         self.assertEqual(
             self.git(self.path, "rev-parse", "HEAD"),
@@ -727,8 +730,7 @@ class RemoteRepositoryTest(unittest.TestCase):
         missing = self.root / "unavailable.git"
         self.configure(missing)
         for version in ("v0.0.2", "v0.0.3", "v1.2.3.4"):
-            with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
-                self.publish(version)
+            self.publish(version)
             self.assertIn(version, self.repository.tags())
             self.assertEqual([], self.repository.status())
             self.assertEqual(["robot.txt"], self.repository.manifest(version))
@@ -745,21 +747,22 @@ class RemoteRepositoryTest(unittest.TestCase):
         self.repository.sync_remote()
         self.assertEqual("4", self.git(missing, "rev-list", "--count", "main"))
 
-    def test_next_successful_release_also_pushes_older_offline_versions(self):
+    def test_later_release_stays_local_until_manual_sync(self):
         missing = self.root / "unavailable.git"
         self.configure(missing)
         for version in ("v0.0.2", "v0.0.3"):
-            with self.assertRaises(MODULE.GitError):
-                self.publish(version)
+            self.publish(version)
         self.git(self.root, "init", "--bare", "-q", str(missing))
 
         self.publish("v0.0.4")
+        self.assertEqual("", self.git(missing, "for-each-ref"))
+        self.repository.sync_remote()
 
         self.assertEqual("4", self.git(missing, "rev-list", "--count", "main"))
         self.assertEqual(self.repository.tags(), self.git(missing, "tag", "--sort=version:refname").splitlines())
 
-    def test_disabled_auto_sync_does_not_contact_remote(self):
-        self.configure(self.root / "unavailable.git", auto_sync=False)
+    def test_local_release_does_not_contact_remote(self):
+        self.configure(self.root / "unavailable.git")
         with mock.patch.object(self.repository, "_run_remote") as run:
             self.publish("v0.0.2")
         run.assert_not_called()
@@ -767,12 +770,13 @@ class RemoteRepositoryTest(unittest.TestCase):
 
     def test_missing_remote_also_keeps_local_release(self):
         self.repository.run(["config", "codeversionmanager.autoSync", "true"])
-        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
+        with mock.patch.object(self.repository, "_run_remote") as run:
             self.publish("v0.0.2")
+        run.assert_not_called()
         self.assertIn("v0.0.2", self.repository.tags())
 
     def test_manual_sync_includes_lightweight_version_tags_but_not_other_tags(self):
-        self.configure(auto_sync=False)
+        self.configure()
         self.repository.run(["tag", "v2.0.0"])
         self.repository.run(["tag", "internal-note"])
         self.publish("v2.0.1")
@@ -785,11 +789,13 @@ class RemoteRepositoryTest(unittest.TestCase):
         self.repository.sync_remote()
         old_head = self.git(self.path, "rev-parse", "HEAD")
         self.publish("v0.0.2")
+        self.repository.sync_remote()
         remote_head = self.git(self.remote, "rev-parse", "main")
         self.repository.run(["reset", "--mixed", old_head])
 
-        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
-            self.publish("v0.0.3")
+        self.publish("v0.0.3")
+        with self.assertRaises(MODULE.GitError):
+            self.repository.sync_remote()
 
         self.assertEqual(remote_head, self.git(self.remote, "rev-parse", "main"))
         self.assertEqual(["v0.0.1", "v0.0.2"], self.git(self.remote, "tag").splitlines())
@@ -801,8 +807,9 @@ class RemoteRepositoryTest(unittest.TestCase):
         remote_head = self.git(self.remote, "rev-parse", "main")
         self.repository.run(["tag", "-f", "-a", "v0.0.1", "-m", "changed description"])
 
-        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
-            self.publish("v0.0.2")
+        self.publish("v0.0.2")
+        with self.assertRaises(MODULE.GitError):
+            self.repository.sync_remote()
 
         self.assertEqual(remote_head, self.git(self.remote, "rev-parse", "main"))
         self.assertEqual(["v0.0.1"], self.git(self.remote, "tag").splitlines())
@@ -811,8 +818,9 @@ class RemoteRepositoryTest(unittest.TestCase):
         self.configure()
         self.git(self.remote, "config", "receive.advertiseAtomic", "false")
 
-        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
-            self.publish("v0.0.2")
+        self.publish("v0.0.2")
+        with self.assertRaises(MODULE.GitError):
+            self.repository.sync_remote()
 
         self.assertEqual("", self.git(self.remote, "for-each-ref"))
         self.assertIn("v0.0.2", self.repository.tags())
@@ -823,8 +831,9 @@ class RemoteRepositoryTest(unittest.TestCase):
         hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         hook.chmod(0o700)
 
-        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
-            self.publish("v0.0.2")
+        self.publish("v0.0.2")
+        with self.assertRaises(MODULE.GitError):
+            self.repository.sync_remote()
 
         self.assertEqual("", self.git(self.remote, "for-each-ref"))
         self.assertIn("v0.0.2", self.repository.tags())
@@ -846,6 +855,8 @@ class RemoteRepositoryTest(unittest.TestCase):
             self.repository.sync_remote()
         (empty / "hello.txt").write_text("hello\n", encoding="utf-8")
         self.repository.save_version("v1.0.0", "first", ["hello.txt"])
+        self.assertEqual("", self.git(self.remote, "for-each-ref"))
+        self.repository.sync_remote()
         self.assertEqual(["v1.0.0"], self.git(self.remote, "tag").splitlines())
 
 
@@ -853,6 +864,7 @@ class RemoteRepositoryTest(unittest.TestCase):
         self.repository.run(["switch", "-c", "release"])
         self.configure()
         self.publish("v0.0.2")
+        self.repository.sync_remote()
 
         self.assertEqual(
             "refs/heads/release", self.git(self.remote, "for-each-ref", "--format=%(refname)", "refs/heads/")
@@ -864,8 +876,9 @@ class RemoteRepositoryTest(unittest.TestCase):
         self.repository.run(["config", "--add", "remote.origin.pushurl", str(self.remote)])
         self.repository.run(["config", "--add", "remote.origin.pushurl", str(self.root / "other.git")])
 
-        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
-            self.publish("v0.0.2")
+        self.publish("v0.0.2")
+        with self.assertRaises(MODULE.GitError):
+            self.repository.sync_remote()
 
         self.assertEqual("", self.git(self.remote, "for-each-ref"))
         self.assertIn("v0.0.2", self.repository.tags())
@@ -892,7 +905,7 @@ class RemoteRepositoryTest(unittest.TestCase):
 
     def test_push_timeout_is_editable_local_and_preserved_when_not_overridden(self):
         self.repository.configure_remote(
-            str(self.remote), "Test", "test@example.com", True, push_timeout=1800
+            str(self.remote), "Test", "test@example.com", push_timeout=1800
         )
         self.assertEqual(1800, self.repository.push_timeout_seconds())
         self.assertEqual("1800", self.git(self.path, "config", "--local", "codeversionmanager.pushTimeout"))
@@ -906,7 +919,7 @@ class RemoteRepositoryTest(unittest.TestCase):
         for value in (0, 59, 3601, 900.5, "900"):
             with self.subTest(value=value), self.assertRaises(MODULE.GitError):
                 self.repository.configure_remote(
-                    str(self.remote), "Test", "test@example.com", True, push_timeout=value
+                    str(self.remote), "Test", "test@example.com", push_timeout=value
                 )
         self.assertEqual("", self.repository.remote_url())
         for value in ("invalid", "0", "3601"):
@@ -931,11 +944,12 @@ class RemoteRepositoryTest(unittest.TestCase):
 
     def test_timeout_with_no_git_output_still_explains_stage_and_keeps_local_release(self):
         self.configure()
+        self.publish("v0.0.2")
         with mock.patch.object(
             MODULE, "run_remote_process", side_effect=subprocess.TimeoutExpired("git", MODULE.PUSH_TIMEOUT)
         ):
-            with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败") as raised:
-                self.publish("v0.0.2")
+            with self.assertRaisesRegex(MODULE.GitError, "远程操作超时") as raised:
+                self.repository.sync_remote()
 
         self.assertIn("推送分支与版本标签", str(raised.exception))
         self.assertNotIn("Git 最后输出", str(raised.exception))
@@ -945,6 +959,7 @@ class RemoteRepositoryTest(unittest.TestCase):
 
     def test_retry_after_timeout_when_remote_already_accepted_updates_is_idempotent(self):
         self.configure()
+        self.publish("v0.0.2")
         original_runner = MODULE.run_remote_process
 
         def accepted_then_timeout(command, **kwargs):
@@ -954,7 +969,7 @@ class RemoteRepositoryTest(unittest.TestCase):
 
         with mock.patch.object(MODULE, "run_remote_process", side_effect=accepted_then_timeout):
             with self.assertRaisesRegex(MODULE.GitError, "不能确认远程是否已经接收更新"):
-                self.publish("v0.0.2")
+                self.repository.sync_remote()
 
         self.assertEqual(["v0.0.1", "v0.0.2"], self.git(self.remote, "tag").splitlines())
         self.repository.sync_remote()
@@ -977,7 +992,7 @@ class RemoteRepositoryTest(unittest.TestCase):
             self.assertEqual(value, MODULE.validate_remote_url(value))
         for name, email in (("", "email@example.com"), ("Test", ""), ("Test\nother", "a@b")):
             with self.subTest(name=name), self.assertRaises(MODULE.GitError):
-                self.repository.configure_remote(str(self.remote), name, email, True)
+                self.repository.configure_remote(str(self.remote), name, email)
         self.assertEqual("", self.repository.remote_url())
 
 

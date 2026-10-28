@@ -73,6 +73,20 @@ class GitError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class RemoteSyncSnapshot:
+    remote_url: str
+    branch_ref: str
+    refs: Tuple[Tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class RemoteSyncStatus:
+    state: str
+    message: str
+    can_sync: bool = False
+
+
 def settings_file_path() -> Path:
     return Path(GLib.get_user_config_dir()) / "code-version-manager" / "settings.ini"
 
@@ -378,11 +392,6 @@ class GitRepository:
     def remote_url(self) -> str:
         return self.run(["config", "--get", "remote.origin.url"], check=False).strip()
 
-    def auto_sync_enabled(self) -> bool:
-        return self.run(
-            ["config", "--bool", "--get", "codeversionmanager.autoSync"], check=False
-        ).strip() == "true"
-
     def push_timeout_seconds(self) -> int:
         configured = self.run(
             ["config", "--get", "codeversionmanager.pushTimeout"], check=False
@@ -402,7 +411,6 @@ class GitRepository:
         remote_url: str,
         name: str,
         email: str,
-        auto_sync: bool,
         push_timeout: Optional[int] = None,
     ) -> None:
         remote_url = validate_remote_url(remote_url)
@@ -419,7 +427,7 @@ class GitRepository:
         self.run(["config", "--local", "user.name", name.strip()])
         self.run(["config", "--local", "user.email", email.strip()])
         self.run(["config", "--local", "--unset-all", "codeversionmanager.username"], check=False)
-        self.run(["config", "--local", "codeversionmanager.autoSync", str(auto_sync).lower()])
+        self.run(["config", "--local", "--unset-all", "codeversionmanager.autoSync"], check=False)
         if push_timeout is not None:
             self.run(["config", "--local", "codeversionmanager.pushTimeout", str(push_timeout)])
 
@@ -505,13 +513,8 @@ class GitRepository:
         branch_ref = f"refs/heads/{branch}"
         if not self.run(["rev-parse", "--verify", branch_ref], check=False).strip():
             return "远程仓库可读取；尚无本地提交，未检查推送权限。首次同步时仍需验证登录与写入权限。"
-        self._run_remote(
-            [
-                "push", "--dry-run", "--atomic", "--porcelain", "--no-follow-tags", "--no-verify",
-                "origin", f"{branch_ref}:{branch_ref}",
-            ],
-            remote_url,
-        )
+        snapshot = self.sync_snapshot(require_versions=False)
+        self._run_remote(self._push_arguments(snapshot, dry_run=True), remote_url)
         return "连接及推送预检查通过，未上传版本；正式同步仍需满足分支规则和服务器检查。"
 
     def _sync_target(self) -> str:
@@ -522,28 +525,82 @@ class GitRepository:
             raise GitError("请先通过“Git 账号”配置唯一的 origin 远程仓库地址。")
         return validate_remote_url(urls[0])
 
-    def sync_remote(self) -> None:
+    def sync_snapshot(self, require_versions: bool = True) -> RemoteSyncSnapshot:
         branch = self.current_branch()
         if not branch:
             raise GitError("查看历史版本时不能同步远程，请先返回工作分支。")
         remote_url = self._sync_target()
         branch_ref = f"refs/heads/{branch}"
-        if not self.run(["rev-parse", "--verify", branch_ref], check=False).strip():
+        commit = self.run(["rev-parse", "--verify", branch_ref], check=False).strip()
+        if not commit:
             raise GitError("当前分支尚无可同步的版本，请先发布版本。")
-        tags = [
-            tag for tag in self.run(["tag", "--merged", branch_ref]).splitlines()
-            if VERSION_PATTERN.match(tag)
+        tag_refs = []
+        for line in self.run([
+            "for-each-ref", f"--merged={branch_ref}", "--format=%(refname) %(objectname)", "refs/tags/",
+        ]).splitlines():
+            ref, object_id = line.split()
+            if VERSION_PATTERN.fullmatch(ref[len("refs/tags/"):]):
+                tag_refs.append((ref, object_id))
+        if require_versions and not tag_refs:
+            raise GitError("当前分支尚无可同步的版本，请先发布版本。")
+        return RemoteSyncSnapshot(remote_url, branch_ref, ((branch_ref, commit), *tag_refs))
+
+    @staticmethod
+    def _push_arguments(snapshot: RemoteSyncSnapshot, dry_run: bool = False) -> List[str]:
+        options = ["--dry-run", "--no-verify"] if dry_run else ["--progress", "--set-upstream"]
+        return [
+            "push", "--atomic", "--porcelain", "--no-follow-tags", *options,
+            "origin", *[f"{ref}:{ref}" for ref, _object_id in snapshot.refs],
         ]
-        if not tags:
-            raise GitError("当前分支尚无可同步的版本，请先发布版本。")
-        self._run_remote(
-            [
-                "push", "--atomic", "--porcelain", "--progress", "--no-follow-tags", "--set-upstream",
-                "origin", f"{branch_ref}:{branch_ref}",
-                *[f"refs/tags/{tag}:refs/tags/{tag}" for tag in tags],
-            ],
-            remote_url,
+
+    def remote_sync_status(self, snapshot: RemoteSyncSnapshot) -> RemoteSyncStatus:
+        try:
+            output = self._run_remote(["ls-remote", "--", snapshot.remote_url], snapshot.remote_url)
+        except GitError as error:
+            return RemoteSyncStatus("unavailable", f"无法检查远程状态：{error}\n修复后点击“刷新”重新检查。")
+        remote_refs = {}
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) == 2:
+                object_id, ref = fields
+                remote_refs[ref] = object_id
+        local_refs = dict(snapshot.refs)
+        changed = [ref for ref, object_id in snapshot.refs if remote_refs.get(ref) != object_id]
+        # Also report remotely retained version tags from this branch after local deletion.
+        extra = []
+        for ref, object_id in remote_refs.items():
+            if not ref.startswith("refs/tags/") or ref in local_refs:
+                continue
+            if not VERSION_PATTERN.fullmatch(ref[len("refs/tags/"):]):
+                continue
+            target = remote_refs.get(ref + "^{}", object_id)
+            ancestor = self.run(
+                ["merge-base", target, local_refs[snapshot.branch_ref]], check=False
+            ).strip()
+            if ancestor == target:
+                extra.append(ref[len("refs/tags/"):])
+        if extra:
+            return RemoteSyncStatus(
+                "pending", "本地与远程不一致，远程保留了本地已删除的当前分支版本标签："
+                + "、".join(extra) + "。\n请先手动处理标签差异；软件不会删除远程标签。",
+            )
+        if not changed:
+            return RemoteSyncStatus("synced", "当前分支和版本标签与远程一致，无需同步。")
+        try:
+            self.push_timeout_seconds()
+            self._run_remote(self._push_arguments(snapshot, dry_run=True), snapshot.remote_url)
+        except GitError as error:
+            return RemoteSyncStatus(
+                "pending", f"本地与远程存在差异，当前无法同步：{error}\n修复后点击“刷新”重新检查。",
+            )
+        return RemoteSyncStatus(
+            "pending", f"当前分支或版本标签有 {len(changed)} 项待同步，推送预检查已通过。点击上传本地版本。", True,
         )
+
+    def sync_remote(self) -> None:
+        snapshot = self.sync_snapshot()
+        self.push_timeout_seconds()
+        self._run_remote(self._push_arguments(snapshot), snapshot.remote_url)
 
     def current_branch(self) -> Optional[str]:
         branch = self.run(["symbolic-ref", "--quiet", "--short", "HEAD"], check=False).strip()
@@ -802,7 +859,6 @@ class GitRepository:
             raise GitError("版本号应以 v 开头并至少包含三段数字，例如 v1.7.8.9.7。")
         if version in self.tags():
             raise GitError(f"版本 {version} 已存在。")
-        auto_sync = self.auto_sync_enabled()
         ensure_git_identity(self)
         changes = normalize_changes(message)
         if not changes:
@@ -826,17 +882,6 @@ class GitRepository:
         self.run(["tag", "-a", version, "-m", commit_message])
         self._write_manifest(version, selected)
         self._write_changelog(None)
-        if auto_sync:
-            try:
-                self.sync_remote()
-            except GitError as error:
-                raise GitError(
-                    f"版本 {version} 已保存到本地，但远程同步失败。\n"
-                    "本地版本和文件均已保留，无需再次发布；"
-                    "处理网络、权限或远程分支差异后，"
-                    "点击“同步远程”重试。不会自动合并或强制覆盖远程历史。\n\n"
-                    + str(error)
-                ) from error
 
     def update_version_message(self, version: str, message: str) -> None:
         if not VERSION_PATTERN.match(version) or version not in self.tags():
@@ -1280,6 +1325,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.info_mode = ""
         self.busy = False
         self.background_timer: Optional[int] = None
+        self.remote_status_generation = 0
+        self.remote_status_snapshot: Optional[RemoteSyncSnapshot] = None
+        self.remote_status = RemoteSyncStatus("unavailable", "尚未检查远程状态。")
+        self.remote_sync_error: Optional[str] = None
+        self.connect("destroy", lambda _window: self._invalidate_remote_status())
 
         self._build_header()
         self._build_content()
@@ -1316,6 +1366,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.sync_button = self._command_button(
             "同步远程", "emblem-synchronizing-symbolic", self.on_sync_remote
         )
+        self.sync_button.set_sensitive(False)
         header.pack_end(self.sync_button)
 
         refresh_button = self._icon_button("view-refresh-symbolic", "刷新", self.on_refresh)
@@ -1389,6 +1440,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.toolbar = toolbar
         toolbar.get_style_context().add_class("command-bar")
         self.save_button = self._command_button("发布版本", "document-save-symbolic", self.on_save_version)
+        self.save_button.set_tooltip_text("仅在本地创建版本，不上传到远程仓库")
         self.compare_button = self._command_button("比较所选版本", "edit-copy-symbolic", self.on_compare_versions)
         self.current_button = self._command_button(
             "所选版本与当前", "document-open-recent-symbolic", self.on_compare_current
@@ -1481,6 +1533,15 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         .command-bar button { min-height: 30px; padding: 2px 10px; }
         .footer { padding: 7px 12px; border-top: 1px solid alpha(@borders, 0.8); }
         treeview { padding: 2px; }
+        button.remote-synced, button.remote-synced:disabled {
+            background-image: none; background-color: #278044; color: white;
+            border-color: #206b39; text-shadow: none; box-shadow: none; opacity: 1;
+        }
+        button.remote-pending, button.remote-pending:disabled {
+            background-image: none; background-color: #bb3030; color: white;
+            border-color: #982727; text-shadow: none; box-shadow: none; opacity: 1;
+        }
+        button.remote-pending:hover { background-color: #a32929; }
         """
         provider = Gtk.CssProvider()
         provider.load_from_data(css)
@@ -1494,6 +1555,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.show_error("所选工作空间不存在。")
             return
         self.workspace_path = resolved
+        self.remote_sync_error = None
+        self._invalidate_remote_status()
         try:
             self.repository = GitRepository(resolved)
             self.workspace_path = self.repository.path
@@ -1502,7 +1565,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self._save_repository_path(self.workspace_path)
         self.refresh()
 
-    def refresh(self) -> None:
+    def refresh(self, check_remote: bool = True) -> None:
         if not self.repository:
             self.history_entries = []
             self.history_store.clear()
@@ -1514,7 +1577,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.info_action_button.set_label("启用版本管理")
             self.info_bar.show_all()
             self.save_button.set_sensitive(False)
-            self.sync_button.set_sensitive(False)
+            self._invalidate_remote_status()
+            self._set_remote_status(RemoteSyncStatus("unavailable", "请先启用版本管理并发布本地版本。"))
             self.compare_button.set_sensitive(False)
             self.current_button.set_sensitive(False)
             self.export_button.set_sensitive(False)
@@ -1540,7 +1604,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 self.change_store.append([change.status, change.path])
 
             branch = self.repository.current_branch()
-            self.sync_button.set_sensitive(bool(branch and self.repository.remote_url()))
             if branch:
                 self.info_mode = ""
                 self.info_bar.hide()
@@ -1561,8 +1624,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 f"版本存储 {format_storage_size(self.repository.storage_size())}"
             )
             status = "工作区干净" if not changes else f"{len(changes)} 项修改"
-            if self.repository.auto_sync_enabled():
-                status += " · 发布后同步远程"
             self.status_label.set_text(status)
             has_versions = bool(self.history_entries)
             self.current_button.set_sensitive(has_versions)
@@ -1572,8 +1633,94 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.delete_button.set_sensitive(has_versions)
             self.changelog_button.set_sensitive(True)
             self.download_changelog_button.set_sensitive(True)
+            if check_remote:
+                self._refresh_remote_status()
+            else:
+                self._invalidate_remote_status()
+                self._set_remote_status(RemoteSyncStatus(
+                    "unavailable", "配置已保存，尚未验证远程状态。请点击“刷新”或“保存并验证连接”。",
+                ))
         except GitError as error:
+            self._invalidate_remote_status()
+            self._set_remote_status(RemoteSyncStatus("unavailable", str(error)))
             self.show_error(str(error))
+
+    def _invalidate_remote_status(self) -> None:
+        self.remote_status_generation += 1
+        self.remote_status_snapshot = None
+
+    def _set_remote_status(self, status: RemoteSyncStatus) -> None:
+        self.remote_status = status
+        context = self.sync_button.get_style_context()
+        context.remove_class("remote-synced")
+        context.remove_class("remote-pending")
+        if status.state == "synced":
+            label, icon = "远程已同步", "emblem-ok-symbolic"
+            context.add_class("remote-synced")
+        elif status.state == "pending":
+            label = "同步远程（待同步）" if status.can_sync else "远程有差异（不可同步）"
+            icon = "document-send-symbolic" if status.can_sync else "dialog-warning-symbolic"
+            context.add_class("remote-pending")
+        elif status.state == "checking":
+            label, icon = "正在检查远程…", "emblem-synchronizing-symbolic"
+        else:
+            label, icon = "同步远程（不可用）", "network-offline-symbolic"
+        self.sync_button.set_label(label)
+        self.sync_button.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
+        self.sync_button.set_tooltip_text(status.message)
+        self.sync_button.set_sensitive(status.can_sync and not self.busy)
+
+    def _refresh_remote_status(self) -> None:
+        if self.busy:
+            self._invalidate_remote_status()
+            self._set_remote_status(RemoteSyncStatus("checking", "操作进行中，完成后重新检查远程状态。"))
+            return
+        repository = self.repository
+        try:
+            snapshot = repository.sync_snapshot()
+        except GitError as error:
+            self._invalidate_remote_status()
+            self._set_remote_status(RemoteSyncStatus("unavailable", str(error)))
+            return
+        if self.remote_status_snapshot == snapshot and self.remote_status.state == "checking":
+            return
+        self._invalidate_remote_status()
+        generation = self.remote_status_generation
+        self.remote_status_snapshot = snapshot
+        self._set_remote_status(RemoteSyncStatus("checking", "正在比较当前分支、版本标签并检查推送权限，不上传版本。"))
+
+        def worker() -> None:
+            try:
+                status = repository.remote_sync_status(snapshot)
+            except Exception as error:
+                status = RemoteSyncStatus("unavailable", f"无法检查远程状态：{error}\n请点击“刷新”重试。")
+            GLib.idle_add(self._remote_status_complete, repository, generation, snapshot, status)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _remote_status_complete(
+        self, repository: GitRepository, generation: int,
+        snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus,
+    ) -> bool:
+        if generation != self.remote_status_generation or repository is not self.repository or self.busy:
+            return False
+        try:
+            current_snapshot = repository.sync_snapshot()
+        except GitError as error:
+            self._invalidate_remote_status()
+            self._set_remote_status(RemoteSyncStatus("unavailable", str(error)))
+            return False
+        if current_snapshot != snapshot:
+            self._invalidate_remote_status()
+            self._refresh_remote_status()
+            return False
+        if status.can_sync and self.remote_sync_error:
+            status = RemoteSyncStatus(
+                "pending", "上次上传失败，当前仍有待同步版本：\n" + self.remote_sync_error
+                + "\n修复后点击“刷新”重新检查，再尝试同步。",
+            )
+        self._set_remote_status(status)
+        return False
 
     def selected_history(self) -> List[HistoryEntry]:
         model, paths = self.history_tree.get_selection().get_selected_rows()
@@ -1660,6 +1807,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.show_error(str(error))
 
     def on_refresh(self, _button) -> None:
+        self.remote_sync_error = None
         self.refresh()
 
     def on_about(self, _button) -> None:
@@ -1680,7 +1828,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             "保存并验证连接", Gtk.ResponseType.OK,
         )
         dialog.get_widget_for_response(Gtk.ResponseType.APPLY).set_tooltip_text(
-            "保存当前工作空间的仓库地址、提交身份和同步选项；不连接远程仓库"
+            "保存当前工作空间的仓库地址、提交身份和超时设置；不连接远程仓库"
         )
         dialog.get_widget_for_response(Gtk.ResponseType.OK).set_tooltip_text(
             "先保存配置，再检查仓库读取和推送权限；不上传提交或标签，完成后弹窗显示结果"
@@ -1747,10 +1895,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         advanced_grid.attach(timeout_notice, 0, 1, 2, 1)
         advanced = Gtk.Expander(label="高级设置：推送超时")
         advanced.add(advanced_grid)
-        auto_sync = Gtk.CheckButton(label="发布版本后自动同步当前分支和版本标签到 origin")
-        auto_sync.set_active(
-            repository.auto_sync_enabled() if repository and repository.remote_url() else True
-        )
         remote_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         create_remote = Gtk.Button(label="创建远程仓库（网页）")
         create_remote.set_tooltip_text("打开 GitHub 创建页面；登录并确认后才会创建，已有仓库无需重复创建")
@@ -1768,7 +1912,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             "创建后确认上方 SSH 地址。\n"
             "“保存配置”：仅保存到当前工作空间，不连接远程。\n"
             "“保存并验证连接”：保存后检查连接和推送权限，弹窗显示结果，不上传版本。\n"
-            "实际上传请点击主窗口“同步远程”，或在发布时自动同步。",
+            "发布版本只保存到本地。实际上传请单独点击主窗口的红色“同步远程”按钮；"
+            "绿色表示已一致，禁用表示当前无需同步或无法同步。",
             xalign=0,
         )
         notice.set_line_wrap(True)
@@ -1776,7 +1921,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         content.pack_start(grid, False, False, 0)
         content.pack_start(address_hint, False, False, 0)
         content.pack_start(remote_actions, False, False, 0)
-        content.pack_start(auto_sync, False, False, 0)
         content.pack_start(advanced, False, False, 0)
         content.pack_start(notice, False, False, 0)
         dialog.get_content_area().add(content)
@@ -1794,14 +1938,15 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                     repository = create_repository(self.workspace_path)
                     self.repository = repository
                 repository.configure_remote(
-                    remote_url, name, email, auto_sync.get_active(),
+                    remote_url, name, email,
                     push_timeout=push_timeout.get_value_as_int() * 60,
                 )
             except (GitError, OSError, ValueError) as error:
                 self.show_error(str(error))
                 continue
             dialog.destroy()
-            self.refresh()
+            self.remote_sync_error = None
+            self.refresh(check_remote=False)
             if response == Gtk.ResponseType.OK:
                 self.run_background(
                     "正在验证连接与推送权限（不上传版本）...", repository.check_remote_connection,
@@ -1987,10 +2132,19 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def on_sync_remote(self, _button) -> None:
         repository = self.repository
-        if repository:
+        if repository and not self.busy and self.remote_status.can_sync:
+            try:
+                snapshot = repository.sync_snapshot()
+            except GitError as error:
+                self._invalidate_remote_status()
+                self._set_remote_status(RemoteSyncStatus("unavailable", str(error)))
+                return
+            if snapshot != self.remote_status_snapshot:
+                self._refresh_remote_status()
+                return
             self.run_background(
                 "正在同步远程仓库...", repository.sync_remote,
-                "当前分支和版本标签已同步到远程仓库。",
+                "当前分支和版本标签已同步到远程仓库。", remote_sync=True,
             )
 
     def on_return_main(self, _bar, response) -> None:
@@ -2039,8 +2193,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             lambda: repository.save_version(
                 version, message, selected, selected_scopes=selected_entries
             ),
-            f"版本 {version} 已发布"
-            + ("并同步到远程仓库。" if repository.auto_sync_enabled() else "。"),
+            f"版本 {version} 已发布到本地。需要上传时请单独点击“同步远程”。",
         )
 
     def on_enable_versioning(self) -> None:
@@ -2069,7 +2222,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.run_background(
             "正在启用版本管理...",
             initialize,
-            f"首个版本 {version} 已发布。",
+            f"首个版本 {version} 已发布到本地。",
             reload_workspace=True,
         )
 
@@ -2362,11 +2515,13 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def run_background(
         self, busy: str, operation, success: str, reload_workspace: bool = False,
-        show_result: bool = False,
+        show_result: bool = False, remote_sync: bool = False,
     ) -> None:
         if self.busy:
             return
         self.busy = True
+        self._invalidate_remote_status()
+        self._set_remote_status(RemoteSyncStatus("checking", "操作进行中，完成后重新检查远程状态。"))
         self.header.set_sensitive(False)
         self.toolbar.set_sensitive(False)
         self.notebook.set_sensitive(False)
@@ -2392,7 +2547,10 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 else:
                     GLib.idle_add(self._background_complete, message, reload_workspace)
             except Exception as error:  # GTK must receive subprocess errors on the main thread.
-                GLib.idle_add(self._background_failed, str(error))
+                if remote_sync:
+                    GLib.idle_add(self._background_failed, str(error), True)
+                else:
+                    GLib.idle_add(self._background_failed, str(error))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2419,7 +2577,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             dialog.destroy()
         return False
 
-    def _background_failed(self, message: str) -> bool:
+    def _background_failed(self, message: str, remote_sync: bool = False) -> bool:
+        if remote_sync:
+            self.remote_sync_error = message
         self._end_background()
         self.refresh()
         self.show_error(message)
