@@ -6,15 +6,18 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote, quote_plus, urlencode, urlsplit
 
 import gi
 
@@ -47,6 +50,9 @@ MANAGER_CHANGELOG = "CHANGELOG.rst"
 RECENT_WORKSPACE_LIMIT = 10
 DELETE_TAG_RESPONSE = 1
 DELETE_COMMIT_RESPONSE = 2
+REMOTE_TIMEOUT = 120
+PUSH_TIMEOUT = 900
+MAX_PUSH_TIMEOUT = 3600
 DEFAULT_EXCLUDED_DIRECTORIES = {
     ".git",
     ".cache",
@@ -154,6 +160,161 @@ class HistoryEntry:
         return self.tags[0] if self.tags else self.commit
 
 
+@dataclass(frozen=True)
+class GitCredentials:
+    remote_url: str
+    username: str
+    token: str = field(repr=False)
+
+
+def run_remote_process(command: Sequence[str], timeout: int, **options):
+    with subprocess.Popen(command, start_new_session=True, **options) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr) from None
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def redact_git_output(message: str, credentials: Optional[GitCredentials]) -> str:
+    if credentials:
+        secrets = {
+            credentials.token,
+            quote(credentials.token, safe=""),
+            quote_plus(credentials.token),
+        }
+        for secret in sorted(secrets, key=len, reverse=True):
+            if secret:
+                message = message.replace(secret, "[已隐藏令牌]")
+    return re.sub(r"(https?://)[^/\s@]+@", r"\1[已隐藏账号]@", message)
+
+
+def github_repository_coordinates(remote_url: str) -> Optional[Tuple[str, str]]:
+    try:
+        remote_url = validate_remote_url(remote_url)
+    except (GitError, ValueError):
+        return None
+    if remote_url.startswith("git@github.com:"):
+        repository_path = remote_url.split(":", 1)[1]
+    else:
+        try:
+            parsed = urlsplit(remote_url)
+        except ValueError:
+            return None
+        if parsed.hostname != "github.com" or parsed.scheme not in ("https", "ssh"):
+            return None
+        repository_path = parsed.path
+    repository_path = repository_path.strip("/")
+    if repository_path.endswith(".git"):
+        repository_path = repository_path[:-4]
+    parts = repository_path.split("/")
+    if len(parts) != 2:
+        return None
+    owner, repository_name = parts
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", owner):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", repository_name) or repository_name in (".", ".."):
+        return None
+    return owner, repository_name
+
+
+def github_repository_creation_url(remote_url: str, username: str, workspace_name: str) -> str:
+    if remote_url.strip():
+        coordinates = github_repository_coordinates(remote_url)
+        if not coordinates:
+            raise GitError("此创建入口仅适用于 GitHub。请填写 GitHub 仓库地址，或清空地址后创建。")
+        owner, repository_name = coordinates
+    else:
+        owner = username.strip()
+        if owner and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", owner):
+            raise GitError("请填写有效的 GitHub 用户名或组织名，或留空后在网页中选择。")
+        repository_name = re.sub(r"[^A-Za-z0-9_.-]", "-", workspace_name)[:100]
+        if not repository_name.strip(".-"):
+            repository_name = "workspace"
+    parameters = {"name": repository_name, "visibility": "private"}
+    if owner:
+        parameters["owner"] = owner
+    return "https://github.com/new?" + urlencode(parameters)
+
+
+def github_ssh_remote_url(remote_url: str) -> str:
+    coordinates = github_repository_coordinates(remote_url)
+    if not coordinates:
+        raise GitError("请先填写有效的 GitHub 仓库地址，再切换到 SSH。其他平台请直接填写其 SSH 地址。")
+    owner, repository_name = coordinates
+    return f"git@github.com:{owner}/{repository_name}.git"
+
+
+def github_token_creation_url(remote_url: str) -> Optional[str]:
+    coordinates = github_repository_coordinates(remote_url)
+    if not coordinates:
+        return None
+    owner, _repository_name = coordinates
+    parameters = {
+        "name": "Code Version Manager",
+        "target_name": owner,
+        "expires_in": "30",
+        "contents": "write",
+    }
+    return "https://github.com/settings/personal-access-tokens/new?" + urlencode(parameters)
+
+
+def ssh_public_keys(directory: Optional[Path] = None) -> Dict[str, str]:
+    directory = directory if directory is not None else Path.home() / ".ssh"
+    keys = {}
+    for path in sorted(directory.glob("*.pub")):
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 16384:
+                continue
+            public_key = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            continue
+        if re.fullmatch(
+            r"(?:ssh-(?:ed25519|rsa)|ecdsa-sha2-nistp(?:256|384|521)|"
+            r"sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) "
+            r"[A-Za-z0-9+/=]+(?: [^\r\n]*)?",
+            public_key,
+        ):
+            keys[str(path)] = public_key
+    return keys
+
+
+def validate_remote_url(value: str) -> str:
+    value = value.strip()
+    if not value or value.startswith("-") or any(ord(char) < 32 for char in value):
+        raise GitError("请填写有效的远程仓库地址。")
+    if "://" in value:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            raise GitError("远程仓库地址格式无效。") from None
+        if parsed.scheme not in ("https", "ssh", "file"):
+            raise GitError("远程地址请使用 HTTPS、SSH 或本地仓库路径，不支持明文 HTTP。")
+        if parsed.scheme != "file" and not parsed.hostname:
+            raise GitError("远程仓库地址缺少主机名。")
+        if parsed.password is not None or (parsed.scheme == "https" and parsed.username):
+            raise GitError("请勿在仓库地址中填写账号或令牌，请使用下方账号输入框。")
+        if parsed.query or parsed.fragment:
+            raise GitError("远程仓库地址不能包含查询参数或片段。")
+    elif not (Path(value).is_absolute() or re.match(r"^[^\s@:]+@[^\s:]+:.+", value)):
+        raise GitError("请填写 HTTPS、SSH 地址或本地仓库的绝对路径。")
+    return value
+
+
+def validate_git_account(name: str, email: str, username: str, token: str, remote_url: str) -> None:
+    if not name.strip() or not email.strip():
+        raise GitError("请填写 Git 提交姓名和邮箱。")
+    if any(ord(char) < 32 for char in name + email + username + token):
+        raise GitError("账号信息不能包含换行或控制字符。")
+    if token and (not username.strip() or not remote_url.startswith("https://")):
+        raise GitError("访问令牌需要同时填写 Git 用户名，并使用 HTTPS 仓库地址。")
+
+
 class GitRepository:
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
@@ -169,6 +330,8 @@ class GitRepository:
         if not git_directory:
             raise GitError("无法确定 Git 元数据目录。")
         self.metadata_path = Path(git_directory).resolve() / METADATA_DIRECTORY
+        self.credentials: Optional[GitCredentials] = None
+        self.credential_prompt: Optional[Callable[[str, str], Optional[GitCredentials]]] = None
 
     def run(self, args: Sequence[str], check: bool = True) -> str:
         result = subprocess.run(
@@ -192,6 +355,271 @@ class GitRepository:
             message = result.stderr.decode("utf-8", errors="replace").strip()
             raise GitError(message or "Git 操作失败。")
         return result.stdout
+
+    def remote_url(self) -> str:
+        return self.run(["config", "--get", "remote.origin.url"], check=False).strip()
+
+    def auto_sync_enabled(self) -> bool:
+        return self.run(
+            ["config", "--bool", "--get", "codeversionmanager.autoSync"], check=False
+        ).strip() == "true"
+
+    def push_timeout_seconds(self) -> int:
+        configured = self.run(
+            ["config", "--get", "codeversionmanager.pushTimeout"], check=False
+        ).strip()
+        if not configured:
+            return PUSH_TIMEOUT
+        try:
+            seconds = int(configured)
+        except ValueError:
+            raise GitError("推送超时配置无效，请在“Git 账号”中设置 1–60 分钟。") from None
+        if not 60 <= seconds <= MAX_PUSH_TIMEOUT:
+            raise GitError("推送超时必须为 1–60 分钟，请在“Git 账号”中重新设置。")
+        return seconds
+
+    def configure_remote(
+        self,
+        remote_url: str,
+        name: str,
+        email: str,
+        username: str,
+        token: str,
+        auto_sync: bool,
+        clear_token: bool = False,
+        push_timeout: Optional[int] = None,
+    ) -> None:
+        remote_url = validate_remote_url(remote_url)
+        validate_git_account(name, email, username, token, remote_url)
+        if push_timeout is not None and (
+            not isinstance(push_timeout, int) or not 60 <= push_timeout <= MAX_PUSH_TIMEOUT
+        ):
+            raise GitError("推送超时必须为 1–60 分钟。")
+        name, email, username = name.strip(), email.strip(), username.strip()
+        credentials = None if clear_token else self.credentials
+        if token:
+            credentials = GitCredentials(remote_url, username, token)
+        elif credentials and (
+            credentials.remote_url != remote_url or credentials.username != username
+        ):
+            credentials = None
+        if "origin" not in self.run(["remote"]).splitlines():
+            self.run(["remote", "add", "origin", remote_url])
+        else:
+            self.run(["config", "--local", "--replace-all", "remote.origin.url", remote_url])
+            self.run(["config", "--local", "--unset-all", "remote.origin.pushurl"], check=False)
+        self.run(["config", "--local", "user.name", name])
+        self.run(["config", "--local", "user.email", email])
+        self.run(["config", "--local", "codeversionmanager.username", username])
+        self.run(["config", "--local", "codeversionmanager.autoSync", str(auto_sync).lower()])
+        if push_timeout is not None:
+            self.run(["config", "--local", "codeversionmanager.pushTimeout", str(push_timeout)])
+        self.credentials = credentials
+
+    def _run_remote(
+        self, args: Sequence[str], remote_url: str, prompt_authentication: bool = True
+    ) -> str:
+        checking_push = bool(args and args[0] == "push" and "--dry-run" in args)
+        pushing = bool(args and args[0] == "push" and not checking_push)
+        timeout = self.push_timeout_seconds() if pushing else REMOTE_TIMEOUT
+        credentials = self.credentials
+        if credentials and credentials.remote_url != remote_url:
+            credentials = None
+        environment = os.environ.copy()
+        environment.pop("CVM_GIT_USERNAME", None)
+        environment.pop("CVM_GIT_TOKEN", None)
+        environment.update({
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "/bin/false",
+            "SSH_ASKPASS": "/bin/false",
+            "SSH_ASKPASS_REQUIRE": "never",
+            "LC_ALL": "C",
+        })
+        environment.setdefault("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=15")
+        git_options = []
+        with tempfile.TemporaryDirectory(prefix="cvm-auth-") as temporary:
+            if credentials:
+                askpass = Path(temporary) / "askpass"
+                askpass.write_text(
+                    '#!/bin/sh\ncase "$1" in\n'
+                    '  *Username*) printf "%s\\n" "$CVM_GIT_USERNAME" ;;\n'
+                    '  *Password*) printf "%s\\n" "$CVM_GIT_TOKEN" ;;\n'
+                    '  *) exit 1 ;;\nesac\n',
+                    encoding="utf-8",
+                )
+                askpass.chmod(0o700)
+                environment.update({
+                    "GIT_ASKPASS": str(askpass),
+                    "CVM_GIT_USERNAME": credentials.username,
+                    "CVM_GIT_TOKEN": credentials.token,
+                })
+                git_options = ["-c", "credential.helper=", "-c", "credential.interactive=false"]
+            elif remote_url.startswith("https://"):
+                username = self.run(
+                    ["config", "--get", "codeversionmanager.username"], check=False
+                ).strip()
+                if username:
+                    git_options = ["-c", f"credential.username={username}"]
+            try:
+                result = run_remote_process(
+                    ["git", "-C", str(self.path), *git_options, *args],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=environment,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as error:
+                output = error.stderr or error.stdout or ""
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", errors="replace")
+                output = redact_git_output(output, credentials)
+                last_output = "\n".join(output.replace("\r", "\n").splitlines()[-8:])[-2000:]
+                phase = "推送分支与版本标签" if pushing else "连接或读取远程仓库"
+                if checking_push:
+                    phase = "预检查推送权限（不上传版本）"
+                message = (
+                    f"远程操作超时：{phase}超过 {timeout} 秒。\n"
+                    "本地提交和版本标签均已保留，不要重新发布同一版本。\n"
+                    "超时不能确认远程是否已经接收更新；网络恢复后点击“同步远程”可安全补齐。\n"
+                    "请检查网络、代理或 VPN；读取成功不代表上传链路正常。"
+                )
+                if pushing:
+                    message += "\n传输缓慢时可在“Git 账号”中调整推送超时，默认 15 分钟。"
+                if last_output:
+                    message += "\n\nGit 最后输出：\n" + last_output
+                raise GitError(message) from None
+            except OSError as error:
+                raise GitError(f"无法执行远程 Git 操作：{error}") from error
+        if result.returncode != 0:
+            message = redact_git_output(
+                result.stderr.strip() or result.stdout.strip() or "远程 Git 操作失败。",
+                credentials,
+            )
+            if github_repository_coordinates(remote_url) and not remote_url.startswith("https://"):
+                if re.search(r"Permission denied \(publickey(?:,[^)]*)?\)", message, re.IGNORECASE):
+                    raise GitError(
+                        "GitHub 尚未接受本机 SSH 密钥，无需填写访问令牌或网站密码。\n"
+                        "请在“Git 账号”中点击“SSH 公钥设置”，将本机 .pub 公钥添加到 GitHub，"
+                        "并在终端运行 ssh -T git@github.com 验证。加密私钥需先用 ssh-add 解锁。\n"
+                        "不要上传或发送没有 .pub 后缀的私钥。本地提交和版本标签均已保留。\n\n"
+                        "Git 原始错误：\n" + message
+                    )
+                if "Host key verification failed" in message:
+                    raise GitError(
+                        "尚未建立可信的 GitHub SSH 主机连接。请在终端运行 ssh -T git@github.com，"
+                        "核对 GitHub 官方公布的主机指纹后确认；不要关闭主机密钥检查。\n"
+                        "本地提交和版本标签均已保留。\n\nGit 原始错误：\n" + message
+                    )
+            github_permission_denied = (
+                urlsplit(remote_url).hostname == "github.com"
+                and re.search(
+                    r"permission to .+ denied to|write access to repository not granted|"
+                    r"requested url returned error: 403",
+                    message,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if github_permission_denied:
+                repository_path = urlsplit(remote_url).path.strip("/")
+                if repository_path.endswith(".git"):
+                    repository_path = repository_path[:-4]
+                owner, _, repository_name = repository_path.partition("/")
+                raise GitError(
+                    "GitHub 拒绝当前凭据写入仓库。账号名称正确不代表访问令牌有写入权限。\n\n"
+                    "请在 GitHub 的 Settings → Developer settings → Personal access tokens "
+                    "→ Fine-grained tokens 中检查当前令牌：\n"
+                    f"1. Resource owner 选择 {owner}。\n"
+                    f"2. Repository access 授权 {repository_name} 仓库，不能只有公共仓库只读权限。\n"
+                    "3. Repository permissions → Contents 设为 Read and write，然后保存。\n"
+                    "4. 确认令牌所属账号本身有该仓库写入权限；"
+                    "组织仓库还需满足组织的审批和 SSO 授权要求。\n\n"
+                    "保存权限后再次点击“同步远程”；若新建了令牌，请先在“Git 账号”中替换旧令牌。"
+                    "本地提交和版本标签均已保留，不需要再次发布版本。\n\n"
+                    "Git 原始错误：\n" + message
+                )
+            authentication_failed = re.search(
+                r"could not read (?:username|password)|unable to read askpass response|"
+                r"terminal prompts disabled|authentication failed|invalid username or (?:password|token)|"
+                r"password authentication is not supported|http basic: access denied|"
+                r"requested url returned error: 401",
+                message,
+                flags=re.IGNORECASE,
+            )
+            if remote_url.startswith("https://") and authentication_failed:
+                explanation = (
+                    "HTTPS 登录凭据缺失或已失效。请填写 Git 用户名和具有仓库写入权限的"
+                    " PAT/访问令牌，不是网站登录密码。令牌仅保留在本次软件会话内。"
+                )
+                if prompt_authentication and self.credential_prompt:
+                    replacement = self.credential_prompt(remote_url, explanation)
+                    if replacement is None:
+                        raise GitError(
+                            "已取消 Git 登录，远程操作未完成。本地版本均已保留；"
+                            "下次点击“同步远程”可重新登录并补齐全部版本。"
+                        )
+                    if replacement.remote_url != remote_url or not replacement.token:
+                        raise GitError("登录凭据与远程仓库不匹配或访问令牌为空，请重新登录。")
+                    validate_git_account(
+                        "Git User", "user@localhost", replacement.username, replacement.token, remote_url
+                    )
+                    self.credentials = replacement
+                    self.run([
+                        "config", "--local", "codeversionmanager.username", replacement.username.strip()
+                    ])
+                    return self._run_remote(args, remote_url, prompt_authentication=False)
+                raise GitError(explanation + "\n请点击“Git 账号”重新填写凭据后同步。\n\n" + message)
+            raise GitError(message)
+        return result.stdout
+
+    def check_remote_connection(self) -> str:
+        remote_url = self._sync_target()
+        self._run_remote(["ls-remote", "--", remote_url], remote_url)
+        branch = self.current_branch()
+        if not branch:
+            return "远程仓库可读取；当前正在查看历史版本，未检查推送权限。请返回工作分支再验证。"
+        branch_ref = f"refs/heads/{branch}"
+        if not self.run(["rev-parse", "--verify", branch_ref], check=False).strip():
+            return "远程仓库可读取；尚无本地提交，未检查推送权限。首次同步时仍需验证登录与写入权限。"
+        self._run_remote(
+            [
+                "push", "--dry-run", "--atomic", "--porcelain", "--no-follow-tags", "--no-verify",
+                "origin", f"{branch_ref}:{branch_ref}",
+            ],
+            remote_url,
+        )
+        return "连接及推送预检查通过，未上传版本；正式同步仍需满足分支规则和服务器检查。"
+
+    def _sync_target(self) -> str:
+        urls = self.run(
+            ["remote", "get-url", "--push", "--all", "origin"], check=False
+        ).splitlines()
+        if len(urls) != 1:
+            raise GitError("请先通过“Git 账号”配置唯一的 origin 远程仓库地址。")
+        return validate_remote_url(urls[0])
+
+    def sync_remote(self) -> None:
+        branch = self.current_branch()
+        if not branch:
+            raise GitError("查看历史版本时不能同步远程，请先返回工作分支。")
+        remote_url = self._sync_target()
+        branch_ref = f"refs/heads/{branch}"
+        if not self.run(["rev-parse", "--verify", branch_ref], check=False).strip():
+            raise GitError("当前分支尚无可同步的版本，请先发布版本。")
+        tags = [
+            tag for tag in self.run(["tag", "--merged", branch_ref]).splitlines()
+            if VERSION_PATTERN.match(tag)
+        ]
+        if not tags:
+            raise GitError("当前分支尚无可同步的版本，请先发布版本。")
+        self._run_remote(
+            [
+                "push", "--atomic", "--porcelain", "--progress", "--no-follow-tags", "--set-upstream",
+                "origin", f"{branch_ref}:{branch_ref}",
+                *[f"refs/tags/{tag}:refs/tags/{tag}" for tag in tags],
+            ],
+            remote_url,
+        )
 
     def current_branch(self) -> Optional[str]:
         branch = self.run(["symbolic-ref", "--quiet", "--short", "HEAD"], check=False).strip()
@@ -284,6 +712,8 @@ class GitRepository:
 
     def history(self, limit: int = 500) -> List[HistoryEntry]:
         tags = self._tags_by_commit()
+        if not tags and not self.run(["rev-parse", "--verify", "HEAD"], check=False).strip():
+            return []
         output = self.run(
             [
                 "log",
@@ -448,6 +878,7 @@ class GitRepository:
             raise GitError("版本号应以 v 开头并至少包含三段数字，例如 v1.7.8.9.7。")
         if version in self.tags():
             raise GitError(f"版本 {version} 已存在。")
+        auto_sync = self.auto_sync_enabled()
         ensure_git_identity(self)
         changes = normalize_changes(message)
         if not changes:
@@ -471,6 +902,17 @@ class GitRepository:
         self.run(["tag", "-a", version, "-m", commit_message])
         self._write_manifest(version, selected)
         self._write_changelog(None)
+        if auto_sync:
+            try:
+                self.sync_remote()
+            except GitError as error:
+                raise GitError(
+                    f"版本 {version} 已保存到本地，但远程同步失败。\n"
+                    "本地版本和文件均已保留，无需再次发布；"
+                    "处理网络、权限或远程分支差异后，"
+                    "点击“同步远程”重试。不会自动合并或强制覆盖远程历史。\n\n"
+                    + str(error)
+                ) from error
 
     def update_version_message(self, version: str, message: str) -> None:
         if not VERSION_PATTERN.match(version) or version not in self.tags():
@@ -776,13 +1218,8 @@ def ensure_git_identity(repository: GitRepository) -> None:
         repository.run(["config", "user.email", f"{user}@localhost"])
 
 
-def initialize_repository(
-    path: Path, version: str, message: str, selected_files: Sequence[str]
-) -> GitRepository:
+def create_repository(path: Path) -> GitRepository:
     root = path.expanduser().resolve()
-    selected = validate_selected_files(root, selected_files)
-    if not selected:
-        raise GitError("至少选择一个需要封装的文件。")
     result = subprocess.run(
         ["git", "-C", str(root), "init", "-q"],
         stdout=subprocess.PIPE,
@@ -793,6 +1230,16 @@ def initialize_repository(
         raise GitError(result.stderr.strip() or "无法启用版本管理。")
     repository = GitRepository(root)
     repository.run(["symbolic-ref", "HEAD", "refs/heads/main"])
+    return repository
+
+
+def initialize_repository(
+    path: Path, version: str, message: str, selected_files: Sequence[str]
+) -> GitRepository:
+    selected = validate_selected_files(path.expanduser().resolve(), selected_files)
+    if not selected:
+        raise GitError("至少选择一个需要封装的文件。")
+    repository = create_repository(path)
     ensure_git_identity(repository)
     repository.save_version(version, message, selected)
     return repository
@@ -904,9 +1351,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.set_default_size(1120, 720)
         self.set_icon_name("code-version-manager")
         self.repository: Optional[GitRepository] = None
+        self.git_credentials: Dict[Path, GitCredentials] = {}
         self.workspace_path = initial_path.expanduser().resolve()
         self.history_entries: List[HistoryEntry] = []
         self.info_mode = ""
+        self.busy = False
+        self.background_timer: Optional[int] = None
 
         self._build_header()
         self._build_content()
@@ -915,6 +1365,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def _build_header(self) -> None:
         header = Gtk.HeaderBar()
+        self.header = header
         header.set_show_close_button(True)
         header.props.title = APP_NAME
         self.set_titlebar(header)
@@ -934,6 +1385,15 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.recent_popover.connect("show", self.on_recent_popover_show)
         self.recent_button.set_popover(self.recent_popover)
         header.pack_start(self.recent_button)
+
+        self.git_account_button = self._command_button(
+            "Git 账号", "avatar-default-symbolic", self.on_git_account
+        )
+        header.pack_end(self.git_account_button)
+        self.sync_button = self._command_button(
+            "同步远程", "emblem-synchronizing-symbolic", self.on_sync_remote
+        )
+        header.pack_end(self.sync_button)
 
         refresh_button = self._icon_button("view-refresh-symbolic", "刷新", self.on_refresh)
         header.pack_end(refresh_button)
@@ -1003,6 +1463,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         root.pack_start(self.info_bar, False, False, 0)
 
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.toolbar = toolbar
         toolbar.get_style_context().add_class("command-bar")
         self.save_button = self._command_button("发布版本", "document-save-symbolic", self.on_save_version)
         self.compare_button = self._command_button("比较所选版本", "edit-copy-symbolic", self.on_compare_versions)
@@ -1109,9 +1570,17 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if not resolved.is_dir():
             self.show_error("所选工作空间不存在。")
             return
+        if self.repository:
+            credentials = self.repository.credentials
+            if credentials:
+                self.git_credentials[self.repository.path] = credentials
+            else:
+                self.git_credentials.pop(self.repository.path, None)
         self.workspace_path = resolved
         try:
             self.repository = GitRepository(resolved)
+            self.repository.credentials = self.git_credentials.get(resolved)
+            self.repository.credential_prompt = self.request_git_credentials
             self.workspace_path = self.repository.path
         except GitError:
             self.repository = None
@@ -1130,6 +1599,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.info_action_button.set_label("启用版本管理")
             self.info_bar.show_all()
             self.save_button.set_sensitive(False)
+            self.sync_button.set_sensitive(False)
             self.compare_button.set_sensitive(False)
             self.current_button.set_sensitive(False)
             self.export_button.set_sensitive(False)
@@ -1155,6 +1625,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 self.change_store.append([change.status, change.path])
 
             branch = self.repository.current_branch()
+            self.sync_button.set_sensitive(bool(branch and self.repository.remote_url()))
             if branch:
                 self.info_mode = ""
                 self.info_bar.hide()
@@ -1174,7 +1645,10 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.storage_label.set_text(
                 f"版本存储 {format_storage_size(self.repository.storage_size())}"
             )
-            self.status_label.set_text("工作区干净" if not changes else f"{len(changes)} 项修改")
+            status = "工作区干净" if not changes else f"{len(changes)} 项修改"
+            if self.repository.auto_sync_enabled():
+                status += " · 发布后同步远程"
+            self.status_label.set_text(status)
             has_versions = bool(self.history_entries)
             self.current_button.set_sensitive(has_versions)
             self.compare_button.set_sensitive(len(self.history_entries) >= 2)
@@ -1277,10 +1751,324 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog = Gtk.AboutDialog(transient_for=self, modal=True)
         dialog.set_program_name("Code Version Manager")
         dialog.set_version(APP_VERSION)
-        dialog.set_comments("本地 Git 工作空间版本管理器")
+        dialog.set_comments("Git 工作空间版本管理器，支持本地版本与远程同步")
         dialog.set_logo_icon_name("code-version-manager")
         dialog.run()
         dialog.destroy()
+
+    def on_git_account(self, _button) -> None:
+        repository = self.repository
+        dialog = Gtk.Dialog(title="Git 账号与远程仓库", transient_for=self, modal=True)
+        dialog.add_buttons(
+            "取消", Gtk.ResponseType.CANCEL,
+            "保存配置", Gtk.ResponseType.APPLY,
+            "验证连接与推送", Gtk.ResponseType.OK,
+        )
+        dialog.set_default_size(720, 620)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=18)
+        grid = Gtk.Grid(column_spacing=14, row_spacing=12)
+        values = [
+            ("远程仓库", repository.remote_url() if repository else "", "https://host/owner/repo.git"),
+            (
+                "提交姓名",
+                repository.run(["config", "user.name"], check=False).strip()
+                if repository else os.environ.get("USER", ""),
+                "Git 提交作者姓名",
+            ),
+            (
+                "提交邮箱",
+                repository.run(["config", "user.email"], check=False).strip()
+                if repository else "",
+                "name@example.com",
+            ),
+            (
+                "Git 用户名",
+                repository.run(["config", "codeversionmanager.username"], check=False).strip()
+                if repository else "",
+                "HTTPS 登录账号；SSH 可留空",
+            ),
+            ("访问令牌", "", "HTTPS 使用 PAT/访问令牌，不是平台登录密码"),
+        ]
+        entries = []
+        for row, (label, value, placeholder) in enumerate(values):
+            entry = Gtk.Entry(text=value)
+            entry.set_placeholder_text(placeholder)
+            entry.set_hexpand(True)
+            grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
+            grid.attach(entry, 1, row, 1, 1)
+            entries.append(entry)
+        entries[-1].set_visibility(False)
+        entries[-1].set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        push_timeout = Gtk.SpinButton.new_with_range(1, MAX_PUSH_TIMEOUT // 60, 1)
+        try:
+            configured_timeout = repository.push_timeout_seconds() if repository else PUSH_TIMEOUT
+        except GitError:
+            configured_timeout = PUSH_TIMEOUT
+        push_timeout.set_value(configured_timeout / 60)
+        push_timeout.set_tooltip_text("仅限制推送传输时长，连接验证仍为 120 秒；超时不删除本地版本")
+        grid.attach(Gtk.Label(label="推送超时（分钟）", xalign=0), 0, len(values), 1, 1)
+        grid.attach(push_timeout, 1, len(values), 1, 1)
+        auto_sync = Gtk.CheckButton(label="发布版本后自动同步当前分支和版本标签到 origin")
+        auto_sync.set_active(
+            repository.auto_sync_enabled() if repository and repository.remote_url() else True
+        )
+        clear_token = Gtk.CheckButton(label="清除本次会话中已有的访问令牌")
+        clear_token.set_sensitive(bool(repository and repository.credentials))
+        notice = Gtk.Label(xalign=0)
+        notice.set_line_wrap(True)
+        notice.set_max_width_chars(72)
+        notice.set_text(
+            "请先在代码托管平台创建仓库，并确保账号拥有写入权限。\n"
+            "长期使用推荐 SSH：点击“改用 SSH”，将公钥添加到 GitHub 后即可免令牌同步。\n"
+            "GitHub 不接受网站登录密码进行 Git 推送；账号密码仅在官方网页中输入。\n"
+            "仓库地址不是登录凭据。HTTPS 请填写用户名和访问令牌，"
+            "仅在系统已有凭据时可留空；缺失或失效时会弹出登录框。\n"
+            "GitHub 令牌需授权目标仓库，并将 Contents 设置为 Read and write。\n"
+            "令牌仅保存在本次软件会话内，不写入配置或仓库；留空沿用本次令牌，"
+            "否则使用系统已有 Git 凭据或 SSH 密钥。重启后需重新输入令牌。\n"
+            "公开仓库可能无需登录即可读取。已有本地提交时会预检查推送权限（不上传版本）；"
+            "首次提交前或查看历史版本时仅验证读取权限。正式同步仍需满足分支规则和服务器检查。"
+            "同步不会自动拉取、合并或强制推送；"
+            "未启用版本管理时，保存配置会创建独立本地 Git 仓库。"
+        )
+        remote_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        create_remote = Gtk.Button(label="创建远程仓库（网页）")
+        create_remote.set_tooltip_text("打开 GitHub 创建页面；登录并确认后才会创建，已有仓库无需重复创建")
+        create_remote.connect(
+            "clicked",
+            lambda _button: self.open_github_repository_creation(dialog, entries[0], entries[3]),
+        )
+        use_ssh = Gtk.Button(label="改用 SSH（推荐）")
+        use_ssh.set_tooltip_text("将当前 GitHub 地址转换为 SSH；确认保存前不会修改远程配置")
+        use_ssh.connect("clicked", lambda _button: self.use_github_ssh(entries[0], entries[4]))
+        ssh_settings = Gtk.Button(label="SSH 公钥设置")
+        ssh_settings.connect("clicked", lambda _button: self.show_ssh_public_keys(dialog))
+        remote_actions.pack_start(create_remote, False, False, 0)
+        remote_actions.pack_start(use_ssh, False, False, 0)
+        remote_actions.pack_start(ssh_settings, False, False, 0)
+        remote_notice = Gtk.Label(
+            label="网页创建时请勿初始化 README、.gitignore 或许可证，以免与本地历史冲突。"
+            "创建后复制仓库地址到上方，再验证连接。创建入口默认建议私有仓库。",
+            xalign=0,
+        )
+        remote_notice.set_line_wrap(True)
+        remote_notice.set_max_width_chars(72)
+        content.pack_start(grid, False, False, 0)
+        content.pack_start(remote_actions, False, False, 0)
+        content.pack_start(remote_notice, False, False, 0)
+        content.pack_start(auto_sync, False, False, 0)
+        content.pack_start(clear_token, False, False, 0)
+        content.pack_start(notice, False, False, 0)
+        token_url = github_token_creation_url(repository.remote_url()) if repository else None
+        if token_url:
+            token_link = Gtk.LinkButton.new_with_label(
+                token_url, "创建 GitHub 写入令牌（页面中仍需勾选目标仓库）"
+            )
+            token_link.set_halign(Gtk.Align.START)
+            content.pack_start(token_link, False, False, 0)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(440)
+        scroll.add(content)
+        dialog.get_content_area().pack_start(scroll, True, True, 0)
+        dialog.show_all()
+        while True:
+            response = dialog.run()
+            if response not in (Gtk.ResponseType.OK, Gtk.ResponseType.APPLY):
+                dialog.destroy()
+                return
+            remote_url, name, email, username, token = [entry.get_text() for entry in entries]
+            try:
+                remote_url = validate_remote_url(remote_url)
+                validate_git_account(name, email, username, token, remote_url)
+                if repository is None:
+                    repository = create_repository(self.workspace_path)
+                    self.repository = repository
+                    repository.credential_prompt = self.request_git_credentials
+                repository.configure_remote(
+                    remote_url, name, email, username, token, auto_sync.get_active(),
+                    clear_token=clear_token.get_active(),
+                    push_timeout=push_timeout.get_value_as_int() * 60,
+                )
+            except (GitError, OSError, ValueError) as error:
+                self.show_error(str(error))
+                continue
+            dialog.destroy()
+            self.refresh()
+            if response == Gtk.ResponseType.OK:
+                self.run_background(
+                    "正在验证连接与推送权限（不上传版本）...", repository.check_remote_connection,
+                    "远程验证完成。",
+                )
+            else:
+                self.status_label.set_text("Git 账号与远程仓库配置已保存。")
+            return
+
+    def open_github_repository_creation(self, dialog, remote_entry, username_entry) -> None:
+        try:
+            url = github_repository_creation_url(
+                remote_entry.get_text(), username_entry.get_text(), self.workspace_path.name
+            )
+            Gtk.show_uri_on_window(dialog, url, Gdk.CURRENT_TIME)
+        except (GitError, GLib.Error, OSError) as error:
+            self.show_error(str(error))
+
+    def use_github_ssh(self, remote_entry, token_entry) -> None:
+        try:
+            remote_url = github_ssh_remote_url(remote_entry.get_text())
+        except GitError as error:
+            self.show_error(str(error))
+            return
+        remote_entry.set_text(remote_url)
+        token_entry.set_text("")
+
+    def show_ssh_public_keys(self, parent) -> None:
+        dialog = Gtk.Dialog(title="GitHub SSH 公钥设置", transient_for=parent, modal=True)
+        dialog.add_buttons("关闭", Gtk.ResponseType.CLOSE)
+        dialog.set_default_size(680, 380)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=18)
+        notice = Gtk.Label(
+            label="1. 复制下方公钥；2. 在 GitHub 页面选择 Authentication Key 并粘贴保存；"
+            "3. 返回账号设置，保存 SSH 地址并验证。仅复制 .pub 公钥，绝不要上传私钥。\n"
+            "首次连接请在终端运行 ssh -T git@github.com，核对官方主机指纹。"
+            "加密私钥请先用 ssh-add 解锁。",
+            xalign=0,
+        )
+        notice.set_line_wrap(True)
+        notice.set_max_width_chars(72)
+        content.pack_start(notice, False, False, 0)
+        keys = ssh_public_keys()
+        if keys:
+            selector = Gtk.ComboBoxText()
+            for path in keys:
+                selector.append(path, path)
+            key_view = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.CHAR)
+            selector.connect(
+                "changed", lambda combo: key_view.get_buffer().set_text(keys[combo.get_active_id()])
+            )
+            selector.set_active(0)
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            scroll.set_min_content_height(100)
+            scroll.add(key_view)
+            copy_button = Gtk.Button(label="复制所选公钥")
+            copy_button.connect(
+                "clicked",
+                lambda _button: Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(
+                    keys[selector.get_active_id()], -1
+                ),
+            )
+            content.pack_start(selector, False, False, 0)
+            content.pack_start(scroll, True, True, 0)
+            content.pack_start(copy_button, False, False, 0)
+        else:
+            missing = Gtk.Label(
+                label="未找到可用的 .pub 公钥。请先在终端运行：\n"
+                'ssh-keygen -t ed25519 -C "你的邮箱"\n'
+                "设置密钥口令；如果目标文件已存在，请选择新文件名，不要覆盖旧密钥。",
+                xalign=0,
+            )
+            missing.set_selectable(True)
+            missing.set_line_wrap(True)
+            content.pack_start(missing, False, False, 0)
+        link = Gtk.LinkButton.new_with_label("https://github.com/settings/ssh/new", "打开 GitHub 添加 SSH 公钥")
+        link.set_halign(Gtk.Align.START)
+        content.pack_start(link, False, False, 0)
+        dialog.get_content_area().add(content)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
+    def request_git_credentials(self, remote_url: str, message: str) -> Optional[GitCredentials]:
+        completed = threading.Event()
+        credentials: List[Optional[GitCredentials]] = [None]
+
+        def prompt() -> bool:
+            try:
+                credentials[0] = self.prompt_git_credentials(remote_url, message)
+            except Exception as error:
+                self.show_error(str(error))
+            finally:
+                completed.set()
+            return False
+
+        if threading.current_thread() is threading.main_thread():
+            prompt()
+        else:
+            GLib.idle_add(prompt)
+            completed.wait()
+        return credentials[0]
+
+    def prompt_git_credentials(self, remote_url: str, message: str) -> Optional[GitCredentials]:
+        dialog = Gtk.Dialog(title="登录 Git 并重试同步", transient_for=self, modal=True)
+        dialog.add_buttons("稍后同步", Gtk.ResponseType.CANCEL, "登录并重试", Gtk.ResponseType.OK)
+        dialog.set_default_size(600, 320)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=18)
+        if urlsplit(remote_url).hostname == "github.com":
+            message += "\nGitHub 令牌需授权此仓库，并设置 Contents → Read and write。"
+        notice = Gtk.Label(label=message + "\n\n" + remote_url, xalign=0)
+        notice.set_line_wrap(True)
+        notice.set_max_width_chars(64)
+        notice.set_selectable(True)
+        content.pack_start(notice, False, False, 0)
+        token_url = github_token_creation_url(remote_url)
+        if token_url:
+            token_link = Gtk.LinkButton.new_with_label(
+                token_url, "创建 GitHub 写入令牌（选择目标仓库后生成）"
+            )
+            token_link.set_halign(Gtk.Align.START)
+            content.pack_start(token_link, False, False, 0)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=12)
+        username = ""
+        if self.repository:
+            username = self.repository.run(
+                ["config", "--get", "codeversionmanager.username"], check=False
+            ).strip()
+            if not username and self.repository.credentials:
+                username = self.repository.credentials.username
+        username_entry = Gtk.Entry(text=username)
+        username_entry.set_hexpand(True)
+        username_entry.set_placeholder_text("Git 托管平台用户名")
+        token_entry = Gtk.Entry()
+        token_entry.set_visibility(False)
+        token_entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        token_entry.set_placeholder_text("PAT/访问令牌，不是网站登录密码")
+        token_entry.set_activates_default(True)
+        grid.attach(Gtk.Label(label="Git 用户名", xalign=0), 0, 0, 1, 1)
+        grid.attach(username_entry, 1, 0, 1, 1)
+        grid.attach(Gtk.Label(label="访问令牌", xalign=0), 0, 1, 1, 1)
+        grid.attach(token_entry, 1, 1, 1, 1)
+        content.pack_start(grid, False, False, 0)
+        dialog.get_content_area().add(content)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        dialog.show_all()
+        if username:
+            token_entry.grab_focus()
+        else:
+            username_entry.grab_focus()
+        while True:
+            response = dialog.run()
+            if response != Gtk.ResponseType.OK:
+                dialog.destroy()
+                return None
+            username, token = username_entry.get_text().strip(), token_entry.get_text().strip()
+            try:
+                if not username or not token:
+                    raise GitError("请填写 Git 用户名和 PAT/访问令牌。")
+                validate_git_account("Git User", "user@localhost", username, token, remote_url)
+            except GitError as error:
+                self.show_error(str(error))
+                continue
+            dialog.destroy()
+            return GitCredentials(remote_url, username, token)
+
+    def on_sync_remote(self, _button) -> None:
+        repository = self.repository
+        if repository:
+            self.run_background(
+                "正在同步远程仓库...", repository.sync_remote,
+                "当前分支和版本标签已同步到远程仓库。",
+            )
 
     def on_return_main(self, _bar, response) -> None:
         if response != Gtk.ResponseType.OK:
@@ -1299,6 +2087,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def on_save_version(self, _button) -> None:
         if not self.repository:
             return
+        repository = self.repository
         metadata = self.prompt_version_metadata(self.repository.next_version())
         if not metadata:
             return
@@ -1324,10 +2113,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         selected = expand_package_groups(groups, selected_entries)
         self.run_background(
             "正在发布版本...",
-            lambda: self.repository.save_version(
+            lambda: repository.save_version(
                 version, message, selected, selected_scopes=selected_entries
             ),
-            f"版本 {version} 已发布。",
+            f"版本 {version} 已发布"
+            + ("并同步到远程仓库。" if repository.auto_sync_enabled() else "。"),
         )
 
     def on_enable_versioning(self) -> None:
@@ -1650,18 +2440,37 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def run_background(
         self, busy: str, operation, success: str, reload_workspace: bool = False
     ) -> None:
+        if self.busy:
+            return
+        self.busy = True
+        self.header.set_sensitive(False)
+        self.toolbar.set_sensitive(False)
+        self.notebook.set_sensitive(False)
+        self.info_action_button.set_sensitive(False)
         self.status_label.set_text(busy)
+        started = time.monotonic()
+
+        def update_elapsed() -> bool:
+            if not self.busy:
+                return False
+            elapsed = int(time.monotonic() - started)
+            self.status_label.set_text(f"{busy} · 已等待 {elapsed} 秒")
+            return True
+
+        self.background_timer = GLib.timeout_add_seconds(1, update_elapsed)
 
         def worker() -> None:
             try:
-                operation()
-                GLib.idle_add(self._background_complete, success, reload_workspace)
+                result = operation()
+                message = result if isinstance(result, str) and result else success
+                GLib.idle_add(self._background_complete, message, reload_workspace)
             except Exception as error:  # GTK must receive subprocess errors on the main thread.
                 GLib.idle_add(self._background_failed, str(error))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _background_complete(self, message: str, reload_workspace: bool = False) -> bool:
+        self._end_background()
         if reload_workspace:
             self.load_workspace(self.workspace_path)
         else:
@@ -1670,9 +2479,20 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         return False
 
     def _background_failed(self, message: str) -> bool:
+        self._end_background()
         self.refresh()
         self.show_error(message)
         return False
+
+    def _end_background(self) -> None:
+        self.busy = False
+        if self.background_timer is not None:
+            GLib.source_remove(self.background_timer)
+            self.background_timer = None
+        self.header.set_sensitive(True)
+        self.toolbar.set_sensitive(True)
+        self.notebook.set_sensitive(True)
+        self.info_action_button.set_sensitive(True)
 
     def show_error(self, message: str) -> None:
         dialog = Gtk.MessageDialog(

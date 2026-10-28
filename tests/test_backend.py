@@ -1,11 +1,15 @@
 #!/usr/bin/python3
 import importlib.util
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from unittest import mock
 
 
@@ -110,7 +114,8 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("2.5 MB", MODULE.format_storage_size(5 * 1024 * 1024 // 2))
 
     def test_application_version_uses_project_version_file(self):
-        self.assertEqual("0.1.6", MODULE.APP_VERSION)
+        expected = (SOURCE.parents[1] / "VERSION").read_text(encoding="utf-8").strip()
+        self.assertEqual(expected, MODULE.APP_VERSION)
 
     def test_recent_workspaces_are_deduplicated_limited_and_persisted(self):
         config_file = self.path / "config" / "settings.ini"
@@ -528,6 +533,1000 @@ class GitRepositoryTest(unittest.TestCase):
         with zipfile.ZipFile(archive) as bundle:
             self.assertIn("src/keep.txt", bundle.namelist())
             self.assertNotIn("src/obsolete.txt", bundle.namelist())
+
+
+class RemoteProcessTest(unittest.TestCase):
+    def test_remote_process_returns_output_and_exit_status(self):
+        result = MODULE.run_remote_process(
+            [sys.executable, "-c", "import sys; print('output'); print('progress', file=sys.stderr)"],
+            timeout=5, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("output\n", result.stdout)
+        self.assertEqual("progress\n", result.stderr)
+
+    def test_timeout_kills_transport_children_without_waiting_for_inherited_pipes(self):
+        command = [
+            sys.executable, "-c",
+            "import subprocess, sys, time; "
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print(child.pid, flush=True); "
+            "print('Writing objects: 50%', file=sys.stderr, flush=True); time.sleep(60)",
+        ]
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            MODULE.run_remote_process(
+                command, timeout=0.5, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn("Writing objects: 50%", raised.exception.stderr)
+        child_pid = int(raised.exception.stdout.strip())
+        status = Path(f"/proc/{child_pid}/stat")
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                state = status.read_text().split()[2]
+            except FileNotFoundError:
+                break
+            if state == "Z":
+                break
+            self.assertLess(time.monotonic(), deadline, "Git transport child was not terminated")
+            time.sleep(0.01)
+
+    def test_timeout_tolerates_process_group_already_exiting(self):
+        process = mock.Mock()
+        process.pid = 123456
+        process.communicate.side_effect = [subprocess.TimeoutExpired("git", 1), ("output", "progress")]
+        context_manager = mock.MagicMock()
+        context_manager.__enter__.return_value = process
+        with mock.patch.object(MODULE.subprocess, "Popen", return_value=context_manager) as popen, \
+             mock.patch.object(MODULE.os, "killpg", side_effect=ProcessLookupError):
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                MODULE.run_remote_process(["git", "push"], timeout=1)
+
+        self.assertEqual("progress", raised.exception.stderr)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(2, process.communicate.call_count)
+
+
+class RemoteRepositoryTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.path = self.root / "workspace"
+        self.path.mkdir()
+        (self.path / "robot.txt").write_text("initial\n", encoding="utf-8")
+        self.repository = MODULE.initialize_repository(
+            self.path, "v0.0.1", "initial", ["robot.txt"]
+        )
+        self.remote = self.root / "remote.git"
+        self.git(self.root, "init", "--bare", "-q", str(self.remote))
+
+    def git(self, path, *args):
+        return subprocess.run(
+            ["git", "-C", str(path), *args], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ).stdout.strip()
+
+    def configure(self, remote=None, auto_sync=True):
+        self.repository.configure_remote(
+            str(remote or self.remote), "Test User", "test@example.com", "tester", "", auto_sync
+        )
+
+    def publish(self, version):
+        (self.path / "robot.txt").write_text(version + "\n", encoding="utf-8")
+        self.repository.save_version(version, "changes " + version, ["robot.txt"])
+
+    def test_configure_is_local_and_preserves_unrelated_remotes(self):
+        self.repository.run(["remote", "add", "backup", str(self.root / "backup.git")])
+        self.configure()
+
+        self.assertEqual(str(self.remote), self.repository.remote_url())
+        self.assertTrue(self.repository.auto_sync_enabled())
+        self.assertEqual("Test User", self.git(self.path, "config", "--local", "user.name"))
+        self.assertEqual("tester", self.git(self.path, "config", "--local", "codeversionmanager.username"))
+        self.assertEqual(["backup", "origin"], self.git(self.path, "remote").splitlines())
+        result = self.repository.check_remote_connection()
+        self.assertIn("推送预检查通过", result)
+        self.assertEqual("", self.git(self.remote, "for-each-ref"))
+
+    def test_github_token_creation_url_prefills_owner_and_write_permission(self):
+        for remote in (
+            "https://github.com/lqxmb/code-version-manager.git",
+            "git@github.com:lqxmb/code-version-manager.git",
+            "ssh://git@github.com/lqxmb/code-version-manager.git",
+        ):
+            with self.subTest(remote=remote):
+                token_url = MODULE.github_token_creation_url(remote)
+                parameters = parse_qs(urlsplit(token_url).query)
+                self.assertEqual(["lqxmb"], parameters["target_name"])
+                self.assertEqual(["write"], parameters["contents"])
+                self.assertNotIn("repository", parameters)
+
+        self.assertIsNone(MODULE.github_token_creation_url("https://gitlab.com/team/repo.git"))
+        self.assertIsNone(MODULE.github_token_creation_url("git@github.com:"))
+
+    def test_github_readable_but_write_denied_fails_during_dry_run_preflight(self):
+        remote_url = "https://github.com/lqxmb/code-version-manager.git"
+        self.configure(remote=remote_url)
+        read_success = subprocess.CompletedProcess([], 0, stdout="refs\n", stderr="")
+        write_denied = subprocess.CompletedProcess(
+            [], 128, stdout="",
+            stderr=(
+                "remote: Permission to lqxmb/code-version-manager.git denied to lqxmb.\n"
+                "fatal: unable to access 'https://github.com/lqxmb/code-version-manager.git/': "
+                "The requested URL returned error: 403"
+            ),
+        )
+        with mock.patch.object(
+            MODULE, "run_remote_process", side_effect=[read_success, write_denied]
+        ) as run:
+            with self.assertRaises(MODULE.GitError) as raised:
+                self.repository.check_remote_connection()
+
+        self.assertIn("Contents 设为 Read and write", str(raised.exception))
+        self.assertIn("本地提交和版本标签均已保留", str(raised.exception))
+        self.assertEqual(2, run.call_count)
+        preflight = run.call_args_list[1]
+        self.assertIn("--dry-run", preflight.args[0])
+        self.assertEqual(MODULE.REMOTE_TIMEOUT, preflight.kwargs["timeout"])
+        self.assertEqual("", self.git(self.remote, "for-each-ref"))
+
+    def test_detached_head_reports_read_only_check_without_dry_run(self):
+        self.configure()
+        self.git(self.path, "checkout", "--detach", "-q", "HEAD")
+        completed = subprocess.CompletedProcess([], 0, stdout="refs\n", stderr="")
+        with mock.patch.object(MODULE, "run_remote_process", return_value=completed) as run:
+            result = self.repository.check_remote_connection()
+
+        self.assertIn("未检查推送权限", result)
+        self.assertEqual(1, run.call_count)
+        self.assertIn("ls-remote", run.call_args.args[0])
+        self.assertNotIn("push", run.call_args.args[0])
+
+    def test_empty_repository_reports_that_write_permission_was_not_checked(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        self.git(empty, "init", "-q")
+        repository = MODULE.GitRepository(empty)
+        repository.configure_remote(
+            str(self.remote), "Test", "test@example.com", "tester", "", False
+        )
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(MODULE, "run_remote_process", return_value=completed) as run:
+            result = repository.check_remote_connection()
+
+        self.assertIn("尚无本地提交，未检查推送权限", result)
+        self.assertEqual(1, run.call_count)
+        self.assertNotIn("push", run.call_args.args[0])
+
+    def test_dry_run_does_not_change_refs_upstream_or_run_local_push_hook(self):
+        self.configure()
+        before_refs = self.git(self.path, "for-each-ref")
+        before_config = self.git(self.path, "config", "--local", "--list")
+        marker = self.root / "push-hook-ran"
+        hook = self.path / ".git" / "hooks" / "pre-push"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
+        hook.chmod(0o755)
+
+        self.repository.check_remote_connection()
+
+        self.assertEqual("", self.git(self.remote, "for-each-ref"))
+        self.assertEqual(before_refs, self.git(self.path, "for-each-ref"))
+        self.assertEqual(before_config, self.git(self.path, "config", "--local", "--list"))
+        self.assertFalse(marker.exists())
+
+    def test_configure_replaces_different_push_destination(self):
+        self.repository.run(["remote", "add", "origin", str(self.root / "old.git")])
+        self.repository.run(["config", "remote.origin.pushurl", str(self.root / "other.git")])
+        self.configure()
+
+        self.assertEqual(str(self.remote), self.repository._sync_target())
+
+    def test_release_pushes_branch_all_versions_and_sets_upstream(self):
+        self.configure()
+        self.publish("v0.0.2")
+
+        self.assertEqual(
+            self.git(self.path, "rev-parse", "HEAD"),
+            self.git(self.remote, "rev-parse", "refs/heads/main"),
+        )
+        self.assertEqual(["v0.0.1", "v0.0.2"], self.git(self.remote, "tag").splitlines())
+        self.assertEqual("origin/main", self.git(self.path, "rev-parse", "--abbrev-ref", "@{u}"))
+        self.assertEqual("robot.txt", self.git(self.remote, "ls-tree", "-r", "--name-only", "main"))
+        self.repository.sync_remote()
+        self.assertEqual("2", self.git(self.remote, "rev-list", "--count", "main"))
+
+    def test_offline_versions_all_sync_on_manual_retry(self):
+        missing = self.root / "unavailable.git"
+        self.configure(missing)
+        for version in ("v0.0.2", "v0.0.3", "v1.2.3.4"):
+            with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
+                self.publish(version)
+            self.assertIn(version, self.repository.tags())
+            self.assertEqual([], self.repository.status())
+            self.assertEqual(["robot.txt"], self.repository.manifest(version))
+            self.assertIn(version[1:], self.repository.changelog_text())
+
+        self.git(self.root, "init", "--bare", "-q", str(missing))
+        self.repository.sync_remote()
+
+        self.assertEqual("4", self.git(missing, "rev-list", "--count", "main"))
+        self.assertEqual(self.repository.tags(), self.git(missing, "tag", "--sort=version:refname").splitlines())
+        self.assertEqual(
+            self.git(self.path, "rev-parse", "HEAD"), self.git(missing, "rev-parse", "main")
+        )
+        self.repository.sync_remote()
+        self.assertEqual("4", self.git(missing, "rev-list", "--count", "main"))
+
+    def test_next_successful_release_also_pushes_older_offline_versions(self):
+        missing = self.root / "unavailable.git"
+        self.configure(missing)
+        for version in ("v0.0.2", "v0.0.3"):
+            with self.assertRaises(MODULE.GitError):
+                self.publish(version)
+        self.git(self.root, "init", "--bare", "-q", str(missing))
+
+        self.publish("v0.0.4")
+
+        self.assertEqual("4", self.git(missing, "rev-list", "--count", "main"))
+        self.assertEqual(self.repository.tags(), self.git(missing, "tag", "--sort=version:refname").splitlines())
+
+    def test_disabled_auto_sync_does_not_contact_remote(self):
+        self.configure(self.root / "unavailable.git", auto_sync=False)
+        with mock.patch.object(self.repository, "_run_remote") as run:
+            self.publish("v0.0.2")
+        run.assert_not_called()
+        self.assertIn("v0.0.2", self.repository.tags())
+
+    def test_missing_remote_also_keeps_local_release(self):
+        self.repository.run(["config", "codeversionmanager.autoSync", "true"])
+        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
+            self.publish("v0.0.2")
+        self.assertIn("v0.0.2", self.repository.tags())
+
+    def test_manual_sync_includes_lightweight_version_tags_but_not_other_tags(self):
+        self.configure(auto_sync=False)
+        self.repository.run(["tag", "v2.0.0"])
+        self.repository.run(["tag", "internal-note"])
+        self.publish("v2.0.1")
+        self.repository.sync_remote()
+
+        self.assertEqual(["v0.0.1", "v2.0.0", "v2.0.1"], self.git(self.remote, "tag").splitlines())
+
+    def test_remote_ahead_is_not_overwritten_and_new_tags_are_not_partially_pushed(self):
+        self.configure()
+        self.repository.sync_remote()
+        old_head = self.git(self.path, "rev-parse", "HEAD")
+        self.publish("v0.0.2")
+        remote_head = self.git(self.remote, "rev-parse", "main")
+        self.repository.run(["reset", "--mixed", old_head])
+
+        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
+            self.publish("v0.0.3")
+
+        self.assertEqual(remote_head, self.git(self.remote, "rev-parse", "main"))
+        self.assertEqual(["v0.0.1", "v0.0.2"], self.git(self.remote, "tag").splitlines())
+        self.assertIn("v0.0.3", self.repository.tags())
+
+    def test_conflicting_tag_does_not_update_remote_branch(self):
+        self.configure()
+        self.repository.sync_remote()
+        remote_head = self.git(self.remote, "rev-parse", "main")
+        self.repository.run(["tag", "-f", "-a", "v0.0.1", "-m", "changed description"])
+
+        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
+            self.publish("v0.0.2")
+
+        self.assertEqual(remote_head, self.git(self.remote, "rev-parse", "main"))
+        self.assertEqual(["v0.0.1"], self.git(self.remote, "tag").splitlines())
+
+    def test_server_without_atomic_push_fails_without_partial_updates(self):
+        self.configure()
+        self.git(self.remote, "config", "receive.advertiseAtomic", "false")
+
+        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
+            self.publish("v0.0.2")
+
+        self.assertEqual("", self.git(self.remote, "for-each-ref"))
+        self.assertIn("v0.0.2", self.repository.tags())
+
+    def test_push_permission_failure_keeps_local_version(self):
+        self.configure()
+        hook = self.remote / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o700)
+
+        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
+            self.publish("v0.0.2")
+
+        self.assertEqual("", self.git(self.remote, "for-each-ref"))
+        self.assertIn("v0.0.2", self.repository.tags())
+
+    def test_sync_rejects_detached_head(self):
+        self.configure()
+        self.repository.run(["switch", "--detach", "v0.0.1"])
+        with self.assertRaisesRegex(MODULE.GitError, "查看历史版本时不能同步"):
+            self.repository.sync_remote()
+        self.assertEqual("", self.git(self.remote, "for-each-ref"))
+
+    def test_empty_repository_can_be_configured_before_first_release(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        self.repository = MODULE.create_repository(empty)
+        self.configure()
+        self.assertEqual([], self.repository.history())
+        with self.assertRaisesRegex(MODULE.GitError, "尚无可同步的版本"):
+            self.repository.sync_remote()
+        (empty / "hello.txt").write_text("hello\n", encoding="utf-8")
+        self.repository.save_version("v1.0.0", "first", ["hello.txt"])
+        self.assertEqual(["v1.0.0"], self.git(self.remote, "tag").splitlines())
+
+    def test_token_is_session_only_and_retained_when_same_account_is_saved(self):
+        token = "secret-token-123"
+        self.repository.configure_remote(
+            "https://example.com/team/project.git", "Test", "test@example.com", "tester", token, True
+        )
+        configuration = (self.path / ".git" / "config").read_text(encoding="utf-8")
+        self.assertNotIn(token, configuration)
+        self.assertNotIn(token, repr(self.repository.credentials))
+        self.repository.configure_remote(
+            self.repository.remote_url(), "Test", "test@example.com", "tester", "", True
+        )
+        self.assertEqual(token, self.repository.credentials.token)
+        self.assertIsNone(MODULE.GitRepository(self.path).credentials)
+        self.repository.configure_remote(
+            "https://example.com/team/other.git", "Test", "test@example.com", "tester", "", True
+        )
+        self.assertIsNone(self.repository.credentials)
+
+    def test_session_token_can_be_cleared_without_changing_remote(self):
+        remote = "https://example.com/repo.git"
+        self.repository.configure_remote(remote, "Test", "test@example.com", "tester", "secret", True)
+        self.repository.configure_remote(
+            remote, "Test", "test@example.com", "tester", "", True, clear_token=True
+        )
+        self.assertIsNone(self.repository.credentials)
+        self.assertEqual(remote, self.repository.remote_url())
+
+    def test_uses_actual_working_branch_instead_of_assuming_main(self):
+        self.repository.run(["switch", "-c", "release"])
+        self.configure()
+        self.publish("v0.0.2")
+
+        self.assertEqual(
+            "refs/heads/release", self.git(self.remote, "for-each-ref", "--format=%(refname)", "refs/heads/")
+        )
+        self.assertEqual(["v0.0.1", "v0.0.2"], self.git(self.remote, "tag").splitlines())
+
+    def test_multiple_push_destinations_are_rejected_without_losing_local_release(self):
+        self.configure()
+        self.repository.run(["config", "--add", "remote.origin.pushurl", str(self.remote)])
+        self.repository.run(["config", "--add", "remote.origin.pushurl", str(self.root / "other.git")])
+
+        with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败"):
+            self.publish("v0.0.2")
+
+        self.assertEqual("", self.git(self.remote, "for-each-ref"))
+        self.assertIn("v0.0.2", self.repository.tags())
+
+    def test_existing_helpers_remain_available_without_session_token(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(self.repository, "run", return_value="tester\n"), \
+             mock.patch.object(MODULE, "run_remote_process", return_value=completed) as run:
+            self.repository._run_remote(["ls-remote", "origin"], "https://example.com/repo.git")
+
+        self.assertNotIn("credential.helper=", run.call_args.args[0])
+        self.assertIn("credential.username=tester", run.call_args.args[0])
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual("0", environment["GIT_TERMINAL_PROMPT"])
+        self.assertEqual("/bin/false", environment["GIT_ASKPASS"])
+        self.assertIn("BatchMode=yes", environment["GIT_SSH_COMMAND"])
+
+    def test_askpass_keeps_token_out_of_arguments_and_files(self):
+        token = "secret-token-a/b+c"
+        self.repository.credentials = MODULE.GitCredentials("https://example.com/repo.git", "tester", token)
+        askpass_path = None
+
+        def run(command, **kwargs):
+            nonlocal askpass_path
+            self.assertNotIn(token, " ".join(command))
+            self.assertIn("credential.helper=", command)
+            environment = kwargs["env"]
+            self.assertEqual("0", environment["GIT_TERMINAL_PROMPT"])
+            self.assertEqual(MODULE.REMOTE_TIMEOUT, kwargs["timeout"])
+            askpass_path = Path(environment["GIT_ASKPASS"])
+            self.assertNotIn(token, askpass_path.read_text(encoding="utf-8"))
+            self.assertEqual(0o700, askpass_path.stat().st_mode & 0o777)
+            with subprocess.Popen(
+                [str(askpass_path), "Username for 'https://example.com':"],
+                env=environment, stdout=subprocess.PIPE, text=True,
+            ) as process:
+                self.assertEqual("tester\n", process.communicate()[0])
+            with subprocess.Popen(
+                [str(askpass_path), "Password for 'https://example.com':"],
+                env=environment, stdout=subprocess.PIPE, text=True,
+            ) as process:
+                self.assertEqual(token + "\n", process.communicate()[0])
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch.object(MODULE, "run_remote_process", side_effect=run):
+            self.repository._run_remote(["ls-remote", "origin"], "https://example.com/repo.git")
+        self.assertFalse(askpass_path.exists())
+
+    def test_remote_errors_redact_tokens_and_encoded_tokens(self):
+        token = "secret/token+123"
+        self.repository.credentials = MODULE.GitCredentials("https://example.com/repo.git", "tester", token)
+        failure = subprocess.CompletedProcess(
+            [], 1, stdout="",
+            stderr=f"failure {token} {MODULE.quote(token, safe='')} https://tester:password@example.com/repo.git",
+        )
+        with mock.patch.object(MODULE, "run_remote_process", return_value=failure):
+            with self.assertRaises(MODULE.GitError) as raised:
+                self.repository._run_remote(["push", "origin"], "https://example.com/repo.git")
+        self.assertNotIn(token, str(raised.exception))
+        self.assertNotIn(MODULE.quote(token, safe=""), str(raised.exception))
+        self.assertNotIn("password", str(raised.exception))
+
+    def test_timeout_is_reported_and_askpass_is_cleaned_up(self):
+        self.repository.credentials = MODULE.GitCredentials("https://example.com/repo.git", "tester", "secret")
+        with mock.patch.object(
+            MODULE, "run_remote_process", side_effect=subprocess.TimeoutExpired("git", MODULE.REMOTE_TIMEOUT)
+        ) as run:
+            with self.assertRaisesRegex(MODULE.GitError, "远程操作超时"):
+                self.repository._run_remote(["ls-remote", "origin"], "https://example.com/repo.git")
+        self.assertFalse(Path(run.call_args.kwargs["env"]["GIT_ASKPASS"]).exists())
+
+    def test_push_has_longer_timeout_than_connection_verification(self):
+        self.configure()
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(MODULE, "run_remote_process", return_value=completed) as run:
+            self.repository.sync_remote()
+            self.assertEqual(MODULE.PUSH_TIMEOUT, run.call_args.kwargs["timeout"])
+            self.assertIn("--progress", run.call_args.args[0])
+            self.repository.check_remote_connection()
+            self.assertEqual(MODULE.REMOTE_TIMEOUT, run.call_args.kwargs["timeout"])
+            self.assertIn("--dry-run", run.call_args.args[0])
+
+    def test_push_timeout_is_editable_local_and_preserved_when_not_overridden(self):
+        self.repository.configure_remote(
+            str(self.remote), "Test", "test@example.com", "tester", "", True, push_timeout=1800
+        )
+        self.assertEqual(1800, self.repository.push_timeout_seconds())
+        self.assertEqual("1800", self.git(self.path, "config", "--local", "codeversionmanager.pushTimeout"))
+        self.configure()
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(MODULE, "run_remote_process", return_value=completed) as run:
+            self.repository.sync_remote()
+        self.assertEqual(1800, run.call_args.kwargs["timeout"])
+
+    def test_invalid_timeout_is_rejected_before_changing_repository(self):
+        for value in (0, 59, 3601, 900.5, "900"):
+            with self.subTest(value=value), self.assertRaises(MODULE.GitError):
+                self.repository.configure_remote(
+                    str(self.remote), "Test", "test@example.com", "tester", "", True, push_timeout=value
+                )
+        self.assertEqual("", self.repository.remote_url())
+        for value in ("invalid", "0", "3601"):
+            self.repository.run(["config", "codeversionmanager.pushTimeout", value])
+            with self.subTest(value=value), self.assertRaises(MODULE.GitError):
+                self.repository.push_timeout_seconds()
+
+    def test_timeout_preserves_last_git_output_redacts_token_and_marks_unknown_remote_state(self):
+        remote = "https://example.com/repo.git"
+        token = "secret/token+value"
+        self.repository.credentials = MODULE.GitCredentials(remote, "tester", token)
+        failure = subprocess.TimeoutExpired(
+            "git", MODULE.PUSH_TIMEOUT,
+            stderr=("Writing objects: 75%\r" + token + " " + MODULE.quote(token, safe="")).encode(),
+        )
+        with mock.patch.object(MODULE, "run_remote_process", side_effect=failure):
+            with self.assertRaises(MODULE.GitError) as raised:
+                self.repository._run_remote(["push", "origin"], remote)
+
+        message = str(raised.exception)
+        self.assertIn(f"超过 {MODULE.PUSH_TIMEOUT} 秒", message)
+        self.assertIn("Writing objects: 75%", message)
+        self.assertIn("不能确认远程是否已经接收更新", message)
+        self.assertIn("默认 15 分钟", message)
+        self.assertNotIn(token, message)
+        self.assertNotIn(MODULE.quote(token, safe=""), message)
+
+    def test_timeout_with_no_git_output_still_explains_stage_and_keeps_local_release(self):
+        self.configure()
+        with mock.patch.object(
+            MODULE, "run_remote_process", side_effect=subprocess.TimeoutExpired("git", MODULE.PUSH_TIMEOUT)
+        ):
+            with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败") as raised:
+                self.publish("v0.0.2")
+
+        self.assertIn("推送分支与版本标签", str(raised.exception))
+        self.assertNotIn("Git 最后输出", str(raised.exception))
+        self.assertEqual(["v0.0.1", "v0.0.2"], self.repository.tags())
+        self.assertEqual(["robot.txt"], self.repository.manifest("v0.0.2"))
+        self.assertEqual("", self.git(self.remote, "for-each-ref"))
+
+    def test_retry_after_timeout_when_remote_already_accepted_updates_is_idempotent(self):
+        self.configure()
+        original_runner = MODULE.run_remote_process
+
+        def accepted_then_timeout(command, **kwargs):
+            result = original_runner(command, **kwargs)
+            self.assertEqual(0, result.returncode)
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=result.stdout, stderr=result.stderr)
+
+        with mock.patch.object(MODULE, "run_remote_process", side_effect=accepted_then_timeout):
+            with self.assertRaisesRegex(MODULE.GitError, "不能确认远程是否已经接收更新"):
+                self.publish("v0.0.2")
+
+        self.assertEqual(["v0.0.1", "v0.0.2"], self.git(self.remote, "tag").splitlines())
+        self.repository.sync_remote()
+        self.assertEqual("2", self.git(self.remote, "rev-list", "--count", "main"))
+        self.assertEqual("2", self.git(self.path, "rev-list", "--count", "HEAD"))
+
+    def test_existing_credentials_are_not_sent_to_different_destination(self):
+        self.configure()
+        self.repository.credentials = MODULE.GitCredentials("https://example.com/repo.git", "tester", "secret")
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(MODULE, "run_remote_process", return_value=completed) as run:
+            self.repository._run_remote(["push", "origin"], str(self.remote))
+        self.assertNotIn("CVM_GIT_TOKEN", run.call_args.kwargs["env"])
+
+    def test_missing_https_credentials_explain_how_to_log_in(self):
+        failure = subprocess.CompletedProcess(
+            [], 128, stdout="",
+            stderr="error: unable to read askpass response from '/bin/false'\n"
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+        )
+        with mock.patch.object(self.repository, "run", return_value=""), \
+             mock.patch.object(MODULE, "run_remote_process", return_value=failure):
+            with self.assertRaisesRegex(MODULE.GitError, "HTTPS 登录凭据缺失或已失效") as raised:
+                self.repository._run_remote(["push", "origin"], "https://github.com/team/repo.git")
+        self.assertIn("PAT/访问令牌", str(raised.exception))
+
+    def test_readable_remote_does_not_require_login_or_claim_to_authenticate(self):
+        self.repository.credential_prompt = mock.Mock()
+        success = subprocess.CompletedProcess([], 0, stdout="remote refs\n", stderr="")
+        with mock.patch.object(self.repository, "run", return_value=""), \
+             mock.patch.object(MODULE, "run_remote_process", return_value=success):
+            result = self.repository._run_remote(
+                ["ls-remote", "--", "https://example.com/repo.git"], "https://example.com/repo.git"
+            )
+
+        self.assertEqual("remote refs\n", result)
+        self.repository.credential_prompt.assert_not_called()
+        self.assertIsNone(self.repository.credentials)
+
+    def test_authentication_prompt_retries_remote_command_with_session_credentials(self):
+        remote = "https://example.com/repo.git"
+        self.repository.credential_prompt = mock.Mock(
+            return_value=MODULE.GitCredentials(remote, "tester", "new-secret")
+        )
+        failure = subprocess.CompletedProcess(
+            [], 128, stdout="", stderr="fatal: could not read Username: terminal prompts disabled"
+        )
+        success = subprocess.CompletedProcess([], 0, stdout="connected\n", stderr="")
+
+        with mock.patch.object(self.repository, "run", return_value="") as local_run, \
+             mock.patch.object(MODULE, "run_remote_process", side_effect=[failure, success]) as run:
+            result = self.repository._run_remote(["ls-remote", "--", remote], remote)
+
+        self.assertEqual("connected\n", result)
+        self.repository.credential_prompt.assert_called_once()
+        local_run.assert_any_call(["config", "--local", "codeversionmanager.username", "tester"])
+        self.assertEqual(2, run.call_count)
+        self.assertNotIn("CVM_GIT_TOKEN", run.call_args_list[0].kwargs["env"])
+        self.assertEqual("new-secret", run.call_args_list[1].kwargs["env"]["CVM_GIT_TOKEN"])
+        self.assertNotIn("new-secret", " ".join(run.call_args.args[0]))
+        self.assertEqual("new-secret", self.repository.credentials.token)
+
+    def test_invalid_token_can_be_replaced_but_does_not_prompt_indefinitely(self):
+        remote = "https://example.com/repo.git"
+        self.repository.credentials = MODULE.GitCredentials(remote, "tester", "expired-secret")
+        self.repository.credential_prompt = mock.Mock(
+            return_value=MODULE.GitCredentials(remote, "tester", "replacement-secret")
+        )
+        failures = [
+            subprocess.CompletedProcess(
+                [], 128, stdout="", stderr=f"fatal: Authentication failed using {token}"
+            )
+            for token in ("expired-secret", "replacement-secret")
+        ]
+        with mock.patch.object(self.repository, "run", return_value=""), \
+             mock.patch.object(MODULE, "run_remote_process", side_effect=failures) as run:
+            with self.assertRaisesRegex(MODULE.GitError, "请点击“Git 账号”") as raised:
+                self.repository._run_remote(["push", "origin"], remote)
+
+        self.assertEqual(2, run.call_count)
+        self.repository.credential_prompt.assert_called_once()
+        self.assertNotIn("expired-secret", str(raised.exception))
+        self.assertNotIn("replacement-secret", str(raised.exception))
+
+    def test_cancelled_login_keeps_local_version_and_allows_later_sync(self):
+        remote = "https://example.com/repo.git"
+        self.repository.configure_remote(remote, "Test", "test@example.com", "", "", True)
+        self.repository.credential_prompt = mock.Mock(return_value=None)
+        original_run = subprocess.run
+        push_attempts = []
+
+        def run(command, **kwargs):
+            if "push" in command:
+                push_attempts.append(command)
+                return subprocess.CompletedProcess(
+                    command, 128, stdout="", stderr="fatal: could not read Username: terminal prompts disabled"
+                )
+            return original_run(command, **kwargs)
+
+        with mock.patch.object(MODULE, "run_remote_process", side_effect=run):
+            with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败") as raised:
+                self.publish("v0.0.2")
+        self.assertIn("已取消 Git 登录", str(raised.exception))
+        self.assertEqual(1, len(push_attempts))
+        self.assertEqual(["v0.0.1", "v0.0.2"], self.repository.tags())
+        self.assertEqual("2", self.git(self.path, "rev-list", "--count", "HEAD"))
+
+        self.configure()
+        self.repository.sync_remote()
+        self.assertEqual(["v0.0.1", "v0.0.2"], self.git(self.remote, "tag").splitlines())
+
+    def test_authentication_retry_pushes_accumulated_versions_without_repeating_release(self):
+        self.publish("v0.0.2")
+        self.publish("v0.0.3")
+        remote = "https://example.com/repo.git"
+        self.repository.configure_remote(remote, "Test", "test@example.com", "tester", "", True)
+        self.repository.credential_prompt = mock.Mock(
+            return_value=MODULE.GitCredentials(remote, "tester", "valid-secret")
+        )
+        original_run = subprocess.run
+        push_attempts = []
+
+        def run(command, **kwargs):
+            if "push" in command:
+                push_attempts.append(command)
+                if len(push_attempts) == 1:
+                    return subprocess.CompletedProcess(
+                        command, 128, stdout="", stderr="fatal: could not read Password: terminal prompts disabled"
+                    )
+                self.assertEqual("valid-secret", kwargs["env"]["CVM_GIT_TOKEN"])
+                command = [str(self.remote) if argument == "origin" else argument for argument in command]
+            return original_run(command, **kwargs)
+
+        with mock.patch.object(MODULE, "run_remote_process", side_effect=run):
+            self.publish("v0.0.4")
+
+        self.assertEqual(2, len(push_attempts))
+        self.repository.credential_prompt.assert_called_once()
+        self.assertEqual("4", self.git(self.path, "rev-list", "--count", "HEAD"))
+        self.assertEqual("4", self.git(self.remote, "rev-list", "--count", "main"))
+        self.assertEqual(self.repository.tags(), self.git(self.remote, "tag", "--sort=version:refname").splitlines())
+        self.assertNotIn("valid-secret", (self.path / ".git" / "config").read_text(encoding="utf-8"))
+
+    def test_network_and_write_permission_errors_do_not_prompt_for_login(self):
+        self.repository.credential_prompt = mock.Mock()
+        for error in ("Could not resolve host: example.com", "Permission to repo.git denied to tester"):
+            failure = subprocess.CompletedProcess([], 128, stdout="", stderr=error)
+            with self.subTest(error=error), \
+                 mock.patch.object(self.repository, "run", return_value=""), \
+                 mock.patch.object(MODULE, "run_remote_process", return_value=failure):
+                with self.assertRaises(MODULE.GitError):
+                    self.repository._run_remote(["push", "origin"], "https://example.com/repo.git")
+        self.repository.credential_prompt.assert_not_called()
+
+    def test_credentials_for_another_repository_are_rejected_without_retry(self):
+        self.repository.credential_prompt = mock.Mock(
+            return_value=MODULE.GitCredentials("https://other.example.com/repo.git", "tester", "secret")
+        )
+        failure = subprocess.CompletedProcess([], 128, stdout="", stderr="fatal: Authentication failed")
+        with mock.patch.object(self.repository, "run", return_value=""), \
+             mock.patch.object(MODULE, "run_remote_process", return_value=failure) as run:
+            with self.assertRaisesRegex(MODULE.GitError, "登录凭据与远程仓库不匹配"):
+                self.repository._run_remote(["push", "origin"], "https://example.com/repo.git")
+        self.assertEqual(1, run.call_count)
+        self.assertIsNone(self.repository.credentials)
+
+    def test_github_403_explains_required_repository_and_contents_permissions(self):
+        remote = "https://github.com/lqxmb/code-version-manager.git"
+        self.repository.credentials = MODULE.GitCredentials(remote, "lqxmb", "secret-token")
+        self.repository.credential_prompt = mock.Mock()
+        failure = subprocess.CompletedProcess(
+            [], 128, stdout="",
+            stderr="remote: Permission to lqxmb/code-version-manager.git denied to lqxmb.\n"
+            "fatal: unable to access 'https://github.com/lqxmb/code-version-manager.git/': "
+            "The requested URL returned error: 403\nsecret-token",
+        )
+        with mock.patch.object(MODULE, "run_remote_process", return_value=failure) as run:
+            with self.assertRaises(MODULE.GitError) as raised:
+                self.repository._run_remote(["push", "origin"], remote)
+
+        message = str(raised.exception)
+        self.assertIn("Resource owner 选择 lqxmb", message)
+        self.assertIn("Repository access 授权 code-version-manager", message)
+        self.assertIn("Contents 设为 Read and write", message)
+        self.assertIn("本地提交和版本标签均已保留", message)
+        self.assertIn("Git 原始错误", message)
+        self.assertNotIn("secret-token", message)
+        self.repository.credential_prompt.assert_not_called()
+        self.assertEqual(1, run.call_count)
+
+    def test_github_403_keeps_new_local_release_and_all_tags(self):
+        remote = "https://github.com/lqxmb/code-version-manager.git"
+        self.repository.configure_remote(remote, "Test", "test@example.com", "lqxmb", "secret-token", True)
+        original_run = subprocess.run
+
+        def run(command, **kwargs):
+            if "push" in command:
+                return subprocess.CompletedProcess(
+                    command, 128, stdout="",
+                    stderr="remote: Write access to repository not granted.\n"
+                    "fatal: The requested URL returned error: 403",
+                )
+            return original_run(command, **kwargs)
+
+        with mock.patch.object(MODULE, "run_remote_process", side_effect=run):
+            with self.assertRaisesRegex(MODULE.GitError, "已保存到本地，但远程同步失败") as raised:
+                self.publish("v0.0.2")
+
+        self.assertIn("Read and write", str(raised.exception))
+        self.assertEqual(["v0.0.1", "v0.0.2"], self.repository.tags())
+        self.assertEqual(["robot.txt"], self.repository.manifest("v0.0.2"))
+        self.assertEqual("2", self.git(self.path, "rev-list", "--count", "HEAD"))
+
+    def test_other_host_403_does_not_show_github_specific_settings(self):
+        failure = subprocess.CompletedProcess(
+            [], 128, stdout="", stderr="fatal: The requested URL returned error: 403"
+        )
+        self.repository.credential_prompt = mock.Mock()
+        with mock.patch.object(self.repository, "run", return_value=""), \
+             mock.patch.object(MODULE, "run_remote_process", return_value=failure):
+            with self.assertRaises(MODULE.GitError) as raised:
+                self.repository._run_remote(["push", "origin"], "https://example.com/repo.git")
+
+        self.assertNotIn("Fine-grained tokens", str(raised.exception))
+        self.repository.credential_prompt.assert_not_called()
+
+    def test_invalid_remote_addresses_and_credentials_are_rejected(self):
+        for value in (
+            "", "--upload-pack=bad", "http://example.com/repo.git", "ext::bad", "relative/path",
+            "https://tester:secret@example.com/repo.git", "https://tester@example.com/repo.git",
+            "https://example.com/repo.git?token=secret", "ssh://host/repo.git\nother",
+        ):
+            with self.subTest(value=value), self.assertRaises(MODULE.GitError):
+                MODULE.validate_remote_url(value)
+        for value in ("https://example.com/repo.git", "git@example.com:team/repo.git", "ssh://git@example.com/repo.git", str(self.remote)):
+            self.assertEqual(value, MODULE.validate_remote_url(value))
+        with self.assertRaises(MODULE.GitError):
+            self.repository.configure_remote(str(self.remote), "Test", "test@example.com", "tester", "secret", True)
+        with self.assertRaises(MODULE.GitError):
+            self.repository.configure_remote("https://example.com/repo.git", "Test", "test@example.com", "", "secret", True)
+        self.assertEqual("", self.repository.remote_url())
+
+
+class GitHubSetupTest(unittest.TestCase):
+    def test_github_addresses_convert_to_ssh_without_changing_repository(self):
+        for remote_url in (
+            "https://github.com/lqxmb/code-version-manager.git",
+            "https://github.com/lqxmb/code-version-manager/",
+            "ssh://git@github.com/lqxmb/code-version-manager.git",
+            "git@github.com:lqxmb/code-version-manager.git",
+        ):
+            with self.subTest(remote_url=remote_url):
+                self.assertEqual(
+                    "git@github.com:lqxmb/code-version-manager.git",
+                    MODULE.github_ssh_remote_url(remote_url),
+                )
+
+    def test_github_helpers_reject_unrelated_or_unsafe_addresses(self):
+        for remote_url in (
+            "", "https://gitlab.com/owner/repo.git", "https://github.com.evil.test/owner/repo.git",
+            "https://github.com/owner", "https://github.com/owner/repo/extra",
+            "https://github.com/owner/..", "https://github.com/owner/repo?token=example",
+            "https://user:password@github.com/owner/repo", "git@github.com:/",
+            "file:///github.com/owner/repo",
+        ):
+            with self.subTest(remote_url=remote_url):
+                self.assertIsNone(MODULE.github_repository_coordinates(remote_url))
+                with self.assertRaises(MODULE.GitError):
+                    MODULE.github_ssh_remote_url(remote_url)
+
+    def test_create_page_uses_owner_from_url_and_defaults_to_private(self):
+        url = MODULE.github_repository_creation_url(
+            "https://github.com/lqxmb/code-version-manager.git", "someone-else", "unrelated"
+        )
+        self.assertEqual("https://github.com/new", url.split("?", 1)[0])
+        parameters = parse_qs(urlsplit(url).query)
+        self.assertEqual(["lqxmb"], parameters["owner"])
+        self.assertEqual(["code-version-manager"], parameters["name"])
+        self.assertEqual(["private"], parameters["visibility"])
+        self.assertNotIn("auto_init", parameters)
+
+    def test_empty_remote_can_open_creation_before_local_repository_exists(self):
+        url = MODULE.github_repository_creation_url("", "lqxmb", "my workspace")
+        self.assertEqual(["my-workspace"], parse_qs(urlsplit(url).query)["name"])
+        url = MODULE.github_repository_creation_url("", "", "中文工作空间")
+        parameters = parse_qs(urlsplit(url).query)
+        self.assertNotIn("owner", parameters)
+        self.assertEqual(["workspace"], parameters["name"])
+        with self.assertRaises(MODULE.GitError):
+            MODULE.github_repository_creation_url("https://example.com/repo", "", "workspace")
+
+    def test_ssh_switch_only_changes_entries_and_discards_entered_token(self):
+        window = mock.Mock()
+        remote_entry = mock.Mock()
+        remote_entry.get_text.return_value = "https://github.com/lqxmb/code-version-manager.git"
+        token_entry = mock.Mock()
+        MODULE.VersionManagerWindow.use_github_ssh(window, remote_entry, token_entry)
+        remote_entry.set_text.assert_called_once_with("git@github.com:lqxmb/code-version-manager.git")
+        token_entry.set_text.assert_called_once_with("")
+        window.show_error.assert_not_called()
+        window.repository.configure_remote.assert_not_called()
+
+    def test_ssh_switch_preserves_entries_when_address_is_invalid(self):
+        window = mock.Mock()
+        remote_entry = mock.Mock()
+        remote_entry.get_text.return_value = "https://example.com/repo"
+        token_entry = mock.Mock()
+        MODULE.VersionManagerWindow.use_github_ssh(window, remote_entry, token_entry)
+        window.show_error.assert_called_once()
+        remote_entry.set_text.assert_not_called()
+        token_entry.set_text.assert_not_called()
+
+    def test_creation_button_opens_official_page_without_creating_or_pushing(self):
+        window = mock.Mock()
+        window.workspace_path = Path("/temporary/my-workspace")
+        remote_entry, username_entry, dialog = mock.Mock(), mock.Mock(), mock.Mock()
+        remote_entry.get_text.return_value = ""
+        username_entry.get_text.return_value = "lqxmb"
+        with mock.patch.object(MODULE.Gtk, "show_uri_on_window") as open_page:
+            MODULE.VersionManagerWindow.open_github_repository_creation(
+                window, dialog, remote_entry, username_entry
+            )
+        arguments = open_page.call_args.args
+        self.assertIs(dialog, arguments[0])
+        self.assertEqual(["my-workspace"], parse_qs(urlsplit(arguments[1]).query)["name"])
+        window.repository.configure_remote.assert_not_called()
+        window.repository.sync_remote.assert_not_called()
+        window.show_error.assert_not_called()
+
+    def test_public_key_list_does_not_read_private_keys_or_follow_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            public = directory / "id_ed25519.pub"
+            public.write_text("ssh-ed25519 AAAA test@example.com\n", encoding="utf-8")
+            private = directory / "id_ed25519"
+            private.write_text("private-key-must-not-be-read", encoding="utf-8")
+            (directory / "linked.pub").symlink_to(private)
+            (directory / "invalid.pub").write_text("-----BEGIN OPENSSH PRIVATE KEY-----", encoding="utf-8")
+            (directory / "large.pub").write_text("x" * 16385, encoding="utf-8")
+            original_read = Path.read_text
+
+            def read_text(path, *args, **kwargs):
+                self.assertEqual(".pub", path.suffix)
+                self.assertFalse(path.is_symlink())
+                return original_read(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_text", read_text):
+                keys = MODULE.ssh_public_keys(directory)
+            self.assertEqual({str(public): "ssh-ed25519 AAAA test@example.com"}, keys)
+            self.assertEqual({}, MODULE.ssh_public_keys(directory / "missing"))
+
+    def test_ssh_permission_errors_offer_key_setup_not_token_login(self):
+        remote_url = "git@github.com:lqxmb/code-version-manager.git"
+        repository = mock.Mock()
+        repository.credentials = None
+        repository.run.return_value = ""
+        repository.credential_prompt = mock.Mock()
+        for raw_error, expected in (
+            ("git@github.com: Permission denied (publickey).", "SSH 公钥设置"),
+            ("Host key verification failed.", "不要关闭主机密钥检查"),
+        ):
+            result = subprocess.CompletedProcess([], 128, stdout="", stderr=raw_error)
+            with self.subTest(raw_error=raw_error), \
+                 mock.patch.object(MODULE, "run_remote_process", return_value=result):
+                with self.assertRaises(MODULE.GitError) as raised:
+                    MODULE.GitRepository._run_remote(repository, ["ls-remote", "origin"], remote_url)
+            self.assertIn(expected, str(raised.exception))
+            self.assertIn("本地提交和版本标签均已保留", str(raised.exception))
+        repository.credential_prompt.assert_not_called()
+
+
+class BackgroundProgressTest(unittest.TestCase):
+    def test_background_completion_uses_verification_status_instead_of_static_success(self):
+        for result in ("仅验证读取，未检查推送权限", None):
+            with self.subTest(result=result):
+                window = mock.Mock()
+                window.busy = False
+                operation = mock.Mock(return_value=result)
+                with mock.patch.object(MODULE.GLib, "timeout_add_seconds", return_value=42), \
+                     mock.patch.object(MODULE.GLib, "idle_add") as idle_add, \
+                     mock.patch.object(MODULE.threading, "Thread") as thread:
+                    MODULE.VersionManagerWindow.run_background(
+                        window, "正在验证...", operation, "默认成功提示"
+                    )
+                    thread.call_args.kwargs["target"]()
+
+                idle_add.assert_called_once_with(
+                    window._background_complete, result or "默认成功提示", False
+                )
+
+    def test_background_timer_updates_elapsed_time_and_is_removed_after_completion(self):
+        window = mock.Mock()
+        window.busy = False
+        window.background_timer = None
+        operation = mock.Mock()
+        with mock.patch.object(MODULE.time, "monotonic", side_effect=[100, 105]), \
+             mock.patch.object(MODULE.GLib, "timeout_add_seconds", return_value=42) as add_timer, \
+             mock.patch.object(MODULE.threading, "Thread") as thread:
+            MODULE.VersionManagerWindow.run_background(window, "正在同步远程仓库...", operation, "已同步")
+            callback = add_timer.call_args.args[1]
+            self.assertTrue(callback())
+
+        self.assertEqual(42, window.background_timer)
+        window.status_label.set_text.assert_called_with("正在同步远程仓库... · 已等待 5 秒")
+        thread.return_value.start.assert_called_once_with()
+        operation.assert_not_called()
+        with mock.patch.object(MODULE.GLib, "source_remove") as remove_timer:
+            MODULE.VersionManagerWindow._end_background(window)
+        remove_timer.assert_called_once_with(42)
+        self.assertIsNone(window.background_timer)
+        self.assertFalse(window.busy)
+        self.assertFalse(callback())
+
+
+class GitCredentialPromptTest(unittest.TestCase):
+    def test_prompt_runs_directly_on_main_thread(self):
+        window = mock.Mock()
+        credentials = MODULE.GitCredentials("https://example.com/repo.git", "tester", "secret")
+        window.prompt_git_credentials.return_value = credentials
+
+        with mock.patch.object(MODULE.GLib, "idle_add") as idle_add:
+            result = MODULE.VersionManagerWindow.request_git_credentials(
+                window, credentials.remote_url, "Please log in"
+            )
+
+        self.assertEqual(credentials, result)
+        window.prompt_git_credentials.assert_called_once_with(credentials.remote_url, "Please log in")
+        idle_add.assert_not_called()
+
+    def test_worker_schedules_prompt_on_gtk_thread(self):
+        window = mock.Mock()
+        credentials = MODULE.GitCredentials("https://example.com/repo.git", "tester", "secret")
+        window.prompt_git_credentials.return_value = credentials
+        scheduled = threading.Event()
+        callbacks = []
+        results = []
+
+        def idle_add(callback):
+            callbacks.append(callback)
+            scheduled.set()
+
+        def worker():
+            results.append(MODULE.VersionManagerWindow.request_git_credentials(
+                window, credentials.remote_url, "Please log in"
+            ))
+
+        with mock.patch.object(MODULE.GLib, "idle_add", side_effect=idle_add):
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            self.assertTrue(scheduled.wait(timeout=5))
+            self.assertTrue(thread.is_alive())
+            self.assertEqual([], results)
+            window.prompt_git_credentials.assert_not_called()
+            self.assertFalse(callbacks[0]())
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([credentials], results)
+
+    def test_prompt_failure_returns_without_leaving_worker_waiting(self):
+        window = mock.Mock()
+        window.prompt_git_credentials.side_effect = RuntimeError("dialog unavailable")
+        result = MODULE.VersionManagerWindow.request_git_credentials(
+            window, "https://example.com/repo.git", "Please log in"
+        )
+        self.assertIsNone(result)
+        window.show_error.assert_called_once_with("dialog unavailable")
 
 
 class CompareCurrentSelectionTest(unittest.TestCase):
