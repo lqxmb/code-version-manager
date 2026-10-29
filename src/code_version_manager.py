@@ -14,6 +14,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -81,12 +82,23 @@ class RemoteSyncSnapshot:
 
 
 @dataclass(frozen=True)
+class RefDifference:
+    ref: str
+    local_oid: Optional[str]
+    remote_oid: Optional[str]
+
+
+@dataclass(frozen=True)
 class RemoteSyncStatus:
     state: str
     message: str
-    can_sync: bool = False
-    deletion_action: str = ""
+    can_sync_local: bool = False
+    can_sync_remote: bool = False
+    local_changes: Tuple[RefDifference, ...] = ()
+    remote_changes: Tuple[RefDifference, ...] = ()
     remote_refs: Tuple[Tuple[str, str], ...] = ()
+    local_message: str = ""
+    remote_message: str = ""
 
 
 def settings_file_path() -> Path:
@@ -367,6 +379,7 @@ class GitRepository:
         if not git_directory:
             raise GitError("无法确定 Git 元数据目录。")
         self.metadata_path = Path(git_directory).resolve() / METADATA_DIRECTORY
+        self.last_local_sync_stash_ref: Optional[str] = None
 
     def run(self, args: Sequence[str], check: bool = True) -> str:
         result = subprocess.run(
@@ -437,7 +450,8 @@ class GitRepository:
         remote_url = validate_remote_url(remote_url)
         checking_push = bool(args and args[0] == "push" and "--dry-run" in args)
         pushing = bool(args and args[0] == "push" and not checking_push)
-        timeout = self.push_timeout_seconds() if pushing else REMOTE_TIMEOUT
+        fetching = bool(args and args[0] == "fetch")
+        timeout = self.push_timeout_seconds() if pushing or fetching else REMOTE_TIMEOUT
         environment = os.environ.copy()
         environment.update({
             "GIT_TERMINAL_PROMPT": "0",
@@ -462,13 +476,13 @@ class GitRepository:
                 output = output.decode("utf-8", errors="replace")
             output = redact_git_output(output)
             last_output = "\n".join(output.replace("\r", "\n").splitlines()[-8:])[-2000:]
-            phase = "推送分支与版本标签" if pushing else "连接或读取远程仓库"
+            phase = "推送分支与版本标签" if pushing else "获取远程分支和版本标签" if fetching else "连接或读取远程仓库"
             if checking_push:
                 phase = "预检查推送权限（不上传版本）"
             message = (
                 f"远程操作超时：{phase}超过 {timeout} 秒。\n"
                 "本地提交和版本标签均已保留，不要重新发布同一版本。\n"
-                "超时不能确认远程是否已经接收更新；网络恢复后点击“同步远程”可安全补齐。\n"
+                "超时不能确认远程是否已经接收更新；恢复网络后点击“刷新”重新比较两端，再选择同步方向。\n"
                 "请检查网络、代理或 VPN；读取成功不代表上传链路正常。"
             )
             if pushing:
@@ -507,17 +521,23 @@ class GitRepository:
         return result.stdout
 
     def check_remote_connection(self) -> str:
-        remote_url = self._sync_target()
-        self._run_remote(["ls-remote", "--", remote_url], remote_url)
-        branch = self.current_branch()
-        if not branch:
+        if not self.current_branch():
+            remote_url = self._sync_target()
+            self._run_remote(["ls-remote", "--", remote_url], remote_url)
             return "远程仓库可读取；当前正在查看历史版本，未检查推送权限。请返回工作分支再验证。"
-        branch_ref = f"refs/heads/{branch}"
-        if not self.run(["rev-parse", "--verify", branch_ref], check=False).strip():
-            return "远程仓库可读取；尚无本地提交，未检查推送权限。首次同步时仍需验证登录与写入权限。"
-        snapshot = self.sync_snapshot(require_versions=False)
-        self._run_remote(self._push_arguments(snapshot, dry_run=True), remote_url)
-        return "连接及推送预检查通过，未上传版本；正式同步仍需满足分支规则和服务器检查。"
+        snapshot = self.sync_snapshot()
+        status = self.remote_sync_status(snapshot)
+        if status.state == "unavailable":
+            raise GitError(status.message)
+        if status.can_sync_remote:
+            return "远程可读取，推送预检查通过，当前分支和版本标签覆盖预检查通过，未上传版本。"
+        if snapshot.branch_ref not in dict(snapshot.refs):
+            return "远程可读取；尚无本地提交，未检查推送权限。"
+        if not status.remote_changes:
+            return "远程可读取；本地分支和版本标签已一致，当前无需上传。"
+        if status.remote_changes:
+            raise GitError(status.remote_message)
+        return "远程可读取。"
 
     def _sync_target(self) -> str:
         urls = self.run(
@@ -527,25 +547,23 @@ class GitRepository:
             raise GitError("请先通过“Git 账号”配置唯一的 origin 远程仓库地址。")
         return validate_remote_url(urls[0])
 
-    def sync_snapshot(self, require_versions: bool = True) -> RemoteSyncSnapshot:
+    def sync_snapshot(self, require_versions: bool = False) -> RemoteSyncSnapshot:
         branch = self.current_branch()
         if not branch:
             raise GitError("查看历史版本时不能同步远程，请先返回工作分支。")
         remote_url = self._sync_target()
         branch_ref = f"refs/heads/{branch}"
         commit = self.run(["rev-parse", "--verify", branch_ref], check=False).strip()
-        if not commit:
-            raise GitError("当前分支尚无可同步的版本，请先发布版本。")
-        tag_refs = []
+        refs = [(branch_ref, commit)] if commit else []
         for line in self.run([
-            "for-each-ref", f"--merged={branch_ref}", "--format=%(refname) %(objectname)", "refs/tags/",
+            "for-each-ref", "--format=%(refname) %(objectname)", "refs/tags/",
         ]).splitlines():
             ref, object_id = line.split()
             if VERSION_PATTERN.fullmatch(ref[len("refs/tags/"):]):
-                tag_refs.append((ref, object_id))
-        if require_versions and not tag_refs:
+                refs.append((ref, object_id))
+        if require_versions and (not commit or not any(ref.startswith("refs/tags/") for ref, _oid in refs)):
             raise GitError("当前分支尚无可同步的版本，请先发布版本。")
-        return RemoteSyncSnapshot(remote_url, branch_ref, ((branch_ref, commit), *tag_refs))
+        return RemoteSyncSnapshot(remote_url, branch_ref, tuple(refs))
 
     @staticmethod
     def _push_arguments(snapshot: RemoteSyncSnapshot, dry_run: bool = False) -> List[str]:
@@ -557,138 +575,317 @@ class GitRepository:
 
     def remote_sync_status(self, snapshot: RemoteSyncSnapshot) -> RemoteSyncStatus:
         try:
-            output = self._run_remote(["ls-remote", "--", snapshot.remote_url], snapshot.remote_url)
+            output = self._run_remote(
+                ["ls-remote", "--refs", "--", snapshot.remote_url], snapshot.remote_url
+            )
         except GitError as error:
-            return RemoteSyncStatus("unavailable", f"无法检查远程状态：{error}\n修复后点击“刷新”重新检查。")
+            return RemoteSyncStatus(
+                "unavailable", f"无法检查远程状态：{error}\n修复后点击“刷新”重新检查。"
+            )
         remote_refs = {}
         for line in output.splitlines():
             fields = line.split()
             if len(fields) == 2:
                 object_id, ref = fields
-                remote_refs[ref] = object_id
+                if ref == snapshot.branch_ref or (
+                    ref.startswith("refs/tags/")
+                    and VERSION_PATTERN.fullmatch(ref[len("refs/tags/"):])
+                ):
+                    remote_refs[ref] = object_id
         local_refs = dict(snapshot.refs)
-        changed = [ref for ref, object_id in snapshot.refs if remote_refs.get(ref) != object_id]
-        remote_version_tags = []
-        # Detect removed local tags retained on the remote, including a latest tag whose commit was rewound locally.
-        extra = []
-        for ref, object_id in remote_refs.items():
-            if not ref.startswith("refs/tags/") or ref in local_refs:
-                continue
-            if not VERSION_PATTERN.fullmatch(ref[len("refs/tags/"):]):
-                continue
-            target = remote_refs.get(ref + "^{}", object_id)
-            remote_version_tags.append((ref, object_id, target))
-            ancestor = self.run(
-                ["merge-base", target, local_refs[snapshot.branch_ref]], check=False
-            ).strip()
-            if ancestor == target:
-                extra.append(ref[len("refs/tags/"):])
-        remote_branch = remote_refs.get(snapshot.branch_ref)
-        local_branch = local_refs[snapshot.branch_ref]
-        branch_is_one_commit_ahead = False
-        if remote_branch and remote_branch != local_branch:
-            base = self.run(["merge-base", local_branch, remote_branch], check=False).strip()
-            count = self.run(
-                ["rev-list", "--count", f"{local_branch}..{remote_branch}"], check=False
-            ).strip()
-            branch_is_one_commit_ahead = base == local_branch and count == "1"
-        latest_tag_refs = []
-        if branch_is_one_commit_ahead:
-            latest_tag_refs = [
-                (ref, object_id) for ref, object_id, target in remote_version_tags
-                if target == remote_branch
-            ]
-        if branch_is_one_commit_ahead and latest_tag_refs:
-            versions = "、".join(ref[len("refs/tags/"):] for ref, _oid in latest_tag_refs)
-            return self._preflight_remote_deletion(
-                snapshot,
-                RemoteSyncStatus(
-                    "pending",
-                    f"本地已删除最新版本 {versions} 及其提交；远程仍指向该版本。"
-                    "确认后可删除远程版本标签并将远程分支回退一个提交。",
-                    True,
-                    "rewind_latest",
-                    ((snapshot.branch_ref, remote_branch), *latest_tag_refs),
-                ),
-            )
-        if extra:
-            extra_refs = tuple(("refs/tags/" + tag, remote_refs["refs/tags/" + tag]) for tag in extra)
-            return self._preflight_remote_deletion(
-                snapshot,
-                RemoteSyncStatus(
-                    "pending", "本地与远程不一致，本地已删除的当前分支版本标签仍保留在远程："
-                    + "、".join(extra) + "。确认后可只删除远程版本标签，保留提交历史。",
-                    True,
-                    "delete_tags",
-                    extra_refs,
-                ),
-            )
-        if not changed:
-            return RemoteSyncStatus("synced", "当前分支和版本标签与远程一致，无需同步。")
-        try:
-            self.push_timeout_seconds()
-            self._run_remote(self._push_arguments(snapshot, dry_run=True), snapshot.remote_url)
-        except GitError as error:
-            return RemoteSyncStatus(
-                "pending", f"本地与远程存在差异，当前无法同步：{error}\n修复后点击“刷新”重新检查。",
-            )
+        remote_changes = self._ref_differences(local_refs, remote_refs)
+        local_changes = self._ref_differences(local_refs, remote_refs)
+        if snapshot.branch_ref not in remote_refs:
+            local_available = False
+            local_message = "远程不存在当前分支；为保护本地工作分支，不能从远程同步本地。"
+        else:
+            local_available = bool(local_changes)
+            local_message = "远程分支和版本标签可用于同步本地。"
+        if not local_changes:
+            local_message = "当前分支和版本标签已与远程一致。"
+        remote_available = bool(remote_changes) and any(
+            ref == snapshot.branch_ref for ref, _oid in snapshot.refs
+        )
+        remote_message = "尚无本地提交，未检查推送权限。"
+        if remote_available:
+            try:
+                self.push_timeout_seconds()
+                self._run_remote(
+                    self._push_ref_differences(snapshot, remote_refs, dry_run=True),
+                    snapshot.remote_url,
+                )
+                remote_message = "推送预检查通过；确认后将以本地分支和版本标签覆盖远程差异。"
+            except GitError as error:
+                remote_available = False
+                remote_message = f"远程覆盖预检查失败：{error}"
+        elif not remote_changes:
+            remote_message = "当前分支和版本标签已与远程一致。"
+        differences = tuple(sorted(set(local_changes + remote_changes), key=lambda item: item.ref))
+        message = "当前分支和版本标签已与远程一致。" if not differences else (
+            f"检测到 {len(differences)} 项差异；请分别选择以远程覆盖本地，或以本地覆盖远程。"
+        )
         return RemoteSyncStatus(
-            "pending", f"当前分支或版本标签有 {len(changed)} 项待同步，推送预检查已通过。点击上传本地版本。", True,
+            "synced" if not differences else "pending",
+            message,
+            local_available,
+            remote_available,
+            local_changes,
+            remote_changes,
+            tuple(sorted(remote_refs.items())),
+            local_message,
+            remote_message,
         )
 
-    def _deletion_push_arguments(
-        self, snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus, dry_run: bool = False,
-    ) -> List[str]:
-        arguments = ["push", "--atomic", "--porcelain"]
-        arguments.extend(["--dry-run", "--no-verify"] if dry_run else ["--progress"])
-        refspecs = []
-        if status.deletion_action == "rewind_latest":
-            branch_ref, expected_branch = status.remote_refs[0]
-            arguments.append(f"--force-with-lease={branch_ref}:{expected_branch}")
-            refspecs.append(f"{snapshot.branch_ref}:{branch_ref}")
-            tag_refs = status.remote_refs[1:]
-        elif status.deletion_action == "delete_tags":
-            tag_refs = status.remote_refs
-        else:
-            raise GitError("没有可同步的版本删除，请点击“刷新”重新检查远程状态。")
-        for tag_ref, expected_tag in tag_refs:
-            arguments.append(f"--force-with-lease={tag_ref}:{expected_tag}")
-            refspecs.append(f":{tag_ref}")
-        if not refspecs:
-            raise GitError("远程删除内容为空，请点击“刷新”重新检查远程状态。")
-        return [*arguments, "origin", *refspecs]
+    @staticmethod
+    def _ref_differences(
+        source: Dict[str, str], target: Dict[str, str],
+    ) -> Tuple[RefDifference, ...]:
+        return tuple(
+            RefDifference(ref, source.get(ref), target.get(ref))
+            for ref in sorted(set(source) | set(target))
+            if source.get(ref) != target.get(ref)
+        )
 
-    def _preflight_remote_deletion(
-        self, snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus,
-    ) -> RemoteSyncStatus:
-        try:
-            self.push_timeout_seconds()
-            self._run_remote(
-                self._deletion_push_arguments(snapshot, status, dry_run=True), snapshot.remote_url
-            )
-        except GitError as error:
-            return RemoteSyncStatus(
-                "pending", f"本地与远程存在已删除版本差异，但远程删除预检查失败：{error}",
-                False, status.deletion_action, status.remote_refs,
-            )
-        return status
+    @staticmethod
+    def _push_ref_differences(
+        snapshot: RemoteSyncSnapshot, remote_refs: Dict[str, str], dry_run: bool = False,
+    ) -> List[str]:
+        local_refs = dict(snapshot.refs)
+        args = ["push", "--atomic", "--porcelain"]
+        args.extend(["--dry-run", "--no-verify"] if dry_run else ["--progress"])
+        refspecs = []
+        for ref in sorted(set(local_refs) | set(remote_refs)):
+            local_oid, remote_oid = local_refs.get(ref), remote_refs.get(ref)
+            if local_oid == remote_oid:
+                continue
+            args.append(f"--force-with-lease={ref}:{remote_oid or ''}")
+            if local_oid is None:
+                refspecs.append(f":{ref}")
+            else:
+                prefix = "+" if remote_oid else ""
+                refspecs.append(f"{prefix}{ref}:{ref}")
+        if not refspecs:
+            raise GitError("本地和远程没有待同步的引用差异。")
+        return [*args, "origin", *refspecs]
 
     def sync_remote(self) -> None:
         snapshot = self.sync_snapshot()
+        if not snapshot.refs:
+            raise GitError("当前分支尚无可同步的版本，请先发布版本。")
         self.push_timeout_seconds()
         self._run_remote(self._push_arguments(snapshot), snapshot.remote_url)
 
-    def sync_remote_deletions(
-        self, snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus,
+    def _recovery_namespace(self, direction: str) -> str:
+        return f"refs/code-version-manager/recovery/{int(time.time())}-{uuid.uuid4().hex[:8]}/{direction}"
+
+    def _save_recovery_refs(
+        self, namespace: str, refs: Dict[str, str], prefix: str,
+    ) -> List[str]:
+        saved = []
+        for ref, object_id in sorted(refs.items()):
+            if ref.startswith("refs/heads/"):
+                suffix = "heads/" + ref[len("refs/heads/"):]
+            elif ref.startswith("refs/tags/"):
+                suffix = "tags/" + ref[len("refs/tags/"):]
+            else:
+                continue
+            recovery_ref = f"{namespace}/{prefix}/{suffix}"
+            self.run(["update-ref", recovery_ref, object_id])
+            saved.append(recovery_ref)
+        return saved
+
+    def _save_metadata_recovery(self, namespace: str) -> Path:
+        recovery_name = namespace.split("/")[-2]
+        recovery_path = self.metadata_path / "recovery" / recovery_name
+        recovery_path.mkdir(parents=True, exist_ok=True)
+        manifests = self.metadata_path / MANIFEST_DIRECTORY
+        if manifests.is_dir():
+            shutil.copytree(manifests, recovery_path / MANIFEST_DIRECTORY, dirs_exist_ok=True)
+        changelog = self.metadata_path / MANAGER_CHANGELOG
+        if changelog.is_file():
+            shutil.copy2(changelog, recovery_path / MANAGER_CHANGELOG)
+        return recovery_path
+
+    def _ignored_path_conflicts(self, target_ref: str) -> List[str]:
+        ignored_paths = self.run([
+            "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+        ]).split("\0")
+        target_paths = self.run([
+            "ls-tree", "-r", "--name-only", "-z", target_ref,
+        ]).split("\0")
+        conflicts = set()
+        for ignored_path in filter(None, ignored_paths):
+            ignored_path = ignored_path.rstrip("/")
+            for target_path in filter(None, target_paths):
+                if (
+                    target_path == ignored_path
+                    or target_path.startswith(ignored_path + "/")
+                    or ignored_path.startswith(target_path + "/")
+                ):
+                    conflicts.add(ignored_path)
+        return sorted(conflicts)
+
+    def _move_ignored_conflicts(self, paths: Sequence[str], recovery_path: Path) -> List[str]:
+        moved = []
+        destination_root = recovery_path / "ignored-worktree"
+        for relative in paths:
+            source = self.path / relative
+            if not source.exists() and not source.is_symlink():
+                continue
+            destination = destination_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            moved.append(str(destination))
+        return moved
+
+    def _fetch_remote_refs(
+        self, snapshot: RemoteSyncSnapshot, remote_refs: Dict[str, str], namespace: str,
+    ) -> Dict[str, str]:
+        refspecs = []
+        destinations = {}
+        if snapshot.branch_ref in remote_refs:
+            branch_name = snapshot.branch_ref[len("refs/heads/"):]
+            destination = f"{namespace}/heads/{branch_name}"
+            destinations[snapshot.branch_ref] = destination
+            refspecs.append(f"+{snapshot.branch_ref}:{destination}")
+        for ref in sorted(remote_refs):
+            if not ref.startswith("refs/tags/"):
+                continue
+            tag_name = ref[len("refs/tags/"):]
+            destination = f"{namespace}/tags/{tag_name}"
+            destinations[ref] = destination
+            refspecs.append(f"+{ref}:{destination}")
+        if refspecs:
+            self._run_remote(["fetch", "--no-tags", snapshot.remote_url, *refspecs], snapshot.remote_url)
+        fetched = {}
+        for source, destination in destinations.items():
+            object_id = self.run(["rev-parse", "--verify", destination], check=False).strip()
+            if object_id:
+                fetched[source] = object_id
+        if fetched != remote_refs:
+            raise GitError("远程引用在检查期间发生变化，操作已取消；请刷新后重试。")
+        return fetched
+
+    def _delete_fetched_refs(
+        self, snapshot: RemoteSyncSnapshot, remote_refs: Dict[str, str], namespace: str,
     ) -> None:
-        if status.deletion_action not in ("delete_tags", "rewind_latest") or not status.remote_refs:
-            raise GitError("没有可同步的版本删除，请点击“刷新”重新检查远程状态。")
+        refs = []
+        if snapshot.branch_ref in remote_refs:
+            branch_name = snapshot.branch_ref[len("refs/heads/"):]
+            refs.append(f"{namespace}/heads/{branch_name}")
+        refs.extend(
+            f"{namespace}/tags/{ref[len('refs/tags/'):]}"
+            for ref in remote_refs if ref.startswith("refs/tags/")
+        )
+        for ref in refs:
+            self.run(["update-ref", "-d", ref], check=False)
+
+    def sync_local_from_remote(
+        self, snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus,
+    ) -> str:
+        if not status.can_sync_local or not status.remote_refs:
+            raise GitError("远程没有可用的当前分支，请刷新远程状态后重试。")
         if self.sync_snapshot() != snapshot:
-            raise GitError("本地版本状态已变化，请点击“刷新”重新检查后再处理远程差异。")
-        if status.deletion_action == "rewind_latest" and len(status.remote_refs) < 2:
-            raise GitError("无法确认远程最新版本引用，请点击“刷新”重新检查。")
-        self.push_timeout_seconds()
-        self._run_remote(self._deletion_push_arguments(snapshot, status), snapshot.remote_url)
+            raise GitError("本地分支或版本标签已变化，请刷新后重新确认。")
+        remote_refs = dict(status.remote_refs)
+        if snapshot.branch_ref not in remote_refs:
+            raise GitError("远程不存在当前分支，不能同步本地。")
+        namespace = self._recovery_namespace("pull")
+        fetched = self._fetch_remote_refs(snapshot, remote_refs, namespace + "/incoming")
+        if self.sync_snapshot() != snapshot:
+            raise GitError("本地分支或版本标签在同步前发生变化，操作已取消；请刷新后重试。")
+        local_refs = dict(snapshot.refs)
+        metadata_backup = self._save_metadata_recovery(namespace)
+        backup_refs = self._save_recovery_refs(namespace, local_refs, "before")
+        branch_name = snapshot.branch_ref[len("refs/heads/"):]
+        target_branch = f"{namespace}/incoming/heads/{branch_name}"
+        ignored_conflicts = self._ignored_path_conflicts(target_branch)
+        ignored_backup = []
+        if ignored_conflicts:
+            ignored_backup = self._move_ignored_conflicts(ignored_conflicts, metadata_backup)
+        dirty = self.run([
+            "status", "--porcelain=v1", "-z", "--untracked-files=all",
+        ])
+        stash_ref = None
+        if dirty:
+            recovery_name = namespace.split("/")[-2]
+            self.run([
+                "stash", "push", "--include-untracked", "--message",
+                f"Code Version Manager recovery {recovery_name}",
+            ])
+            stash_commit = self.run(
+                ["rev-parse", "--verify", "refs/stash"], check=False
+            ).strip()
+            if stash_commit:
+                stash_ref = f"{namespace}/before/worktree"
+                self.run(["update-ref", stash_ref, stash_commit])
+        self.last_local_sync_stash_ref = stash_ref
+        try:
+            self.run(["reset", "--hard", target_branch])
+        except GitError as error:
+            backup = backup_refs[0] if backup_refs else namespace
+            stash_notice = f"\n工作区修改恢复点：{stash_ref}" if stash_ref else ""
+            raise GitError(
+                "同步本地未完成：Git 无法将当前分支更新到远程状态。\n"
+                f"本地引用恢复点：{backup}\n版本元数据备份：{metadata_backup}"
+                f"{stash_notice}\n\n{error}"
+            ) from error
+        incoming_tags = {
+            ref: fetched[ref] for ref in fetched if ref.startswith("refs/tags/")
+        }
+        for ref in sorted(set(local_refs) | set(incoming_tags)):
+            if not ref.startswith("refs/tags/"):
+                continue
+            desired = incoming_tags.get(ref)
+            previous = local_refs.get(ref)
+            if desired and previous != desired:
+                self.run(["update-ref", ref, desired])
+                manifest = self.metadata_path / MANIFEST_DIRECTORY / (
+                    ref[len("refs/tags/"):] + MANIFEST_SUFFIX
+                )
+                manifest.unlink(missing_ok=True)
+            elif desired is None and previous:
+                self.run(["update-ref", "-d", ref, previous])
+                manifest = self.metadata_path / MANIFEST_DIRECTORY / (
+                    ref[len("refs/tags/"):] + MANIFEST_SUFFIX
+                )
+                manifest.unlink(missing_ok=True)
+        self._write_changelog(None)
+        self._delete_fetched_refs(snapshot, remote_refs, namespace + "/incoming")
+        backup = backup_refs[0] if backup_refs else namespace
+        recovery = f"操作前的本地引用保存在 {backup}；版本清单和 CHANGELOG 备份保存在 {metadata_backup}。"
+        if stash_ref:
+            recovery += f"\n未提交修改和未跟踪文件保存在 {stash_ref}。"
+        if ignored_backup:
+            recovery += "\n被忽略文件已移到 " + str(metadata_backup / "ignored-worktree") + "。"
+        return f"本地分支和版本标签已与远程一致。{recovery}"
+
+    def restore_local_sync_changes(self) -> str:
+        stash_ref = self.last_local_sync_stash_ref
+        if not stash_ref or not self.run(["rev-parse", "--verify", stash_ref], check=False).strip():
+            raise GitError("没有可恢复的同步前工作区修改。")
+        self.run(["stash", "apply", stash_ref])
+        self.last_local_sync_stash_ref = None
+        return "同步前的未提交修改和未跟踪文件已恢复到当前工作区；恢复点仍保留。"
+
+    def sync_remote_from_local(
+        self, snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus,
+    ) -> str:
+        if not status.can_sync_remote:
+            raise GitError("远程覆盖预检查未通过，请刷新状态并检查权限或仓库规则。")
+        if self.sync_snapshot() != snapshot:
+            raise GitError("本地分支或版本标签已变化，请刷新后重新确认。")
+        remote_refs = dict(status.remote_refs)
+        local_refs = dict(snapshot.refs)
+        namespace = self._recovery_namespace("push")
+        fetched = self._fetch_remote_refs(snapshot, remote_refs, namespace + "/incoming")
+        backup_refs = self._save_recovery_refs(namespace, fetched, "before")
+        self._run_remote(
+            self._push_ref_differences(snapshot, remote_refs), snapshot.remote_url
+        )
+        self._delete_fetched_refs(snapshot, remote_refs, namespace + "/incoming")
+        backup = backup_refs[0] if backup_refs else namespace
+        return f"远程分支和版本标签已与本地一致。同步前远程引用已保存在本地恢复点 {backup}。"
 
     def current_branch(self) -> Optional[str]:
         branch = self.run(["symbolic-ref", "--quiet", "--short", "HEAD"], check=False).strip()
@@ -1451,11 +1648,18 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             "Git 账号", "avatar-default-symbolic", self.on_git_account
         )
         header.pack_end(self.git_account_button)
-        self.sync_button = self._command_button(
-            "同步远程", "emblem-synchronizing-symbolic", self.on_sync_remote
+        sync_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.sync_local_button = self._command_button(
+            "同步本地", "go-down-symbolic", self.on_sync_local
         )
-        self.sync_button.set_sensitive(False)
-        header.pack_end(self.sync_button)
+        self.sync_remote_button = self._command_button(
+            "同步远程", "go-up-symbolic", self.on_sync_remote
+        )
+        self.sync_local_button.set_sensitive(False)
+        self.sync_remote_button.set_sensitive(False)
+        sync_actions.pack_start(self.sync_local_button, False, False, 0)
+        sync_actions.pack_start(self.sync_remote_button, False, False, 0)
+        header.pack_end(sync_actions)
 
         refresh_button = self._icon_button("view-refresh-symbolic", "刷新", self.on_refresh)
         header.pack_end(refresh_button)
@@ -1621,15 +1825,15 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         .command-bar button { min-height: 30px; padding: 2px 10px; }
         .footer { padding: 7px 12px; border-top: 1px solid alpha(@borders, 0.8); }
         treeview { padding: 2px; }
-        button.remote-synced, button.remote-synced:disabled {
+        button.sync-synced, button.sync-synced:disabled {
             background-image: none; background-color: #278044; color: white;
             border-color: #206b39; text-shadow: none; box-shadow: none; opacity: 1;
         }
-        button.remote-pending, button.remote-pending:disabled {
+        button.sync-pending, button.sync-pending:disabled {
             background-image: none; background-color: #bb3030; color: white;
             border-color: #982727; text-shadow: none; box-shadow: none; opacity: 1;
         }
-        button.remote-pending:hover { background-color: #a32929; }
+        button.sync-pending:hover { background-color: #a32929; }
         """
         provider = Gtk.CssProvider()
         provider.load_from_data(css)
@@ -1739,29 +1943,41 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def _set_remote_status(self, status: RemoteSyncStatus) -> None:
         self.remote_status = status
-        context = self.sync_button.get_style_context()
-        context.remove_class("remote-synced")
-        context.remove_class("remote-pending")
-        if status.state == "synced":
-            label, icon = "远程已同步", "emblem-ok-symbolic"
-            context.add_class("remote-synced")
-        elif status.state == "pending":
-            if status.can_sync and status.deletion_action == "delete_tags":
-                label = "同步删除到远程"
-            elif status.can_sync and status.deletion_action == "rewind_latest":
-                label = "同步删除并回退远程"
-            else:
-                label = "同步远程（待同步）" if status.can_sync else "远程有差异（不可同步）"
-            icon = "document-send-symbolic" if status.can_sync else "dialog-warning-symbolic"
-            context.add_class("remote-pending")
-        elif status.state == "checking":
-            label, icon = "正在检查远程…", "emblem-synchronizing-symbolic"
+        pending = bool(status.local_changes or status.remote_changes)
+        self._set_sync_button(
+            self.sync_local_button,
+            status.can_sync_local,
+            pending,
+            status.local_message or "以远程分支和版本标签更新本地。",
+            status.local_message or status.message,
+        )
+        self._set_sync_button(
+            self.sync_remote_button,
+            status.can_sync_remote,
+            pending,
+            status.remote_message or "以本地分支和版本标签覆盖远程差异。",
+            status.remote_message or status.message,
+        )
+
+    def _set_sync_button(
+        self, button: Gtk.Button, can_sync: bool, pending: bool,
+        active_message: str, inactive_message: str,
+    ) -> None:
+        context = button.get_style_context()
+        context.remove_class("sync-synced")
+        context.remove_class("sync-pending")
+        if self.remote_status.state == "checking":
+            message = "正在检查远程分支和版本标签。"
+        elif pending:
+            context.add_class("sync-pending")
+            message = active_message if can_sync else (inactive_message or active_message)
+        elif self.remote_status.state == "synced":
+            context.add_class("sync-synced")
+            message = "本地分支和版本标签已与远程一致。"
         else:
-            label, icon = "同步远程（不可用）", "network-offline-symbolic"
-        self.sync_button.set_label(label)
-        self.sync_button.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
-        self.sync_button.set_tooltip_text(status.message)
-        self.sync_button.set_sensitive(status.can_sync and not self.busy)
+            message = inactive_message
+        button.set_tooltip_text(message)
+        button.set_sensitive(can_sync and not self.busy)
 
     def _refresh_remote_status(self) -> None:
         if self.busy:
@@ -1807,12 +2023,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self._invalidate_remote_status()
             self._refresh_remote_status()
             return False
-        if status.can_sync and self.remote_sync_error:
-            status = RemoteSyncStatus(
-                "pending", "上次上传失败，当前仍有待同步版本：\n" + self.remote_sync_error
-                + "\n修复后点击“刷新”重新检查，再尝试同步。",
-                True, status.deletion_action, status.remote_refs,
-            )
         self._set_remote_status(status)
         return False
 
@@ -2006,8 +2216,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             "创建后确认上方 SSH 地址。\n"
             "“保存配置”：仅保存到当前工作空间，不连接远程。\n"
             "“保存并验证连接”：保存后检查连接和推送权限，弹窗显示结果，不上传版本。\n"
-            "发布版本只保存到本地。实际上传请单独点击主窗口的红色“同步远程”按钮；"
-            "绿色表示已一致，禁用表示当前无需同步或无法同步。",
+            "发布版本只保存到本地。主窗口“同步本地”以远程为准；"
+            "“同步远程”以本地为准，执行前会显示差异并要求确认。",
             xalign=0,
         )
         notice.set_line_wrap(True)
@@ -2224,61 +2434,93 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.destroy()
 
 
-    def on_sync_remote(self, _button) -> None:
-        repository = self.repository
-        if repository and not self.busy and self.remote_status.can_sync:
-            try:
-                snapshot = repository.sync_snapshot()
-            except GitError as error:
-                self._invalidate_remote_status()
-                self._set_remote_status(RemoteSyncStatus("unavailable", str(error)))
-                return
-            if snapshot != self.remote_status_snapshot:
-                self._refresh_remote_status()
-                return
-            status = self.remote_status
-            if status.deletion_action:
-                if status.deletion_action == "rewind_latest":
-                    title = "确认同步删除并回退远程分支？"
-                    action = "远程分支将回退一个已同步提交，并删除对应的远程版本标签。"
-                    button_label = "删除远程版本并回退分支"
-                else:
-                    versions = "、".join(
-                        ref[len("refs/tags/"):] for ref, _oid in status.remote_refs
-                    )
-                    title = "确认删除远程版本标签？"
-                    action = f"将删除远程标签 {versions}，保留对应提交历史和分支。"
-                    button_label = "删除远程标签"
-                confirmation = Gtk.MessageDialog(
-                    transient_for=self, modal=True,
-                    message_type=Gtk.MessageType.WARNING,
-                    buttons=Gtk.ButtonsType.NONE, text=title,
-                )
-                confirmation.format_secondary_text(
-                    action + "\n\n此操作会影响所有使用该远程仓库的协作者。"
-                    "只有远程引用仍与本次检查结果一致时才会执行。"
-                )
-                confirmation.add_button("取消", Gtk.ResponseType.CANCEL)
-                destructive = confirmation.add_button(button_label, Gtk.ResponseType.OK)
-                destructive.get_style_context().add_class("destructive-action")
-                confirmation.set_default_response(Gtk.ResponseType.CANCEL)
-                response = confirmation.run()
-                confirmation.destroy()
-                if response != Gtk.ResponseType.OK:
-                    return
-                self.remote_sync_error = None
-                self.run_background(
-                    "正在同步版本删除到远程...",
-                    lambda: repository.sync_remote_deletions(snapshot, status),
-                    "远程版本删除已同步。",
-                    remote_sync=True,
-                )
-                return
-            self.remote_sync_error = None
-            self.run_background(
-                "正在同步远程仓库...", repository.sync_remote,
-                "当前分支和版本标签已同步到远程仓库。", remote_sync=True,
+    @staticmethod
+    def _format_ref_oid(object_id: Optional[str]) -> str:
+        return object_id[:12] if object_id else "（不存在）"
+
+    def _confirm_sync_direction(self, direction: str, status: RemoteSyncStatus) -> bool:
+        if direction == "local":
+            title = "确认以远程覆盖本地分支和版本标签？"
+            description = (
+                "当前分支和软件管理的版本标签将变为远程状态。"
+                "本地独有提交和标签会保存在恢复点；未提交修改和未跟踪文件会先保存，"
+                "完成后可恢复。会把可能被远程目标覆盖的被忽略文件移到恢复点。其他分支及非版本标签不变。"
             )
+            action = "同步本地"
+            differences = status.local_changes
+        else:
+            title = "确认以本地覆盖远程分支和版本标签？"
+            description = (
+                "远程当前分支及软件管理的版本标签将变为本地状态。"
+                "远程旧引用会先下载并保存在本机恢复点；远程协作者可能需要重新同步。"
+                "其他分支及非版本标签不变。"
+            )
+            action = "同步远程（覆盖远程）"
+            differences = status.remote_changes
+        dialog = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        dialog.add_button("取消", Gtk.ResponseType.CANCEL)
+        confirm = dialog.add_button(action, Gtk.ResponseType.OK)
+        confirm.get_style_context().add_class("destructive-action")
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        dialog.set_default_size(760, 500)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=16)
+        notice = Gtk.Label(label=description, xalign=0)
+        notice.set_line_wrap(True)
+        content.pack_start(notice, False, False, 0)
+        rows = []
+        for difference in differences:
+            local_oid = self._format_ref_oid(difference.local_oid)
+            remote_oid = self._format_ref_oid(difference.remote_oid)
+            if direction == "local":
+                rows.append(f"{difference.ref}\n  本地：{local_oid}  →  远程：{remote_oid}")
+            else:
+                rows.append(f"{difference.ref}\n  远程：{remote_oid}  →  本地：{local_oid}")
+        details = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
+        details.get_buffer().set_text("\n\n".join(rows))
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(230)
+        scroll.add(details)
+        content.pack_start(scroll, True, True, 0)
+        dialog.get_content_area().pack_start(content, True, True, 0)
+        dialog.show_all()
+        response = dialog.run()
+        dialog.destroy()
+        return response == Gtk.ResponseType.OK
+
+    def _sync_direction(self, direction: str) -> None:
+        repository = self.repository
+        status = self.remote_status
+        if not repository or self.busy:
+            return
+        can_sync = status.can_sync_local if direction == "local" else status.can_sync_remote
+        if not can_sync:
+            return
+        try:
+            snapshot = repository.sync_snapshot()
+        except GitError as error:
+            self._invalidate_remote_status()
+            self._set_remote_status(RemoteSyncStatus("unavailable", str(error)))
+            return
+        if snapshot != self.remote_status_snapshot:
+            self._refresh_remote_status()
+            return
+        if not self._confirm_sync_direction(direction, status):
+            return
+        if direction == "local":
+            operation = lambda: repository.sync_local_from_remote(snapshot, status)
+            busy = "正在以远程状态更新本地..."
+        else:
+            operation = lambda: repository.sync_remote_from_local(snapshot, status)
+            busy = "正在以本地状态覆盖远程..."
+        self.remote_sync_error = None
+        self.run_background(busy, operation, "分支和版本标签已同步。", remote_sync=True)
+
+    def on_sync_local(self, _button) -> None:
+        self._sync_direction("local")
+
+    def on_sync_remote(self, _button) -> None:
+        self._sync_direction("remote")
 
     def on_return_main(self, _bar, response) -> None:
         if response != Gtk.ResponseType.OK:
@@ -2696,6 +2938,29 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         else:
             self.refresh()
         self.status_label.set_text(message)
+        if "未提交修改和未跟踪文件保存在" in message and self.repository:
+            dialog = Gtk.MessageDialog(
+                transient_for=self, modal=True,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.NONE,
+                text="本地已按远程状态同步",
+            )
+            dialog.format_secondary_text(
+                message + "\n\n可以现在恢复同步前的未提交修改和未跟踪文件；"
+                "恢复可能与当前远程文件产生冲突。"
+            )
+            dialog.add_button("稍后处理", Gtk.ResponseType.CANCEL)
+            restore = dialog.add_button("恢复同步前修改", Gtk.ResponseType.OK)
+            response = dialog.run()
+            dialog.destroy()
+            if response == Gtk.ResponseType.OK:
+                try:
+                    restored = self.repository.restore_local_sync_changes()
+                    self.refresh()
+                    self.status_label.set_text(restored)
+                except GitError as error:
+                    self.show_error(str(error))
+            return False
         if show_result:
             limited = "未检查推送权限" in message
             dialog = Gtk.MessageDialog(
