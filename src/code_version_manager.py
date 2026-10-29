@@ -85,6 +85,8 @@ class RemoteSyncStatus:
     state: str
     message: str
     can_sync: bool = False
+    deletion_action: str = ""
+    remote_refs: Tuple[Tuple[str, str], ...] = ()
 
 
 def settings_file_path() -> Path:
@@ -566,7 +568,8 @@ class GitRepository:
                 remote_refs[ref] = object_id
         local_refs = dict(snapshot.refs)
         changed = [ref for ref, object_id in snapshot.refs if remote_refs.get(ref) != object_id]
-        # Also report remotely retained version tags from this branch after local deletion.
+        remote_version_tags = []
+        # Detect removed local tags retained on the remote, including a latest tag whose commit was rewound locally.
         extra = []
         for ref, object_id in remote_refs.items():
             if not ref.startswith("refs/tags/") or ref in local_refs:
@@ -574,15 +577,51 @@ class GitRepository:
             if not VERSION_PATTERN.fullmatch(ref[len("refs/tags/"):]):
                 continue
             target = remote_refs.get(ref + "^{}", object_id)
+            remote_version_tags.append((ref, object_id, target))
             ancestor = self.run(
                 ["merge-base", target, local_refs[snapshot.branch_ref]], check=False
             ).strip()
             if ancestor == target:
                 extra.append(ref[len("refs/tags/"):])
+        remote_branch = remote_refs.get(snapshot.branch_ref)
+        local_branch = local_refs[snapshot.branch_ref]
+        branch_is_one_commit_ahead = False
+        if remote_branch and remote_branch != local_branch:
+            base = self.run(["merge-base", local_branch, remote_branch], check=False).strip()
+            count = self.run(
+                ["rev-list", "--count", f"{local_branch}..{remote_branch}"], check=False
+            ).strip()
+            branch_is_one_commit_ahead = base == local_branch and count == "1"
+        latest_tag_refs = []
+        if branch_is_one_commit_ahead:
+            latest_tag_refs = [
+                (ref, object_id) for ref, object_id, target in remote_version_tags
+                if target == remote_branch
+            ]
+        if branch_is_one_commit_ahead and latest_tag_refs:
+            versions = "、".join(ref[len("refs/tags/"):] for ref, _oid in latest_tag_refs)
+            return self._preflight_remote_deletion(
+                snapshot,
+                RemoteSyncStatus(
+                    "pending",
+                    f"本地已删除最新版本 {versions} 及其提交；远程仍指向该版本。"
+                    "确认后可删除远程版本标签并将远程分支回退一个提交。",
+                    True,
+                    "rewind_latest",
+                    ((snapshot.branch_ref, remote_branch), *latest_tag_refs),
+                ),
+            )
         if extra:
-            return RemoteSyncStatus(
-                "pending", "本地与远程不一致，远程保留了本地已删除的当前分支版本标签："
-                + "、".join(extra) + "。\n请先手动处理标签差异；软件不会删除远程标签。",
+            extra_refs = tuple(("refs/tags/" + tag, remote_refs["refs/tags/" + tag]) for tag in extra)
+            return self._preflight_remote_deletion(
+                snapshot,
+                RemoteSyncStatus(
+                    "pending", "本地与远程不一致，本地已删除的当前分支版本标签仍保留在远程："
+                    + "、".join(extra) + "。确认后可只删除远程版本标签，保留提交历史。",
+                    True,
+                    "delete_tags",
+                    extra_refs,
+                ),
             )
         if not changed:
             return RemoteSyncStatus("synced", "当前分支和版本标签与远程一致，无需同步。")
@@ -597,10 +636,59 @@ class GitRepository:
             "pending", f"当前分支或版本标签有 {len(changed)} 项待同步，推送预检查已通过。点击上传本地版本。", True,
         )
 
+    def _deletion_push_arguments(
+        self, snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus, dry_run: bool = False,
+    ) -> List[str]:
+        arguments = ["push", "--atomic", "--porcelain"]
+        arguments.extend(["--dry-run", "--no-verify"] if dry_run else ["--progress"])
+        refspecs = []
+        if status.deletion_action == "rewind_latest":
+            branch_ref, expected_branch = status.remote_refs[0]
+            arguments.append(f"--force-with-lease={branch_ref}:{expected_branch}")
+            refspecs.append(f"{snapshot.branch_ref}:{branch_ref}")
+            tag_refs = status.remote_refs[1:]
+        elif status.deletion_action == "delete_tags":
+            tag_refs = status.remote_refs
+        else:
+            raise GitError("没有可同步的版本删除，请点击“刷新”重新检查远程状态。")
+        for tag_ref, expected_tag in tag_refs:
+            arguments.append(f"--force-with-lease={tag_ref}:{expected_tag}")
+            refspecs.append(f":{tag_ref}")
+        if not refspecs:
+            raise GitError("远程删除内容为空，请点击“刷新”重新检查远程状态。")
+        return [*arguments, "origin", *refspecs]
+
+    def _preflight_remote_deletion(
+        self, snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus,
+    ) -> RemoteSyncStatus:
+        try:
+            self.push_timeout_seconds()
+            self._run_remote(
+                self._deletion_push_arguments(snapshot, status, dry_run=True), snapshot.remote_url
+            )
+        except GitError as error:
+            return RemoteSyncStatus(
+                "pending", f"本地与远程存在已删除版本差异，但远程删除预检查失败：{error}",
+                False, status.deletion_action, status.remote_refs,
+            )
+        return status
+
     def sync_remote(self) -> None:
         snapshot = self.sync_snapshot()
         self.push_timeout_seconds()
         self._run_remote(self._push_arguments(snapshot), snapshot.remote_url)
+
+    def sync_remote_deletions(
+        self, snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus,
+    ) -> None:
+        if status.deletion_action not in ("delete_tags", "rewind_latest") or not status.remote_refs:
+            raise GitError("没有可同步的版本删除，请点击“刷新”重新检查远程状态。")
+        if self.sync_snapshot() != snapshot:
+            raise GitError("本地版本状态已变化，请点击“刷新”重新检查后再处理远程差异。")
+        if status.deletion_action == "rewind_latest" and len(status.remote_refs) < 2:
+            raise GitError("无法确认远程最新版本引用，请点击“刷新”重新检查。")
+        self.push_timeout_seconds()
+        self._run_remote(self._deletion_push_arguments(snapshot, status), snapshot.remote_url)
 
     def current_branch(self) -> Optional[str]:
         branch = self.run(["symbolic-ref", "--quiet", "--short", "HEAD"], check=False).strip()
@@ -1658,7 +1746,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             label, icon = "远程已同步", "emblem-ok-symbolic"
             context.add_class("remote-synced")
         elif status.state == "pending":
-            label = "同步远程（待同步）" if status.can_sync else "远程有差异（不可同步）"
+            if status.can_sync and status.deletion_action == "delete_tags":
+                label = "同步删除到远程"
+            elif status.can_sync and status.deletion_action == "rewind_latest":
+                label = "同步删除并回退远程"
+            else:
+                label = "同步远程（待同步）" if status.can_sync else "远程有差异（不可同步）"
             icon = "document-send-symbolic" if status.can_sync else "dialog-warning-symbolic"
             context.add_class("remote-pending")
         elif status.state == "checking":
@@ -1718,6 +1811,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             status = RemoteSyncStatus(
                 "pending", "上次上传失败，当前仍有待同步版本：\n" + self.remote_sync_error
                 + "\n修复后点击“刷新”重新检查，再尝试同步。",
+                True, status.deletion_action, status.remote_refs,
             )
         self._set_remote_status(status)
         return False
@@ -2142,6 +2236,45 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             if snapshot != self.remote_status_snapshot:
                 self._refresh_remote_status()
                 return
+            status = self.remote_status
+            if status.deletion_action:
+                if status.deletion_action == "rewind_latest":
+                    title = "确认同步删除并回退远程分支？"
+                    action = "远程分支将回退一个已同步提交，并删除对应的远程版本标签。"
+                    button_label = "删除远程版本并回退分支"
+                else:
+                    versions = "、".join(
+                        ref[len("refs/tags/"):] for ref, _oid in status.remote_refs
+                    )
+                    title = "确认删除远程版本标签？"
+                    action = f"将删除远程标签 {versions}，保留对应提交历史和分支。"
+                    button_label = "删除远程标签"
+                confirmation = Gtk.MessageDialog(
+                    transient_for=self, modal=True,
+                    message_type=Gtk.MessageType.WARNING,
+                    buttons=Gtk.ButtonsType.NONE, text=title,
+                )
+                confirmation.format_secondary_text(
+                    action + "\n\n此操作会影响所有使用该远程仓库的协作者。"
+                    "只有远程引用仍与本次检查结果一致时才会执行。"
+                )
+                confirmation.add_button("取消", Gtk.ResponseType.CANCEL)
+                destructive = confirmation.add_button(button_label, Gtk.ResponseType.OK)
+                destructive.get_style_context().add_class("destructive-action")
+                confirmation.set_default_response(Gtk.ResponseType.CANCEL)
+                response = confirmation.run()
+                confirmation.destroy()
+                if response != Gtk.ResponseType.OK:
+                    return
+                self.remote_sync_error = None
+                self.run_background(
+                    "正在同步版本删除到远程...",
+                    lambda: repository.sync_remote_deletions(snapshot, status),
+                    "远程版本删除已同步。",
+                    remote_sync=True,
+                )
+                return
+            self.remote_sync_error = None
             self.run_background(
                 "正在同步远程仓库...", repository.sync_remote,
                 "当前分支和版本标签已同步到远程仓库。", remote_sync=True,
