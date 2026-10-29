@@ -8,7 +8,7 @@
 - 工作空间位于其他 Git 仓库内时，仍可创建独立版本库
 - 记录最近打开的 10 个工作空间，可从标题栏快速切换或清空记录
 - 首次启用时只显示工作空间第一层，勾选目录会递归封装其内容
-- 发布后续版本时同样只显示第一层，并记录所选目录内的删除
+- 发布后续版本时同样只显示第一层；已删除的顶层文件和整个目录继续显示并默认勾选，记录所选范围内的删除
 - 发布版本时自行勾选要封装的文件
 - 配置 Git 提交姓名、邮箱和 SSH 远程仓库，支持生成或使用已有 SSH 密钥同步
 - 发布版本只保存到本地；“同步本地”以远程分支和版本标签为准，“同步远程”以本地为准
@@ -100,18 +100,24 @@
 - 同名标签即使指向不同对象也会按所选方向更新。同步远程会使用精确引用租约保护远程并发更新；同步本地会验证取回对象与检查结果一致。
 - 远程同步上传完整 Git 提交历史，不仅是本次勾选的文件，也不只包含 ZIP 导出范围；同步前请确认历史中没有不应公开的内容。软件私有的版本清单和 CHANGELOG 仍保存在 `.git/code-version-manager/`，不会作为工作空间文件上传。
 
-## 构建 0.2.2 安装包
+## 发布时记录删除
+
+0.2.3 起，发布文件列表会保留已经删除的顶层文件和目录，并标记“已删除”、默认勾选。保留勾选后，删除操作会写入新版本的 Git 提交和标签；也可以只选择已删除项发布版本。
+
+旧版仅扫描仍存在的文件，整个顶层目录或文件被删除后会从发布列表消失，导致删除未提交。ZIP 按本机封装清单导出，而 Git 标签和 GitHub 仍保留旧文件，因此同一版本可能出现不同文件清单。升级后发布新版本时，勾选这些已删除项即可修正新版本；已经发布的旧标签需要另行修正，升级本身不会改写已有版本。
+
+## 构建 0.2.3 安装包
 
 构建脚本要求 `VERSION` 和 `debian/control` 中的版本号一致。执行以下命令同步版本号并打包：
 
 ```bash
-cd /home/qm/Tool/code-version-manager
-printf '0.2.2\n' > VERSION
-sed -i 's/^Version:.*/Version: 0.2.2/' debian/control
+# 在 code-version-manager/ 目录中执行
+printf '0.2.3\n' > VERSION
+sed -i 's/^Version:.*/Version: 0.2.3/' debian/control
 sh build_deb.sh
 ```
 
-生成的安装包为 `dist/code-version-manager_0.2.2_all.deb`。
+生成的安装包为 `dist/code-version-manager_0.2.3_all.deb`。
 
 安装前先关闭正在运行的版本管理器。需要卸载旧版时可执行（直接升级无需卸载）：
 
@@ -122,7 +128,7 @@ sudo apt remove code-version-manager
 在项目目录中执行以下命令安装或升级：
 
 ```bash
-sudo apt install ./dist/code-version-manager_0.2.2_all.deb
+sudo apt install ./dist/code-version-manager_0.2.3_all.deb
 ```
 
 

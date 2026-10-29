@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -921,6 +922,10 @@ class GitRepository:
             if (self.path / path).is_file() or (self.path / path).is_symlink()
         ]
 
+    def deleted_files(self) -> List[str]:
+        raw = self.run(["ls-files", "--deleted", "-z"])
+        return [path for path in raw.split("\0") if path]
+
     def changed_paths(self) -> List[str]:
         raw = self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         fields = raw.split("\0")
@@ -1109,7 +1114,7 @@ class GitRepository:
 
     def _add_paths(self, paths: Sequence[str]) -> None:
         for start in range(0, len(paths), 200):
-            self.run(["add", "--", *paths[start : start + 200]])
+            self.run(["--literal-pathspecs", "add", "--", *paths[start : start + 200]])
 
     def filter_ignored(self, paths: Sequence[str]) -> List[str]:
         if not paths:
@@ -1153,14 +1158,18 @@ class GitRepository:
             commit_message += "\n\n" + "\n".join(changes[1:])
         selected = validate_selected_files(self.path, selected_files)
         selected = self.filter_ignored(selected)
-        if not selected:
-            raise GitError("所选文件全部被 .gitignore 排除，无法创建版本。")
+        scopes = validate_top_level_scopes(selected_scopes or [])
+        deleted = [
+            path for path in self.deleted_files()
+            if any(path == scope or path.startswith(scope + "/") for scope in scopes)
+        ]
+        if not selected and not deleted:
+            raise GitError("至少选择一个未被 .gitignore 排除的文件或已删除项。")
         staged = self.run(["diff", "--cached", "--name-only"]).strip()
         if staged:
             raise GitError("Git 暂存区已有其他文件。请先处理这些暂存内容再发布版本。")
-        scopes = validate_top_level_scopes(selected_scopes or [])
         if scopes:
-            self.run(["add", "-u", "--", *scopes])
+            self.run(["--literal-pathspecs", "add", "-u", "--", *scopes])
         self._add_paths(selected)
         self.metadata_path.mkdir(parents=True, exist_ok=True)
         self.run(["commit", "--allow-empty", "-m", commit_message])
@@ -1231,7 +1240,12 @@ class GitRepository:
 
     def _archive_bytes(self, reference: str) -> bytes:
         paths = self.manifest(reference)
-        args = ["archive", "--format=tar", reference]
+        if paths == []:
+            archive = io.BytesIO()
+            with tarfile.open(fileobj=archive, mode="w:"):
+                pass
+            return archive.getvalue()
+        args = ["--literal-pathspecs", "archive", "--format=tar", reference]
         if paths:
             args.extend(["--", *paths])
         return self.run_bytes(args)
@@ -1282,7 +1296,11 @@ class GitRepository:
 
     def export(self, reference: str, destination: Path) -> None:
         paths = self.manifest(reference)
-        args = ["archive", "--format=zip", f"--output={destination}", reference]
+        if paths == []:
+            with zipfile.ZipFile(destination, "w"):
+                pass
+            return
+        args = ["--literal-pathspecs", "archive", "--format=zip", f"--output={destination}", reference]
         if paths:
             args.extend(["--", *paths])
         self.run(args)
@@ -1367,7 +1385,9 @@ def scan_workspace_files(path: Path) -> List[str]:
     return sorted(files)
 
 
-def top_level_package_groups(path: Path) -> Dict[str, List[str]]:
+def top_level_package_groups(
+    path: Path, deleted_files: Sequence[str] = ()
+) -> Dict[str, List[str]]:
     root = path.resolve()
     groups: Dict[str, List[str]] = {}
     for entry in sorted(root.iterdir(), key=lambda item: item.name.lower()):
@@ -1379,7 +1399,16 @@ def top_level_package_groups(path: Path) -> Dict[str, List[str]]:
                 groups[f"{entry.name}/"] = [f"{entry.name}/{item}" for item in nested]
         elif entry.is_file() or entry.is_symlink():
             groups[entry.name] = [entry.name]
-    return groups
+    # Deleted top-level entries cannot be discovered by walking the workspace.
+    # Keep them selectable so git add -u can record the removals too.
+    for relative in deleted_files:
+        parts = Path(relative).parts
+        if parts:
+            entry = parts[0]
+            if entry in groups or entry + "/" in groups:
+                continue
+            groups[entry + "/" if len(parts) > 1 else entry] = []
+    return dict(sorted(groups.items(), key=lambda item: item[0].lower()))
 
 
 def expand_package_groups(
@@ -1507,16 +1536,24 @@ class FileSelectionDialog(Gtk.Dialog):
         selected_files: Sequence[str],
         changed_files: Sequence[str],
         title: str = "选择版本封装文件",
+        deleted_entries: Sequence[str] = (),
     ):
         super().__init__(title=title, transient_for=parent, modal=True)
         self.set_default_size(820, 620)
         self.add_buttons("取消", Gtk.ResponseType.CANCEL, "继续", Gtk.ResponseType.OK)
         selected = set(selected_files)
         changed = set(changed_files)
+        deleted = set(deleted_entries)
 
         content = self.get_content_area()
         content.set_spacing(8)
         content.set_border_width(12)
+
+        if deleted:
+            hint = Gtk.Label(
+                label="勾选“已删除”项会将删除记录写入版本。", xalign=0
+            )
+            content.pack_start(hint, False, False, 0)
 
         search = Gtk.SearchEntry()
         search.set_placeholder_text("搜索文件路径")
@@ -1537,8 +1574,9 @@ class FileSelectionDialog(Gtk.Dialog):
         for path in files:
             is_changed = path in changed
             item_type = "目录" if path.endswith("/") else "文件"
+            status = "已删除" if path in deleted else ("已修改" if is_changed else item_type)
             self.store.append(
-                [path in selected, "已修改" if is_changed else item_type, path, is_changed]
+                [path in selected, status, path, is_changed]
             )
         self.filter = self.store.filter_new()
         self.search_text = ""
@@ -2544,7 +2582,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if not metadata:
             return
         version, message = metadata
-        groups = top_level_package_groups(self.workspace_path)
+        groups = top_level_package_groups(self.workspace_path, repository.deleted_files())
         entries = list(groups)
         if not entries:
             self.show_error("工作空间中没有可以封装的文件。")
@@ -2559,6 +2597,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             sorted(default_entries),
             changed_entries,
             title="选择工作空间顶层文件或目录",
+            deleted_entries=[entry for entry in entries if not groups[entry]],
         )
         if selected_entries is None:
             return
@@ -2607,8 +2646,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         selected_files: Sequence[str],
         changed_files: Sequence[str],
         title: str = "选择版本封装文件",
+        deleted_entries: Sequence[str] = (),
     ) -> Optional[List[str]]:
-        dialog = FileSelectionDialog(self, files, selected_files, changed_files, title=title)
+        dialog = FileSelectionDialog(
+            self, files, selected_files, changed_files, title=title,
+            deleted_entries=deleted_entries,
+        )
         dialog.show_all()
         response = dialog.run()
         selected = dialog.selected_files()
@@ -2616,7 +2659,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if response != Gtk.ResponseType.OK:
             return None
         if not selected:
-            self.show_error("至少选择一个需要封装的文件。")
+            self.show_error("至少选择一个需要封装的文件、目录或已删除项。")
             return None
         return selected
 

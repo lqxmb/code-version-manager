@@ -1,3 +1,5 @@
+> 路径说明：历史记录中的个人主目录已统一写为 `~`；当前使用方法以 README.md 和实际脚本为准。
+
 ## fetch\_robot\_0.0.1.zip ... fetch\_robot\_0.0.8.zip,CHANGELOG.rst,这种压缩版本备份的方式会占用大内存，不是增量式备份，有没有刚好的方法，本地备份，可以马上对比不同版本的修改差别，目前直接用Beyong Compare
 
 <details><summary>4 previous messages</summary>
@@ -87,7 +89,7 @@ git difftool -d --tool=bc v0.0.7 v0.0.8
 >
 > <details><summary>Ran 5 commands</summary>
 >
-> - Ran `find /usr/share/applications /home/qm/.local/share/applications -maxdepth 1 -type f \( -iname '*git*desktop' -o -iname '*bcompare*desktop' -o -iname '*code*desktop' \) -print 2>/dev/null | sort`
+> - Ran `find /usr/share/applications ~/.local/share/applications -maxdepth 1 -type f \( -iname '*git*desktop' -o -iname '*bcompare*desktop' -o -iname '*code*desktop' \) -print 2>/dev/null | sort`
 > - Ran `command -v git-cola || true; command -v gitg || true; command -v git-gui || true; git gui --version 2>&1 || true; command -v gitk || true; command -v bcompare || true`
 > - Ran `printf 'desktop=%s\nsession=%s\ndisplay=%s\n' "$XDG_CURRENT_DESKTOP" "$DESKTOP_SESSION" "$DISPLAY"; id; sudo -n true >/dev/null 2>&1; echo sudo_without_prompt=$?`
 > - Ran `apt-cache policy git-cola gitg git-gui gitk 2>/dev/null | sed -n '1,160p'`
@@ -110,7 +112,7 @@ git difftool -d --tool=bc v0.0.7 v0.0.8
 >
 > </details>
 >
-> - Ran `df -h /home/qm/catkin_ws | sed -n '1,2p'; du -sh src fetch_robot_0.0.*.zip`
+> - Ran `df -h ~/catkin_ws | sed -n '1,2p'; du -sh src fetch_robot_0.0.*.zip`
 >
 > - Ran `for f in fetch_robot_0.0.{1..8}.zip; do printf '%s: ' "$f"; unzip -Z1 "$f" | cut -d/ -f1 | sort -u | tr '\n' ' '; echo; done`
 >
@@ -136,7 +138,7 @@ git difftool -d --tool=bc v0.0.7 v0.0.8
 > <details><summary>Ran a command</summary>
 >
 > - Ran `set -euo pipefail
-> workspace=/home/qm/catkin_ws
+> workspace=~/catkin_ws
 > import_root=$(mktemp -d /tmp/fetch-git-import.XXXXXX)
 > case "$import_root" in /tmp/fetch-git-import.*) ;; *) echo 'Unexpected temporary path' >&2; exit 1;; esac
 > cleanup() { gio trash -- "$import_root"; }
@@ -213,10 +215,10 @@ git difftool -d --tool=bc v0.0.7 v0.0.8
 >
 > <details><summary>Created a file, ran 3 commands</summary>
 >
-> - Ran `rg -n '"command"|"title"' /home/qm/.vscode/extensions/mhutchie.git-graph-1.30.0/package.json | sed -n '1,100p'; code --help | rg -n 'command|reuse|folder|open' | sed -n '1,100p'`
-> - Ran `rg -n '^(Name|Exec|Icon)=' /usr/share/applications/code.desktop | sed -n '1,20p'; mkdir -p /home/qm/.local/share/applications`
+> - Ran `rg -n '"command"|"title"' ~/.vscode/extensions/mhutchie.git-graph-1.30.0/package.json | sed -n '1,100p'; code --help | rg -n 'command|reuse|folder|open' | sed -n '1,100p'`
+> - Ran `rg -n '^(Name|Exec|Icon)=' /usr/share/applications/code.desktop | sed -n '1,20p'; mkdir -p ~/.local/share/applications`
 > - Wrote `~/.local/share/applications/fetch-robot-version-manager.desktop` (+10 -0)
-> - Ran `desktop-file-validate /home/qm/.local/share/applications/fetch-robot-version-manager.desktop && update-desktop-database /home/qm/.local/share/applications && gtk-launch fetch-robot-version-manager`
+> - Ran `desktop-file-validate ~/.local/share/applications/fetch-robot-version-manager.desktop && update-desktop-database ~/.local/share/applications && gtk-launch fetch-robot-version-manager`
 >
 > </details>
 >
@@ -225,7 +227,7 @@ git difftool -d --tool=bc v0.0.7 v0.0.8
 > <details><summary>Edited a file, ran a command</summary>
 >
 > - Wrote `~/.local/share/applications/fetch-robot-version-manager.desktop` (+1 -1)
-> - Ran `desktop-file-validate /home/qm/.local/share/applications/fetch-robot-version-manager.desktop && update-desktop-database /home/qm/.local/share/applications && gtk-launch fetch-robot-version-manager`
+> - Ran `desktop-file-validate ~/.local/share/applications/fetch-robot-version-manager.desktop && update-desktop-database ~/.local/share/applications && gtk-launch fetch-robot-version-manager`
 >
 > </details>
 >
@@ -243,7 +245,7 @@ git difftool -d --tool=bc v0.0.7 v0.0.8
 >
 > </details>
 >
-> - Ran `code --list-extensions | rg '^mhutchie.git-graph$'; desktop-file-validate /home/qm/.local/share/applications/fetch-robot-version-manager.desktop; sed -n '1,80p' /home/qm/.local/share/applications/fetch-robot-version-manager.desktop`
+> - Ran `code --list-extensions | rg '^mhutchie.git-graph$'; desktop-file-validate ~/.local/share/applications/fetch-robot-version-manager.desktop; sed -n '1,80p' ~/.local/share/applications/fetch-robot-version-manager.desktop`
 >
 > - Ran `git fsck --full && git status --short --branch`
 >
@@ -417,7 +419,7 @@ v0.0.8
 >
 > <details><summary>Deleted a file, ran 5 commands</summary>
 >
-> - Ran `ls -l /home/qm/.local/share/applications/fetch-robot-version-manager.desktop /home/qm/catkin_ws/.vscode/tasks.json /home/qm/catkin_ws/.vscode/extensions.json 2>&1 || true; git status --short`
+> - Ran `ls -l ~/.local/share/applications/fetch-robot-version-manager.desktop ~/catkin_ws/.vscode/tasks.json ~/catkin_ws/.vscode/extensions.json 2>&1 || true; git status --short`
 > - Ran `dpkg-query -W -f='${Package} ${Version}\n' python3 python3-gi gir1.2-gtk-3.0 git 2>/dev/null`
 > - Ran `python3 - <<'PY'
 > try:
@@ -431,7 +433,7 @@ v0.0.8
 > command -v dpkg-deb; command -v desktop-file-validate; command -v bcompare`
 > - Ran `code --list-extensions | rg '^mhutchie.git-graph$' || true`
 > - Deleted `~/.local/share/applications/fetch-robot-version-manager.desktop` (+0 -10)
-> - Ran `code --uninstall-extension mhutchie.git-graph && update-desktop-database /home/qm/.local/share/applications`
+> - Ran `code --uninstall-extension mhutchie.git-graph && update-desktop-database ~/.local/share/applications`
 >
 > </details>
 >
@@ -489,7 +491,7 @@ v0.0.8
 > sh -n package/fetch-version-manager/build_deb.sh package/fetch-version-manager/data/fetch-version-manager package/fetch-version-manager/debian/postinst package/fetch-version-manager/debian/postrm`
 > - Ran `dpkg -S /usr/bin/bcompare 2>/dev/null || true; dpkg-deb --version | sed -n '1,2p'; du -sh package/fetch-version-manager`
 > - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v package/fetch-version-manager/tests/test_backend.py`
-> - Ran `test ! -e /home/qm/.local/share/applications/fetch-robot-version-manager.desktop && echo desktop_removed; test ! -e .vscode/tasks.json && echo tasks_removed; test ! -e .vscode/extensions.json && echo extension_recommendation_removed; if code --list-extensions | rg -q '^mhutchie.git-graph$'; then exit 1; else echo git_graph_uninstalled; fi`
+> - Ran `test ! -e ~/.local/share/applications/fetch-robot-version-manager.desktop && echo desktop_removed; test ! -e .vscode/tasks.json && echo tasks_removed; test ! -e .vscode/extensions.json && echo extension_recommendation_removed; if code --list-extensions | rg -q '^mhutchie.git-graph$'; then exit 1; else echo git_graph_uninstalled; fi`
 > - Ran `xwininfo -root -tree 2>/dev/null | rg 'Fetch Robot 版本管理' | head -n 10`
 > - Ran `import -window 0x5c00007 /tmp/fetch_version_manager_ui.png`
 >
@@ -501,7 +503,7 @@ v0.0.8
 >
 > <details><summary>Edited a file, ran 3 commands</summary>
 >
-> - Ran `FETCH_VERSION_REPO=/home/qm/catkin_ws PYTHONDONTWRITEBYTECODE=1 python3 package/fetch-version-manager/src/fetch_version_manager.py`
+> - Ran `FETCH_VERSION_REPO=~/catkin_ws PYTHONDONTWRITEBYTECODE=1 python3 package/fetch-version-manager/src/fetch_version_manager.py`
 > - Wrote `./package/fetch-version-manager/src/fetch_version_manager.py` (+4 -2)
 > - Ran `sh package/fetch-version-manager/build_deb.sh`
 > - Ran `sed -n '1,160p' .git/info/exclude; dpkg-deb --info package/fetch-version-manager/dist/fetch-version-manager_1.0.0_all.deb; dpkg-deb --contents package/fetch-version-manager/dist/fetch-version-manager_1.0.0_all.deb; ls -lh package/fetch-version-manager/dist/fetch-version-manager_1.0.0_all.deb`
@@ -566,7 +568,7 @@ v0.0.8
 >
 > <details><summary>Explored a list, ran 5 commands</summary>
 >
-> - Ran `FETCH_VERSION_REPO=/home/qm/catkin_ws PYTHONDONTWRITEBYTECODE=1 python3 package/fetch-version-manager/src/fetch_version_manager.py`
+> - Ran `FETCH_VERSION_REPO=~/catkin_ws PYTHONDONTWRITEBYTECODE=1 python3 package/fetch-version-manager/src/fetch_version_manager.py`
 >
 > - Ran `dpkg-deb --info package/fetch-version-manager/dist/fetch-version-manager_1.0.0_all.deb | sed -n '1,28p'; dpkg-deb --contents package/fetch-version-manager/dist/fetch-version-manager_1.0.0_all.deb | sed -n '1,40p'; sha256sum package/fetch-version-manager/dist/fetch-version-manager_1.0.0_all.deb`
 >
@@ -580,7 +582,7 @@ v0.0.8
 >
 > - Ran `pgrep -af 'fetch_version_manager.py|fetch-version-manager' || true`
 >
-> - Ran `git status --short --branch; git log --oneline --decorate main -n 3; code --list-extensions | rg '^mhutchie.git-graph$' || true; test ! -e /home/qm/.local/share/applications/fetch-robot-version-manager.desktop && echo old_launcher_removed`
+> - Ran `git status --short --branch; git log --oneline --decorate main -n 3; code --list-extensions | rg '^mhutchie.git-graph$' || true; test ! -e ~/.local/share/applications/fetch-robot-version-manager.desktop && echo old_launcher_removed`
 >
 > </details>
 </details>
@@ -606,7 +608,7 @@ v0.0.8
 
 原 VS Code 任务、扩展推荐、Git Graph 和旧桌面入口均已移除。自动测试、GTK 界面检查及 Debian 包内容检查均已通过。
 
-> 卸载当前按照的Fetch Robot 版本管理。现在的软件只能管理/home/qm/catkin\_ws，改成可以管理其他的工作空间，并且新增版本可以自选文件进行版本封装。然后还没版本的，可以添加版本管理，然后对比时是全文件对接，不要只对比差异的
+> 卸载当前按照的Fetch Robot 版本管理。现在的软件只能管理~/catkin\_ws，改成可以管理其他的工作空间，并且新增版本可以自选文件进行版本封装。然后还没版本的，可以添加版本管理，然后对比时是全文件对接，不要只对比差异的
 
 <details><summary>39 previous messages</summary>
 
@@ -625,13 +627,13 @@ v0.0.8
 >
 > - Ran `sudo -n true >/dev/null 2>&1; echo sudo_without_prompt=$?; command -v pkexec || true; pgrep -af 'fetch_version_manager.py|/usr/bin/fetch-version-manager' || true`
 >
-> - Ran `dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' fetch-version-manager 2>&1 || true; command -v fetch-version-manager || true; find /usr/share/applications /home/qm/.local/share/applications -maxdepth 1 -name 'fetch-version-manager.desktop' -print 2>/dev/null`
+> - Ran `dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' fetch-version-manager 2>&1 || true; command -v fetch-version-manager || true; find /usr/share/applications ~/.local/share/applications -maxdepth 1 -name 'fetch-version-manager.desktop' -print 2>/dev/null`
 >
 > - Ran `bcompare -help 2>&1 | sed -n '1,140p' || true`
 >
 > </details>
 >
-> 系统中确实已安装 `fetch-version-manager 1.0.0`。卸载需要管理员授权，我现在启动 Ubuntu 的图形密码确认窗口；输入系统密码后只会卸载这个包，不会删除 `/home/qm/catkin_ws`、Git 历史或任何版本 ZIP。
+> 系统中确实已安装 `fetch-version-manager 1.0.0`。卸载需要管理员授权，我现在启动 Ubuntu 的图形密码确认窗口；输入系统密码后只会卸载这个包，不会删除 `~/catkin_ws`、Git 历史或任何版本 ZIP。
 >
 > <details><summary>Ran a command</summary>
 >
@@ -767,7 +769,7 @@ v0.0.8
 > spec=importlib.util.spec_from_file_location('fvm',source)
 > module=importlib.util.module_from_spec(spec)
 > spec.loader.exec_module(module)
-> module.GitRepository(Path('/home/qm/catkin_ws')).compare('v0.0.7','v0.0.8')
+> module.GitRepository(Path('~/catkin_ws')).compare('v0.0.7','v0.0.8')
 > PY`
 >
 > - Ran `import -window 0x3e0005f /tmp/fvm_full_compare.png`
@@ -804,7 +806,7 @@ v0.0.8
 > spec=importlib.util.spec_from_file_location('fvm',source)
 > module=importlib.util.module_from_spec(spec)
 > spec.loader.exec_module(module)
-> module.GitRepository(Path('/home/qm/catkin_ws')).compare('v0.0.7','v0.0.8')
+> module.GitRepository(Path('~/catkin_ws')).compare('v0.0.7','v0.0.8')
 > PY`
 > - Ran `pgrep -af '/usr/lib/beyondcompare/BCompare|fvm-compare-' || true; find /tmp -maxdepth 1 -type d -name 'fvm-compare-*' -print`
 >
@@ -823,8 +825,8 @@ v0.0.8
 > PY
 > sh -n package/fetch-version-manager/build_deb.sh package/fetch-version-manager/debian/postinst package/fetch-version-manager/debian/postrm`
 > - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v package/fetch-version-manager/tests/test_backend.py`
-> - Ran `old_deb=/home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_1.0.0_all.deb
-> old_stage=/home/qm/catkin_ws/package/fetch-version-manager/build/fetch-version-manager_1.0.0_all
+> - Ran `old_deb=~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_1.0.0_all.deb
+> old_stage=~/catkin_ws/package/fetch-version-manager/build/fetch-version-manager_1.0.0_all
 > [ ! -e "$old_deb" ] || gio trash "$old_deb"
 > [ ! -e "$old_stage" ] || gio trash "$old_stage"
 > echo old_build_artifacts_removed`
@@ -832,7 +834,7 @@ v0.0.8
 > - Wrote `./package/fetch-version-manager/src/fetch_version_manager.py` (+1 -1)
 > - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -q package/fetch-version-manager/tests/test_backend.py && sh package/fetch-version-manager/build_deb.sh && sha256sum package/fetch-version-manager/dist/fetch-version-manager_2.0.0_all.deb`
 > - Ran `set -e
-> package_file=/home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.0.0_all.deb
+> package_file=~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.0.0_all.deb
 > test_root=$(mktemp -d /tmp/fvm-deb-check.XXXXXX)
 > dpkg-deb --extract "$package_file" "$test_root"
 > python3 - <<PY
@@ -853,7 +855,7 @@ v0.0.8
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `pkexec /usr/bin/dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.0.0_all.deb`
+> - Ran `pkexec /usr/bin/dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.0.0_all.deb`
 >
 > </details>
 >
@@ -907,7 +909,7 @@ v0.0.8
 >
 > <details><summary>Ran 2 commands</summary>
 >
-> - Ran `FETCH_VERSION_REPO=/home/qm/catkin_ws PYTHONDONTWRITEBYTECODE=1 python3 package/fetch-version-manager/src/fetch_version_manager.py`
+> - Ran `FETCH_VERSION_REPO=~/catkin_ws PYTHONDONTWRITEBYTECODE=1 python3 package/fetch-version-manager/src/fetch_version_manager.py`
 > - Ran `PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
 > import importlib.util
 > from pathlib import Path
@@ -915,7 +917,7 @@ v0.0.8
 > spec=importlib.util.spec_from_file_location('fvm',source)
 > module=importlib.util.module_from_spec(spec)
 > spec.loader.exec_module(module)
-> text=module.GitRepository(Path('/home/qm/catkin_ws')).changelog_text()
+> text=module.GitRepository(Path('~/catkin_ws')).changelog_text()
 > print(text)
 > PY`
 >
@@ -925,13 +927,13 @@ v0.0.8
 >
 > <details><summary>Ran 2 commands</summary>
 >
-> - Ran `old_deb=/home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.0.0_all.deb
-> old_stage=/home/qm/catkin_ws/package/fetch-version-manager/build/fetch-version-manager_2.0.0_all
+> - Ran `old_deb=~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.0.0_all.deb
+> old_stage=~/catkin_ws/package/fetch-version-manager/build/fetch-version-manager_2.0.0_all
 > [ ! -e "$old_deb" ] || gio trash "$old_deb"
 > [ ! -e "$old_stage" ] || gio trash "$old_stage"
 > sh package/fetch-version-manager/build_deb.sh
 > sha256sum package/fetch-version-manager/dist/fetch-version-manager_2.1.0_all.deb`
-> - Ran `pkexec /usr/bin/dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.1.0_all.deb`
+> - Ran `pkexec /usr/bin/dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.1.0_all.deb`
 >
 > </details>
 >
@@ -988,7 +990,7 @@ v0.0.8
 
 [fetch-version-manager_2.1.0_all.deb](./package/fetch-version-manager/dist/fetch-version-manager_2.1.0_all.deb)
 
-现在可在 Ubuntu 应用菜单搜索“工作空间版本管理”打开。当前 `/home/qm/catkin_ws` 仍停留在历史版本 `v0.0.6`，软件会显示安全警告并禁用保存；点击“返回 main”只进行普通安全切换，不会强制覆盖文件。
+现在可在 Ubuntu 应用菜单搜索“工作空间版本管理”打开。当前 `~/catkin_ws` 仍停留在历史版本 `v0.0.6`，软件会显示安全警告并禁用保存；点击“返回 main”只进行普通安全切换，不会强制覆盖文件。
 
 另外，IDE 中仍打开的 `tasks.json`、`extensions.json` 是旧缓冲标签，磁盘上的文件已经删除，可以直接关闭标签。四项自动测试、无版本工作空间初始化、完整目录比较和最终安装包启动均已验证。
 
@@ -1121,8 +1123,8 @@ main -> d75af40
 > PY`
 > - Ran `find /tmp/fvm-top-level-ui.sGWtME -depth -delete
 > pgrep -af 'fetch_version_manager.py|cn.local.FetchVersionManager' || true`
-> - Ran `old_deb=/home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.1.0_all.deb
-> old_stage=/home/qm/catkin_ws/package/fetch-version-manager/build/fetch-version-manager_2.1.0_all
+> - Ran `old_deb=~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.1.0_all.deb
+> old_stage=~/catkin_ws/package/fetch-version-manager/build/fetch-version-manager_2.1.0_all
 > [ ! -e "$old_deb" ] || gio trash "$old_deb"
 > [ ! -e "$old_stage" ] || gio trash "$old_stage"
 > sh package/fetch-version-manager/build_deb.sh
@@ -1134,7 +1136,7 @@ main -> d75af40
 >
 > <details><summary>Ran 7 commands</summary>
 >
-> - Ran `pkexec /usr/bin/dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.2.0_all.deb`
+> - Ran `pkexec /usr/bin/dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.2.0_all.deb`
 > - Ran `xwininfo -root -tree 2>/dev/null | rg -i 'authentication|认证|授权|polkit|password|密码' | head -n 30; pgrep -af 'pkexec.*dpkg|polkit' | head -n 30`
 > - Ran `ls -lh package/fetch-version-manager/dist; sha256sum package/fetch-version-manager/dist/fetch-version-manager_2.2.0_all.deb; dpkg-deb --info package/fetch-version-manager/dist/fetch-version-manager_2.2.0_all.deb | sed -n '1,22p'`
 > - Ran `git status --short --branch; test ! -e .vscode/tasks.json && echo tasks_removed; test ! -e .vscode/extensions.json && echo extensions_removed`
@@ -1187,11 +1189,11 @@ assets/model.dae
 >
 > <details><summary>Ran 5 commands</summary>
 >
-> - Ran `target=/home/qm/temp/22/p7_ws; realpath "$target"; ls -la "$target" | sed -n '1,120p'; find "$target" -mindepth 1 -maxdepth 2 -printf '%y %P -> %l\n' | sort | sed -n '1,200p'`
-> - Ran `target=/home/qm/temp/22/p7_ws; git -C "$target" status --short --branch 2>&1 || true; git -C "$target" branch -avv 2>&1 || true; git -C "$target" log --oneline --decorate -n 5 2>&1 || true; git -C "$target" diff --cached --name-status 2>&1 || true`
-> - Ran `target=/home/qm/temp/22/p7_ws; git -C "$target" config --get user.name 2>&1 || true; git -C "$target" config --get user.email 2>&1 || true; git config --global --get user.name || true; git config --global --get user.email || true`
-> - Ran `target=/home/qm/temp/22/p7_ws; find "$target/src" -not -readable -printf 'not-readable %p\n' 2>/dev/null | head -n 80; find "$target" -maxdepth 2 -printf '%m %u:%g %p\n' | sed -n '1,160p'; df -h "$target" | sed -n '1,3p'`
-> - Ran `target=/home/qm/temp/22/p7_ws; find "$target/src" -type d -name .git -print 2>/dev/null | sed -n '1,100p'; find "$target/src" -type f -name .git -print 2>/dev/null | sed -n '1,100p'; find "$target/src" -type l -printf '%p -> %l\n' 2>/dev/null | sed -n '1,100p'`
+> - Ran `target=~/temp/22/p7_ws; realpath "$target"; ls -la "$target" | sed -n '1,120p'; find "$target" -mindepth 1 -maxdepth 2 -printf '%y %P -> %l\n' | sort | sed -n '1,200p'`
+> - Ran `target=~/temp/22/p7_ws; git -C "$target" status --short --branch 2>&1 || true; git -C "$target" branch -avv 2>&1 || true; git -C "$target" log --oneline --decorate -n 5 2>&1 || true; git -C "$target" diff --cached --name-status 2>&1 || true`
+> - Ran `target=~/temp/22/p7_ws; git -C "$target" config --get user.name 2>&1 || true; git -C "$target" config --get user.email 2>&1 || true; git config --global --get user.name || true; git config --global --get user.email || true`
+> - Ran `target=~/temp/22/p7_ws; find "$target/src" -not -readable -printf 'not-readable %p\n' 2>/dev/null | head -n 80; find "$target" -maxdepth 2 -printf '%m %u:%g %p\n' | sed -n '1,160p'; df -h "$target" | sed -n '1,3p'`
+> - Ran `target=~/temp/22/p7_ws; find "$target/src" -type d -name .git -print 2>/dev/null | sed -n '1,100p'; find "$target/src" -type f -name .git -print 2>/dev/null | sed -n '1,100p'; find "$target/src" -type l -printf '%p -> %l\n' 2>/dev/null | sed -n '1,100p'`
 >
 > </details>
 >
@@ -1199,15 +1201,15 @@ assets/model.dae
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `du -sh /home/qm/temp/22/p7_ws/src; test_root=$(mktemp -d /tmp/fvm-p7-repro.XXXXXX)
-> cp -a /home/qm/temp/22/p7_ws/src "$test_root/src"
-> cp -a /home/qm/temp/22/p7_ws/README.md "$test_root/README.md"
+> - Ran `du -sh ~/temp/22/p7_ws/src; test_root=$(mktemp -d /tmp/fvm-p7-repro.XXXXXX)
+> cp -a ~/temp/22/p7_ws/src "$test_root/src"
+> cp -a ~/temp/22/p7_ws/README.md "$test_root/README.md"
 > printf 'TEST_ROOT=%s\n' "$test_root"
 > TEST_ROOT="$test_root" PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
 > import importlib.util
 > import os
 > from pathlib import Path
-> source=Path('/home/qm/catkin_ws/package/fetch-version-manager/src/fetch_version_manager.py')
+> source=Path('~/catkin_ws/package/fetch-version-manager/src/fetch_version_manager.py')
 > spec=importlib.util.spec_from_file_location('fvm',source)
 > module=importlib.util.module_from_spec(spec)
 > spec.loader.exec_module(module)
@@ -1236,7 +1238,7 @@ assets/model.dae
 >
 > </details>
 >
-> /home/qm/catkin\_ws/CHANGELOG.rst版本管理文件格式要像这种格式
+> ~/catkin\_ws/CHANGELOG.rst版本管理文件格式要像这种格式
 >
 > - 代表一个改动，可以同时填写多条
 >
@@ -1244,7 +1246,7 @@ assets/model.dae
 >
 > <details><summary>Explored a file, ran 3 commands</summary>
 >
-> - Ran `if [ -f /home/qm/catkin_ws/CHANGELOG.rst ]; then nl -ba /home/qm/catkin_ws/CHANGELOG.rst | sed -n '1,240p'; else echo 'working CHANGELOG.rst is absent'; fi`
+> - Ran `if [ -f ~/catkin_ws/CHANGELOG.rst ]; then nl -ba ~/catkin_ws/CHANGELOG.rst | sed -n '1,240p'; else echo 'working CHANGELOG.rst is absent'; fi`
 >
 > <details><summary>Explored 2 files</summary>
 >
@@ -1301,14 +1303,14 @@ assets/model.dae
 >
 > - Ran `find /tmp/fvm-p7-repro.HqGHPX -depth -delete 2>/dev/null || true
 > test_root=$(mktemp -d /tmp/fvm-p7-repro-fixed.XXXXXX)
-> cp -a /home/qm/temp/22/p7_ws/src "$test_root/src"
-> cp -a /home/qm/temp/22/p7_ws/README.md "$test_root/README.md"
+> cp -a ~/temp/22/p7_ws/src "$test_root/src"
+> cp -a ~/temp/22/p7_ws/README.md "$test_root/README.md"
 > printf 'TEST_ROOT=%s\n' "$test_root"
 > TEST_ROOT="$test_root" PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
 > import importlib.util
 > import os
 > from pathlib import Path
-> source=Path('/home/qm/catkin_ws/package/fetch-version-manager/src/fetch_version_manager.py')
+> source=Path('~/catkin_ws/package/fetch-version-manager/src/fetch_version_manager.py')
 > spec=importlib.util.spec_from_file_location('fvm',source)
 > module=importlib.util.module_from_spec(spec)
 > spec.loader.exec_module(module)
@@ -1335,18 +1337,18 @@ assets/model.dae
 >
 > </details>
 >
-> `p7_ws` 临时副本已成功初始化：2450 个有效文件入版，`src/CMakeLists.txt` 符号链接保留，两个被 `.gitignore` 排除的目录未封装，CHANGELOG 也按多条 `-` 格式生成。实际 `/home/qm/temp/22/p7_ws` 仍未修改。现在打包并升级到修复版 `2.3.0`。
+> `p7_ws` 临时副本已成功初始化：2450 个有效文件入版，`src/CMakeLists.txt` 符号链接保留，两个被 `.gitignore` 排除的目录未封装，CHANGELOG 也按多条 `-` 格式生成。实际 `~/temp/22/p7_ws` 仍未修改。现在打包并升级到修复版 `2.3.0`。
 >
 > <details><summary>Ran 7 commands</summary>
 >
-> - Ran `old_deb=/home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.2.0_all.deb
-> old_stage=/home/qm/catkin_ws/package/fetch-version-manager/build/fetch-version-manager_2.2.0_all
+> - Ran `old_deb=~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.2.0_all.deb
+> old_stage=~/catkin_ws/package/fetch-version-manager/build/fetch-version-manager_2.2.0_all
 > [ ! -e "$old_deb" ] || gio trash "$old_deb"
 > [ ! -e "$old_stage" ] || gio trash "$old_stage"
 > sh package/fetch-version-manager/build_deb.sh
 > sha256sum package/fetch-version-manager/dist/fetch-version-manager_2.3.0_all.deb`
-> - Ran `pkexec /usr/bin/dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.3.0_all.deb`
-> - Ran `target=/home/qm/temp/22/p7_ws; test ! -e "$target/.git" && echo p7_original_unchanged; ls -ld "$target" "$target/src" "$target/README.md"`
+> - Ran `pkexec /usr/bin/dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.3.0_all.deb`
+> - Ran `target=~/temp/22/p7_ws; test ! -e "$target/.git" && echo p7_original_unchanged; ls -ld "$target" "$target/src" "$target/README.md"`
 > - Ran `ps -p 286494 -o pid,lstart,args 2>/dev/null || true; find /tmp -maxdepth 1 -type d \( -name 'fvm-p7-repro*' -o -name 'fvm-top-level-ui.*' \) -print`
 > - Ran `ls -lh package/fetch-version-manager/dist; sha256sum package/fetch-version-manager/dist/fetch-version-manager_2.3.0_all.deb; dpkg-deb --info package/fetch-version-manager/dist/fetch-version-manager_2.3.0_all.deb | sed -n '1,22p'`
 > - Ran `dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' fetch-version-manager; rg -n 'filter_ignored|normalize_changes|改动内容（每行一条）|Changelog for workspace' /usr/lib/fetch-version-manager/fetch_version_manager.py`
@@ -1368,7 +1370,7 @@ src/core_planning/mpc_follower/tool/qpoases_vendor/qpoases_3_2
 
 - 自动使用嵌套 `.gitignore` 过滤文件。
 - 保留 `src/CMakeLists.txt` 等外部符号链接。
-- CHANGELOG 改为与 `/home/qm/catkin_ws/CHANGELOG.rst` 相同的格式。
+- CHANGELOG 改为与 `~/catkin_ws/CHANGELOG.rst` 相同的格式。
 - “改动内容”改为多行输入框，每行生成一条 `- 内容`。
 - 手动输入 `-` 或 `*` 时会自动规范，不会重复符号。
 
@@ -1394,7 +1396,7 @@ Changelog for workspace
 - 忽略构建依赖目录
 ```
 
-已使用 `p7_ws` 临时副本验证成功，共封装 2450 个有效文件；原始 `/home/qm/temp/22/p7_ws` 没有被修改，可以重新打开软件并再次启用。
+已使用 `p7_ws` 临时副本验证成功，共封装 2450 个有效文件；原始 `~/temp/22/p7_ws` 没有被修改，可以重新打开软件并再次启用。
 
 新版安装包：
 
@@ -1410,9 +1412,9 @@ Changelog for workspace
 >
 > <details><summary>Ran 5 commands</summary>
 >
-> - Ran `target=/home/qm/temp/22/p7_ws; git -C "$target" status --short --branch 2>&1 || true; git -C "$target" log --oneline --decorate -n 6 2>&1 || true; git -C "$target" tag --sort=version:refname 2>&1 || true`
-> - Ran `target=/home/qm/temp/22/p7_ws; find "$target" -mindepth 1 -maxdepth 1 -printf '%y %f\n' | sort; find "$target/src" -mindepth 1 -maxdepth 1 -printf '%y %f\n' | sort | sed -n '1,80p'`
-> - Ran `target=/home/qm/temp/22/p7_ws; tag=$(git -C "$target" tag --sort=-version:refname | head -n1); echo tag=$tag; [ -z "$tag" ] || git -C "$target" show "$tag:.fetch-version-manager/manifests/$tag.txt" 2>&1 | sed -n '1,100p'; [ -z "$tag" ] || git -C "$target" show "$tag:.fetch-version-manager/manifests/$tag.txt" 2>/dev/null | wc -l`
+> - Ran `target=~/temp/22/p7_ws; git -C "$target" status --short --branch 2>&1 || true; git -C "$target" log --oneline --decorate -n 6 2>&1 || true; git -C "$target" tag --sort=version:refname 2>&1 || true`
+> - Ran `target=~/temp/22/p7_ws; find "$target" -mindepth 1 -maxdepth 1 -printf '%y %f\n' | sort; find "$target/src" -mindepth 1 -maxdepth 1 -printf '%y %f\n' | sort | sed -n '1,80p'`
+> - Ran `target=~/temp/22/p7_ws; tag=$(git -C "$target" tag --sort=-version:refname | head -n1); echo tag=$tag; [ -z "$tag" ] || git -C "$target" show "$tag:.fetch-version-manager/manifests/$tag.txt" 2>&1 | sed -n '1,100p'; [ -z "$tag" ] || git -C "$target" show "$tag:.fetch-version-manager/manifests/$tag.txt" 2>/dev/null | wc -l`
 > - Ran `pgrep -af '/usr/lib/fetch-version-manager/fetch_version_manager.py' || true`
 > - Ran `dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' fetch-version-manager; rg -n -C 4 'def on_save_version|top_level_package_groups|default_package_files' /usr/lib/fetch-version-manager/fetch_version_manager.py`
 >
@@ -1478,11 +1480,11 @@ Changelog for workspace
 > - Ran `PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
 > import importlib.util
 > from pathlib import Path
-> source=Path('/home/qm/catkin_ws/package/fetch-version-manager/src/fetch_version_manager.py')
+> source=Path('~/catkin_ws/package/fetch-version-manager/src/fetch_version_manager.py')
 > spec=importlib.util.spec_from_file_location('fvm',source)
 > module=importlib.util.module_from_spec(spec)
 > spec.loader.exec_module(module)
-> root=Path('/home/qm/temp/22/p7_ws')
+> root=Path('~/temp/22/p7_ws')
 > repo=module.GitRepository(root)
 > groups=module.top_level_package_groups(root)
 > default=set(module.top_level_groups_for_paths(groups,repo.default_package_files()))
@@ -1501,8 +1503,8 @@ Changelog for workspace
 >
 > <details><summary>Ran 3 commands</summary>
 >
-> - Ran `ls -la /home/qm/temp/22/p7_ws | sed -n '1,100p'; stat /home/qm/temp/22/p7_ws/.git 2>&1 || true`
-> - Ran `git -C /home/qm/temp/22/p7_ws rev-parse --show-toplevel 2>&1 || true; git -C /home/qm/temp/22/p7_ws status --short --branch 2>&1 | sed -n '1,80p'`
+> - Ran `ls -la ~/temp/22/p7_ws | sed -n '1,100p'; stat ~/temp/22/p7_ws/.git 2>&1 || true`
+> - Ran `git -C ~/temp/22/p7_ws rev-parse --show-toplevel 2>&1 || true; git -C ~/temp/22/p7_ws status --short --branch 2>&1 | sed -n '1,80p'`
 > - Ran `pgrep -af '/usr/lib/fetch-version-manager/fetch_version_manager.py' || true; dpkg-query -W -f='${Version}\n' fetch-version-manager`
 >
 > </details>
@@ -1558,14 +1560,14 @@ Changelog for workspace
 > raise SystemExit(app.run([]))
 > PY`
 > - Ran `find /tmp/fvm-save-top-ui.EdbTDj -depth -delete && test ! -e /tmp/fvm-save-top-ui.EdbTDj && echo removed`
-> - Ran `old_deb=/home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.3.0_all.deb
-> old_stage=/home/qm/catkin_ws/package/fetch-version-manager/build/fetch-version-manager_2.3.0_all
+> - Ran `old_deb=~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.3.0_all.deb
+> old_stage=~/catkin_ws/package/fetch-version-manager/build/fetch-version-manager_2.3.0_all
 > [ ! -e "$old_deb" ] || gio trash "$old_deb"
 > [ ! -e "$old_stage" ] || gio trash "$old_stage"
 > PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -q package/fetch-version-manager/tests/test_backend.py
 > sh package/fetch-version-manager/build_deb.sh
 > sha256sum package/fetch-version-manager/dist/fetch-version-manager_2.4.0_all.deb`
-> - Ran `pkexec /usr/bin/dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.0_all.deb`
+> - Ran `pkexec /usr/bin/dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.0_all.deb`
 >
 > </details>
 >
@@ -1573,10 +1575,10 @@ Changelog for workspace
 >
 > <details><summary>Ran 6 commands</summary>
 >
-> - Ran `pkexec /usr/bin/dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.0_all.deb`
+> - Ran `pkexec /usr/bin/dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.0_all.deb`
 > - Ran `pgrep -af '/usr/lib/fetch-version-manager/fetch_version_manager.py' || true; find /tmp -maxdepth 1 -type d \( -name 'fvm-save-top-ui.*' -o -name 'fvm-p7-repro*' \) -print`
 > - Ran `ls -lh package/fetch-version-manager/dist; sha256sum package/fetch-version-manager/dist/fetch-version-manager_2.4.0_all.deb; dpkg-deb --info package/fetch-version-manager/dist/fetch-version-manager_2.4.0_all.deb | sed -n '1,20p'`
-> - Ran `test ! -e /home/qm/temp/22/p7_ws/.git && echo p7_currently_unversioned; find /home/qm/temp/22/p7_ws -mindepth 1 -maxdepth 1 -printf '%f\n' | sort`
+> - Ran `test ! -e ~/temp/22/p7_ws/.git && echo p7_currently_unversioned; find ~/temp/22/p7_ws -mindepth 1 -maxdepth 1 -printf '%f\n' | sort`
 > - Ran `dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' fetch-version-manager; rg -n 'on_save_version|top_level_groups_for_paths|Changelog for \{workspace_name\}|\* \{change\}' /usr/lib/fetch-version-manager/fetch_version_manager.py`
 > - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -q package/fetch-version-manager/tests/test_backend.py`
 >
@@ -1607,7 +1609,7 @@ Changelog for p7_ws
 * 重构代码,修改为场景驱动调用不同控制器，添加起步旋转场景
 ```
 
-需要注意：最终检查时 `/home/qm/temp/22/p7_ws` 已经没有 `.git`，当前实际是“尚未启用版本管理”，这个状态不是本次修改造成的。重新打开软件后需要再次点击“启用版本管理”。
+需要注意：最终检查时 `~/temp/22/p7_ws` 已经没有 `.git`，当前实际是“尚未启用版本管理”，这个状态不是本次修改造成的。重新打开软件后需要再次点击“启用版本管理”。
 
 新版安装包：
 
@@ -1768,7 +1770,7 @@ Changelog for p7_ws
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `pkexec dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.2_all.deb`
+> - Ran `pkexec dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.2_all.deb`
 >
 > </details>
 >
@@ -1794,7 +1796,7 @@ Changelog for p7_ws
 本机已升级至 `2.4.2`，7 项测试全部通过。安装包：[fetch-version-manager_2.4.2_all.deb](./package/fetch-version-manager/dist/fetch-version-manager_2.4.2_all.deb)
 
 > 点击保存，默认不展开，然后目前CHANGELOG的格式是
-> /home/qm/temp/CHANGELOG.rst
+> ~/temp/CHANGELOG.rst
 > 要改成以下的参考格式
 > **^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^**
 > Changelog for p7\_ws
@@ -1828,7 +1830,7 @@ Changelog for p7_ws
 >
 > - Ran `nl -ba src/fetch_version_manager.py | sed -n '750,825p'; nl -ba src/fetch_version_manager.py | sed -n '1060,1145p'; sed -n '1,120p' README.md; dpkg-query -W -f='${Version}\n' fetch-version-manager 2>/dev/null || true`
 >
-> - Ran `nl -ba src/fetch_version_manager.py | sed -n '420,520p'; find /home/qm/temp/22/p7_ws -mindepth 1 -maxdepth 1 -printf '%f %y\n' 2>/dev/null | sort | sed -n '1,100p'; git -C /home/qm/temp/22/p7_ws status --short 2>/dev/null | sed -n '1,80p'`
+> - Ran `nl -ba src/fetch_version_manager.py | sed -n '420,520p'; find ~/temp/22/p7_ws -mindepth 1 -maxdepth 1 -printf '%f %y\n' 2>/dev/null | sort | sed -n '1,100p'; git -C ~/temp/22/p7_ws status --short 2>/dev/null | sed -n '1,80p'`
 >
 > </details>
 >
@@ -1850,25 +1852,25 @@ Changelog for p7_ws
 > <details><summary>Ran 2 commands</summary>
 >
 > - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; git diff --check -- package/fetch-version-manager`
-> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.GitRepository(Path("/home/qm/temp/22/p7_ws")).changelog_text(), end="")' | sed -n '1,80p'`
+> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.GitRepository(Path("~/temp/22/p7_ws")).changelog_text(), end="")' | sed -n '1,80p'`
 >
 > </details>
 >
-> 真实 `p7_ws` 历史的预览已经与参考格式逐行一致，包括 `0.0.3`、`0.0.2` 和星号列表。接下来我会构建并安装 `2.4.3`，同时用新生成器更新你当前打开的 `/home/qm/temp/CHANGELOG.rst`；不会修改 `p7_ws` 工作空间或其 Git 历史。
+> 真实 `p7_ws` 历史的预览已经与参考格式逐行一致，包括 `0.0.3`、`0.0.2` 和星号列表。接下来我会构建并安装 `2.4.3`，同时用新生成器更新你当前打开的 `~/temp/CHANGELOG.rst`；不会修改 `p7_ws` 工作空间或其 Git 历史。
 >
 > <details><summary>Ran 2 commands</summary>
 >
 > - Ran `sh build_deb.sh; dpkg-deb --field dist/fetch-version-manager_2.4.3_all.deb Package Version Depends Recommends; dpkg-deb --fsys-tarfile dist/fetch-version-manager_2.4.3_all.deb | tar -xOf - ./usr/lib/fetch-version-manager/fetch_version_manager.py | sed -n '245,270p'`
-> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.GitRepository(Path("/home/qm/temp/22/p7_ws")).download_changelog(Path("/home/qm/temp/CHANGELOG.rst"))'; sed -n '1,80p' /home/qm/temp/CHANGELOG.rst`
+> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.GitRepository(Path("~/temp/22/p7_ws")).download_changelog(Path("~/temp/CHANGELOG.rst"))'; sed -n '1,80p' ~/temp/CHANGELOG.rst`
 >
 > </details>
 >
-> 你当前打开的 `/home/qm/temp/CHANGELOG.rst` 已经按新格式重新生成。现在升级应用菜单中的已安装版本，系统可能弹出管理员授权窗口；如果软件当前开着，升级后需要关闭再重新打开一次。
+> 你当前打开的 `~/temp/CHANGELOG.rst` 已经按新格式重新生成。现在升级应用菜单中的已安装版本，系统可能弹出管理员授权窗口；如果软件当前开着，升级后需要关闭再重新打开一次。
 >
 > <details><summary>Ran 2 commands</summary>
 >
-> - Ran `pkexec dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.3_all.deb`
-> - Ran `dpkg-query -W -f='${Status}\n${Version}\n' fetch-version-manager; rg -n 'lines = \[marker, title, marker|"-" \* len\(heading\)' /usr/lib/fetch-version-manager/fetch_version_manager.py; cmp -s /home/qm/temp/CHANGELOG.rst <(PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.GitRepository(Path("/home/qm/temp/22/p7_ws")).changelog_text(), end="")'); git diff --check -- package/fetch-version-manager; ls -lh package/fetch-version-manager/dist/fetch-version-manager_2.4.3_all.deb`
+> - Ran `pkexec dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.3_all.deb`
+> - Ran `dpkg-query -W -f='${Status}\n${Version}\n' fetch-version-manager; rg -n 'lines = \[marker, title, marker|"-" \* len\(heading\)' /usr/lib/fetch-version-manager/fetch_version_manager.py; cmp -s ~/temp/CHANGELOG.rst <(PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.GitRepository(Path("~/temp/22/p7_ws")).changelog_text(), end="")'); git diff --check -- package/fetch-version-manager; ls -lh package/fetch-version-manager/dist/fetch-version-manager_2.4.3_all.deb`
 >
 > </details>
 </details>
@@ -1909,7 +1911,7 @@ Changelog for p7_ws
 > - Wrote `./package/fetch-version-manager/debian/control` (+1 -1)
 > - Wrote `./package/fetch-version-manager/src/fetch_version_manager.py` (+0 -1)
 > - Wrote `./package/fetch-version-manager/tests/test_backend.py` (+14 -0)
-> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; git -C /home/qm/catkin_ws diff --check -- package/fetch-version-manager`
+> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; git -C ~/catkin_ws diff --check -- package/fetch-version-manager`
 >
 > </details>
 >
@@ -1931,7 +1933,7 @@ Changelog for p7_ws
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `pkexec dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.4_all.deb`
+> - Ran `pkexec dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.4_all.deb`
 >
 > </details>
 >
@@ -1951,7 +1953,7 @@ Changelog for p7_ws
 8 项测试全部通过。由于管理员授权窗口超时，本机目前仍是 `2.4.3`，可执行以下命令升级：
 
 ```bash
-sudo apt install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.4_all.deb
+sudo apt install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.4_all.deb
 ```
 
 > 点击比较所选版本和所选版本比较当前还是会展开
@@ -1970,13 +1972,13 @@ sudo apt install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-ver
 >
 > <details><summary>Explored 2 files, ran 6 commands</summary>
 >
-> - Ran `find /home/qm/.config /home/qm/.beyondcompare /home/qm/.Beyond\ Compare -maxdepth 4 -type f 2>/dev/null | rg -i 'beyond|bcompare|bc4|session|setting' | sed -n '1,200p'`
+> - Ran `find ~/.config ~/.beyondcompare ~/.Beyond\ Compare -maxdepth 4 -type f 2>/dev/null | rg -i 'beyond|bcompare|bc4|session|setting' | sed -n '1,200p'`
 >
 > - Ran `dpkg-query -W -f='${Version}\n' bcompare 2>/dev/null || true; dpkg -L bcompare 2>/dev/null | sed -n '1,240p'`
 >
 > - Ran `find /usr/lib/beyondcompare /usr/share/doc/bcompare /usr/share/beyondcompare -maxdepth 3 -type f 2>/dev/null | sort | sed -n '1,240p'; rg -a -n -i "collapseall|expandall|expand all|collapse all|expand" /usr/lib/beyondcompare /usr/share/doc/bcompare /usr/share/beyondcompare 2>/dev/null | sed -n '1,200p'`
 >
-> - Ran `rg -n -i "ExpandAllOnLoad|ExpandDiffsOnLoad|Expand|AutoBuild" /home/qm/.config/bcompare/BCPreferences.xml /home/qm/.config/bcompare/BCSessions.xml /home/qm/.config/bcompare/BCState.xml | sed -n '1,240p'; sed -n '1,220p' /usr/lib/beyondcompare/help/command_line_reference.html | sed -e 's/<[^>]*>/ /g' | tr -s ' ' | rg -n -i "expand|collapse|session|command" | sed -n '1,160p'; rg -n -i "expand subfolders when loading|ExpandAllOnLoad|collapse all|expand all" /usr/lib/beyondcompare/help/*.html | sed -n '1,200p'`
+> - Ran `rg -n -i "ExpandAllOnLoad|ExpandDiffsOnLoad|Expand|AutoBuild" ~/.config/bcompare/BCPreferences.xml ~/.config/bcompare/BCSessions.xml ~/.config/bcompare/BCState.xml | sed -n '1,240p'; sed -n '1,220p' /usr/lib/beyondcompare/help/command_line_reference.html | sed -e 's/<[^>]*>/ /g' | tr -s ' ' | rg -n -i "expand|collapse|session|command" | sed -n '1,160p'; rg -n -i "expand subfolders when loading|ExpandAllOnLoad|collapse all|expand all" /usr/lib/beyondcompare/help/*.html | sed -n '1,200p'`
 >
 > <details><summary>Explored 2 files</summary>
 >
@@ -1991,7 +1993,7 @@ sudo apt install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-ver
 >
 > </details>
 >
-> 已找到根因：Beyond Compare 的用户配置 `/home/qm/.config/bcompare/BCSessions.xml` 中启用了 `ExpandAllOnLoad=True`，所以即使命令行不带 `-expandall`，它仍会自动展开。修复会为版本管理器的每次比较创建临时的独立 Beyond Compare 配置，把自动展开强制设为关闭；不会改动你平时单独使用 Beyond Compare 的配置。
+> 已找到根因：Beyond Compare 的用户配置 `~/.config/bcompare/BCSessions.xml` 中启用了 `ExpandAllOnLoad=True`，所以即使命令行不带 `-expandall`，它仍会自动展开。修复会为版本管理器的每次比较创建临时的独立 Beyond Compare 配置，把自动展开强制设为关闭；不会改动你平时单独使用 Beyond Compare 的配置。
 >
 > <details><summary>Edited 6 files</summary>
 >
@@ -2008,7 +2010,7 @@ sudo apt install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-ver
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; git -C /home/qm/catkin_ws diff --check -- package/fetch-version-manager`
+> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; git -C ~/catkin_ws diff --check -- package/fetch-version-manager`
 >
 > </details>
 >
@@ -2024,7 +2026,7 @@ sudo apt install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-ver
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `sudo -n dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.5_all.deb`
+> - Ran `sudo -n dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.5_all.deb`
 >
 > </details>
 >
@@ -2032,7 +2034,7 @@ sudo apt install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-ver
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `pkexec dpkg --install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.5_all.deb`
+> - Ran `pkexec dpkg --install ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.5_all.deb`
 >
 > </details>
 >
@@ -2099,7 +2101,7 @@ sudo apt install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-ver
 >
 > <details><summary>Ran 2 commands</summary>
 >
-> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; git -C /home/qm/catkin_ws diff --check -- package/fetch-version-manager; sh build_deb.sh`
+> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; git -C ~/catkin_ws diff --check -- package/fetch-version-manager; sh build_deb.sh`
 > - Ran `dpkg-deb --field dist/fetch-version-manager_2.4.6_all.deb Package Version Architecture Depends Recommends; dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' python3 python3-gi gir1.2-gtk-3.0 git; apt-get -s install ./dist/fetch-version-manager_2.4.6_all.deb 2>&1 | sed -n '1,180p'; dpkg-deb --fsys-tarfile dist/fetch-version-manager_2.4.6_all.deb | tar -xOf - ./usr/share/doc/fetch-version-manager/INSTALL.md | sed -n '1,110p'; ls -lh dist/fetch-version-manager_2.4.6_all.deb`
 >
 > </details>
@@ -2108,7 +2110,7 @@ sudo apt install /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-ver
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `pkexec apt-get install --yes /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.6_all.deb`
+> - Ran `pkexec apt-get install --yes ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.6_all.deb`
 >
 > </details>
 >
@@ -2178,7 +2180,7 @@ sudo apt install ./fetch-version-manager_2.4.6_all.deb
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; desktop-file-validate data/fetch-version-manager.desktop; git -C /home/qm/catkin_ws diff --check -- package/fetch-version-manager`
+> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; desktop-file-validate data/fetch-version-manager.desktop; git -C ~/catkin_ws diff --check -- package/fetch-version-manager`
 >
 > </details>
 >
@@ -2187,7 +2189,7 @@ sudo apt install ./fetch-version-manager_2.4.6_all.deb
 > <details><summary>Ran 2 commands</summary>
 >
 > - Ran `sh build_deb.sh; dpkg-deb --field dist/fetch-version-manager_2.4.7_all.deb Package Version Depends; dpkg-deb --fsys-tarfile dist/fetch-version-manager_2.4.7_all.deb | tar -xOf - ./usr/lib/fetch-version-manager/fetch_version_manager.py | rg -n 'def delete_version|删除所选版本|确定删除版本|destructive-action'; dpkg-deb --fsys-tarfile dist/fetch-version-manager_2.4.7_all.deb | tar -xOf - ./usr/share/applications/fetch-version-manager.desktop | rg -n 'Comment='; ls -lh dist/fetch-version-manager_2.4.7_all.deb`
-> - Ran `pkexec apt-get install --yes /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.7_all.deb`
+> - Ran `pkexec apt-get install --yes ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.7_all.deb`
 >
 > </details>
 >
@@ -2244,7 +2246,7 @@ sudo apt install ./fetch-version-manager_2.4.6_all.deb
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; desktop-file-validate data/fetch-version-manager.desktop; git -C /home/qm/catkin_ws diff --check -- package/fetch-version-manager`
+> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; desktop-file-validate data/fetch-version-manager.desktop; git -C ~/catkin_ws diff --check -- package/fetch-version-manager`
 >
 > </details>
 >
@@ -2252,7 +2254,7 @@ sudo apt install ./fetch-version-manager_2.4.6_all.deb
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); [(lambda r: print(path, m.format_storage_size(r.storage_size()), r.run(["rev-parse", "--absolute-git-dir"]).strip()))(m.GitRepository(Path(path))) for path in ("/home/qm/catkin_ws", "/home/qm/temp/22/p7_ws")]'; du -sh /home/qm/catkin_ws/.git /home/qm/temp/22/p7_ws/.git`
+> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); [(lambda r: print(path, m.format_storage_size(r.storage_size()), r.run(["rev-parse", "--absolute-git-dir"]).strip()))(m.GitRepository(Path(path))) for path in ("~/catkin_ws", "~/temp/22/p7_ws")]'; du -sh ~/catkin_ws/.git ~/temp/22/p7_ws/.git`
 >
 > </details>
 >
@@ -2268,7 +2270,7 @@ sudo apt install ./fetch-version-manager_2.4.6_all.deb
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `pkexec apt-get install --yes /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.8_all.deb`
+> - Ran `pkexec apt-get install --yes ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.8_all.deb`
 >
 > </details>
 >
@@ -2295,18 +2297,18 @@ sudo apt install ./fetch-version-manager_2.4.6_all.deb
 
 安装包：[fetch-version-manager_2.4.8_all.deb](./package/fetch-version-manager/dist/fetch-version-manager_2.4.8_all.deb)
 
-> 根据当前最新软件版本，完善生成/home/qm/catkin\_ws/工作空间的版本管理
+> 根据当前最新软件版本，完善生成~/catkin\_ws/工作空间的版本管理
 
 <details><summary>13 previous messages</summary>
 
-> 我先核对 `/home/qm/catkin_ws` 当前的分支、版本标签、已封装范围、CHANGELOG 和未提交修改，确认哪些内容已经纳入版本管理。这个工作空间此前处于历史版本状态，我会先做只读检查，避免覆盖现有修改。
+> 我先核对 `~/catkin_ws` 当前的分支、版本标签、已封装范围、CHANGELOG 和未提交修改，确认哪些内容已经纳入版本管理。这个工作空间此前处于历史版本状态，我会先做只读检查，避免覆盖现有修改。
 >
 > <details><summary>Ran 4 commands</summary>
 >
 > - Ran `find .fetch-version-manager -maxdepth 3 -type f -printf '%P\t%k KB\n' 2>/dev/null | sort; sed -n '1,260p' .fetch-version-manager/CHANGELOG.rst 2>/dev/null; sed -n '1,260p' CHANGELOG.rst`
 > - Ran `git status --short --branch; git branch --all --verbose --no-abbrev; git tag --sort=version:refname; git log --all --decorate --oneline --date=short --pretty='%h %ad %d %s' -n 30`
 > - Ran `for f in .fetch-version-manager/manifests/*.txt; do [ -e "$f" ] || continue; wc -l "$f"; done; git diff --stat; git diff --cached --stat; du -sh .git package/fetch-version-manager 2>/dev/null; find package/fetch-version-manager -maxdepth 2 -type f -printf '%P\n' | sort | sed -n '1,240p'`
-> - Ran `sed -n '1,180p' /home/qm/.config/fetch-version-manager/settings.ini 2>/dev/null; dpkg-query -W -f='${Status}\n${Version}\n' fetch-version-manager 2>/dev/null || true; ps -eo pid,args | rg '[p]ython3 /usr/lib/fetch-version-manager/fetch_version_manager.py|[/]usr/bin/fetch-version-manager' || true`
+> - Ran `sed -n '1,180p' ~/.config/fetch-version-manager/settings.ini 2>/dev/null; dpkg-query -W -f='${Status}\n${Version}\n' fetch-version-manager 2>/dev/null || true; ps -eo pid,args | rg '[p]ython3 /usr/lib/fetch-version-manager/fetch_version_manager.py|[/]usr/bin/fetch-version-manager' || true`
 >
 > </details>
 >
@@ -2350,12 +2352,12 @@ sudo apt install ./fetch-version-manager_2.4.6_all.deb
 >
 > </details>
 >
-> 工作区已安全切到基于 `v0.0.8` 的 `main`，当前状态干净；旧的 `v0.0.6` 现场保存在具名 stash 中，没有丢失。接下来把版本管理器的默认工作空间从 `p7_ws` 改为 `/home/qm/catkin_ws`，然后用最新版后端核对版本列表、下一个版本号和空间统计。
+> 工作区已安全切到基于 `v0.0.8` 的 `main`，当前状态干净；旧的 `v0.0.6` 现场保存在具名 stash 中，没有丢失。接下来把版本管理器的默认工作空间从 `p7_ws` 改为 `~/catkin_ws`，然后用最新版后端核对版本列表、下一个版本号和空间统计。
 >
 > <details><summary>Edited a file, ran a command</summary>
 >
 > - Wrote `~/.config/fetch-version-manager/settings.ini` (+1 -2)
-> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("/home/qm/catkin_ws")); print("branch:", r.current_branch()); print("versions:", ", ".join(tag for tag in r.tags() if m.VERSION_PATTERN.match(tag))); print("history entries:", len(r.history())); print("next version:", r.next_version()); print("status entries:", len(r.status())); print("storage:", m.format_storage_size(r.storage_size())); print("manifest v0.0.8:", "legacy full snapshot" if r.manifest("v0.0.8") is None else "managed manifest")'; sed -n '1,40p' /home/qm/.config/fetch-version-manager/settings.ini; git status --short --branch; git stash list --date=local | sed -n '1,5p'; dpkg-query -W -f='${Version}\n' fetch-version-manager; ps -eo pid,args | rg '[p]ython3 /usr/lib/fetch-version-manager/fetch_version_manager.py|[/]usr/bin/fetch-version-manager' || true`
+> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("~/catkin_ws")); print("branch:", r.current_branch()); print("versions:", ", ".join(tag for tag in r.tags() if m.VERSION_PATTERN.match(tag))); print("history entries:", len(r.history())); print("next version:", r.next_version()); print("status entries:", len(r.status())); print("storage:", m.format_storage_size(r.storage_size())); print("manifest v0.0.8:", "legacy full snapshot" if r.manifest("v0.0.8") is None else "managed manifest")'; sed -n '1,40p' ~/.config/fetch-version-manager/settings.ini; git status --short --branch; git stash list --date=local | sed -n '1,5p'; dpkg-query -W -f='${Version}\n' fetch-version-manager; ps -eo pid,args | rg '[p]ython3 /usr/lib/fetch-version-manager/fetch_version_manager.py|[/]usr/bin/fetch-version-manager' || true`
 >
 > </details>
 </details>
@@ -2368,7 +2370,7 @@ sudo apt install ./fetch-version-manager_2.4.6_all.deb
 - 下一个版本号：`v0.0.9`
 - 当前工作区：干净，无待保存修改
 - 版本存储空间：`75.4 MB`
-- 默认工作空间已改为 `/home/qm/catkin_ws`
+- 默认工作空间已改为 `~/catkin_ws`
 
 原来基于 `v0.0.6` 的现场已安全保存在：
 
@@ -2386,7 +2388,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Explored a search, ran 3 commands</summary>
 >
-> - Ran `find /home/qm/temp -maxdepth 4 -type d -name 'p7_ws*' -printf '%p\n' 2>/dev/null | sort; find /home/qm/temp -maxdepth 4 -type f -name 'p7_ws*.zip' -printf '%p\n' 2>/dev/null | sort -V | sed -n '1,240p'`
+> - Ran `find ~/temp -maxdepth 4 -type d -name 'p7_ws*' -printf '%p\n' 2>/dev/null | sort; find ~/temp -maxdepth 4 -type f -name 'p7_ws*.zip' -printf '%p\n' 2>/dev/null | sort -V | sed -n '1,240p'`
 >
 > <details><summary>Explored a search</summary>
 >
@@ -2394,18 +2396,18 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > </details>
 >
-> - Ran `git -C /home/qm/temp/22/p7_ws status --short --branch 2>/dev/null || true; git -C /home/qm/temp/22/p7_ws tag --sort=version:refname 2>/dev/null || true; git -C /home/qm/temp/22/p7_ws log --all --decorate --oneline -n 20 2>/dev/null || true; sed -n '1,180p' /home/qm/temp/22/p7_ws/.git/info/exclude 2>/dev/null`
+> - Ran `git -C ~/temp/22/p7_ws status --short --branch 2>/dev/null || true; git -C ~/temp/22/p7_ws tag --sort=version:refname 2>/dev/null || true; git -C ~/temp/22/p7_ws log --all --decorate --oneline -n 20 2>/dev/null || true; sed -n '1,180p' ~/temp/22/p7_ws/.git/info/exclude 2>/dev/null`
 >
-> - Ran `find /home/qm -type f \( -name 'p7_ws_1.7.8.5.zip' -o -name 'p7_ws_1.7.8.6*.zip' -o -name 'p7_ws_1.7.8.7*.zip' -o -name 'p7_ws_1.7.8.8*.zip' -o -name 'p7_ws_1.7.8.9*.zip' \) -printf '%p\t%s bytes\n' 2>/dev/null | sort -V`
+> - Ran `find ~ -type f \( -name 'p7_ws_1.7.8.5.zip' -o -name 'p7_ws_1.7.8.6*.zip' -o -name 'p7_ws_1.7.8.7*.zip' -o -name 'p7_ws_1.7.8.8*.zip' -o -name 'p7_ws_1.7.8.9*.zip' \) -printf '%p\t%s bytes\n' 2>/dev/null | sort -V`
 >
 > </details>
 >
-> 已找到完整序列，共 12 个版本：`1.7.8.5`、`.6`、`.7`、`.8`、`.9`、`.9.1` 至 `.9.7`，主副本位于 `/home/qm/p7_ws`，并且另有重复备份。下一步检查压缩包是否都包含同一个工作空间根目录、是否带构建目录或现有 Git 数据，并读取各版本 CHANGELOG 作为提交说明。
+> 已找到完整序列，共 12 个版本：`1.7.8.5`、`.6`、`.7`、`.8`、`.9`、`.9.1` 至 `.9.7`，主副本位于 `~/p7_ws`，并且另有重复备份。下一步检查压缩包是否都包含同一个工作空间根目录、是否带构建目录或现有 Git 数据，并读取各版本 CHANGELOG 作为提交说明。
 >
 > <details><summary>Explored 2 lists, ran 4 commands</summary>
 >
 > - Ran `set -eu
-> for archive in $(find /home/qm/p7_ws -maxdepth 1 -type f -name 'p7_ws_*.zip' | sort -V); do
+> for archive in $(find ~/p7_ws -maxdepth 1 -type f -name 'p7_ws_*.zip' | sort -V); do
 >   name=$(basename "$archive")
 >   count=$(unzip -Z1 "$archive" | wc -l)
 >   roots=$(unzip -Z1 "$archive" | awk -F/ 'NF {print $1}' | sort -u | paste -sd, -)
@@ -2415,9 +2417,9 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >   printf '%s\tfiles=%s\troots=%s\tunsafe=%s\tgit=%s\tgenerated=%s\n' "$name" "$count" "$roots" "$unsafe" "$git_entries" "$generated"
 > done`
 >
-> - Ran `for archive in $(find /home/qm/p7_ws -maxdepth 1 -type f -name 'p7_ws_*.zip' | sort -V); do printf '%s\t' "$(basename "$archive")"; zipinfo -t "$archive" | tail -n 1; done`
+> - Ran `for archive in $(find ~/p7_ws -maxdepth 1 -type f -name 'p7_ws_*.zip' | sort -V); do printf '%s\t' "$(basename "$archive")"; zipinfo -t "$archive" | tail -n 1; done`
 >
-> - Ran `for archive in $(find /home/qm/p7_ws -maxdepth 1 -type f -name 'p7_ws_*.zip' | sort -V); do printf '\n===== %s =====\n' "$(basename "$archive")"; unzip -p "$archive" README.md | sed -n '1,100p'; done`
+> - Ran `for archive in $(find ~/p7_ws -maxdepth 1 -type f -name 'p7_ws_*.zip' | sort -V); do printf '\n===== %s =====\n' "$(basename "$archive")"; unzip -p "$archive" README.md | sed -n '1,100p'; done`
 >
 > <details><summary>Explored 2 lists</summary>
 >
@@ -2426,21 +2428,21 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > </details>
 >
-> - Ran `sha256sum /home/qm/p7_ws/p7_ws_*.zip /home/qm/temp/1-p7/p7_ws_*.zip | sort -k2 -V`
+> - Ran `sha256sum ~/p7_ws/p7_ws_*.zip ~/temp/1-p7/p7_ws_*.zip | sort -k2 -V`
 >
 > </details>
 >
-> 这些 ZIP 都是安全的扁平工作空间快照，只包含 `README.md`、`src/`，早期版本另有 `.vscode/`，不含 `.git`、`build` 或 `devel`。我会把历史导入到实际目录 `/home/qm/p7_ws`，但不覆盖它当前的工作文件：先在临时工作树中按版本顺序生成增量 Git 提交和标签，再把 Git 历史接入现有目录；当前目录相对 `1.7.8.9.7` 的后续修改会作为未保存修改保留。
+> 这些 ZIP 都是安全的扁平工作空间快照，只包含 `README.md`、`src/`，早期版本另有 `.vscode/`，不含 `.git`、`build` 或 `devel`。我会把历史导入到实际目录 `~/p7_ws`，但不覆盖它当前的工作文件：先在临时工作树中按版本顺序生成增量 Git 提交和标签，再把 Git 历史接入现有目录；当前目录相对 `1.7.8.9.7` 的后续修改会作为未保存修改保留。
 >
 > <details><summary>Explored 2 files, 2 searches, ran 4 commands</summary>
 >
-> - Ran `stat -c '%n\t%y' /home/qm/p7_ws/p7_ws_*.zip | sort -V; test -e /home/qm/p7_ws/.git && echo HAS_GIT || echo NO_GIT; sed -n '1,260p' /home/qm/p7_ws/src/CHANGELOG.rst 2>/dev/null; sed -n '1,160p' /home/qm/p7_ws/README\ 2.md 2>/dev/null`
+> - Ran `stat -c '%n\t%y' ~/p7_ws/p7_ws_*.zip | sort -V; test -e ~/p7_ws/.git && echo HAS_GIT || echo NO_GIT; sed -n '1,260p' ~/p7_ws/src/CHANGELOG.rst 2>/dev/null; sed -n '1,160p' ~/p7_ws/README\ 2.md 2>/dev/null`
 >
-> - Ran `git config --global user.name 2>/dev/null || true; git config --global user.email 2>/dev/null || true; du -sh /home/qm/p7_ws/src /home/qm/p7_ws/.vscode 2>/dev/null; find /home/qm/p7_ws -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | sort`
+> - Ran `git config --global user.name 2>/dev/null || true; git config --global user.email 2>/dev/null || true; du -sh ~/p7_ws/src ~/p7_ws/.vscode 2>/dev/null; find ~/p7_ws -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | sort`
 >
-> - Ran `for archive in $(find /home/qm/p7_ws -maxdepth 1 -type f -name 'p7_ws_*.zip' | sort -V); do printf '\n===== %s =====\n' "$(basename "$archive")"; unzip -p "$archive" src/CHANGELOG.rst 2>/dev/null | sed -n '1,100p'; done`
+> - Ran `for archive in $(find ~/p7_ws -maxdepth 1 -type f -name 'p7_ws_*.zip' | sort -V); do printf '\n===== %s =====\n' "$(basename "$archive")"; unzip -p "$archive" src/CHANGELOG.rst 2>/dev/null | sed -n '1,100p'; done`
 >
-> - Ran `for archive in $(find /home/qm/p7_ws -maxdepth 1 -type f -name 'p7_ws_*.zip' | sort -V); do printf '%s\t' "$(basename "$archive")"; zipinfo -l "$archive" src/CMakeLists.txt 2>/dev/null | tail -n 1; done; readlink /home/qm/p7_ws/src/CMakeLists.txt || true`
+> - Ran `for archive in $(find ~/p7_ws -maxdepth 1 -type f -name 'p7_ws_*.zip' | sort -V); do printf '%s\t' "$(basename "$archive")"; zipinfo -l "$archive" src/CMakeLists.txt 2>/dev/null | tail -n 1; done; readlink ~/p7_ws/src/CMakeLists.txt || true`
 >
 > <details><summary>Explored 2 files, 2 searches</summary>
 >
@@ -2463,7 +2465,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 > - Wrote `./package/fetch-version-manager/debian/control` (+1 -1)
 > - Wrote `./package/fetch-version-manager/src/fetch_version_manager.py` (+8 -7)
 > - Wrote `./package/fetch-version-manager/tests/test_backend.py` (+9 -0)
-> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; desktop-file-validate data/fetch-version-manager.desktop; git -C /home/qm/catkin_ws diff --check -- package/fetch-version-manager`
+> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; desktop-file-validate data/fetch-version-manager.desktop; git -C ~/catkin_ws diff --check -- package/fetch-version-manager`
 >
 > </details>
 >
@@ -2483,22 +2485,22 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `pkexec apt-get install --yes /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.9_all.deb`
+> - Ran `pkexec apt-get install --yes ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.9_all.deb`
 >
 > </details>
 >
-> 导入将按 12 个 ZIP 的顺序生成 12 个增量提交和同名标签，前三个版本使用现有 CHANGELOG 说明，后续版本保留压缩包名称作为说明。Git 仓库会先在 `/home/qm/temp` 完整构建并通过 `git fsck`，验证成功后才接入 `/home/qm/p7_ws/.git`；现有 `/home/qm/p7_ws` 文件、ZIP、`build/devel` 和 `lane_editor` 均不会被覆盖或删除。
+> 导入将按 12 个 ZIP 的顺序生成 12 个增量提交和同名标签，前三个版本使用现有 CHANGELOG 说明，后续版本保留压缩包名称作为说明。Git 仓库会先在 `~/temp` 完整构建并通过 `git fsck`，验证成功后才接入 `~/p7_ws/.git`；现有 `~/p7_ws` 文件、ZIP、`build/devel` 和 `lane_editor` 均不会被覆盖或删除。
 >
 > 刚才的导入命令在执行前被安全策略拒绝，因为临时目录清理使用了递归删除；没有任何文件被改动。我会改用 `git rm` 仅清理临时仓库中上一版本已跟踪的三个归档根目录，并把最终临时工作树移入系统回收站，导入结果不变且可恢复。
 >
 > <details><summary>Ran a command</summary>
 >
 > - Ran `set -eu
-> archive_dir=/home/qm/p7_ws
-> target_workspace=/home/qm/p7_ws
-> import_stage=$(mktemp -d /home/qm/temp/p7-version-import.XXXXXX)
+> archive_dir=~/p7_ws
+> target_workspace=~/p7_ws
+> import_stage=$(mktemp -d ~/temp/p7-version-import.XXXXXX)
 > case "$import_stage" in
->   /home/qm/temp/p7-version-import.*) ;;
+>   ~/temp/p7-version-import.*) ;;
 >   *) exit 1 ;;
 > esac
 >
@@ -2552,18 +2554,18 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > </details>
 >
-> 导入在 `1.7.8.9.1` 解压阶段停止，尚未接入目标工作空间。原因是上一 ZIP 把 `src/core_planning/frenet_planner` 保存成了不可写目录，下一版本无法覆盖；前五个提交只存在于临时仓库。接下来我会把这个未完成的临时目录移入回收站，并在每轮解压前修正临时工作树的用户写权限后从头重建。原 ZIP 和 `/home/qm/p7_ws` 当前文件仍未改动。
+> 导入在 `1.7.8.9.1` 解压阶段停止，尚未接入目标工作空间。原因是上一 ZIP 把 `src/core_planning/frenet_planner` 保存成了不可写目录，下一版本无法覆盖；前五个提交只存在于临时仓库。接下来我会把这个未完成的临时目录移入回收站，并在每轮解压前修正临时工作树的用户写权限后从头重建。原 ZIP 和 `~/p7_ws` 当前文件仍未改动。
 >
 > <details><summary>Ran 3 commands</summary>
 >
-> - Ran `test ! -e /home/qm/p7_ws/.git; ls -ld /home/qm/temp/p7-version-import.eGtCZ7 /home/qm/temp/p7-version-import.eGtCZ7/src/core_planning/frenet_planner; git -C /home/qm/temp/p7-version-import.eGtCZ7 tag --sort=version:refname; git -C /home/qm/temp/p7-version-import.eGtCZ7 status --short | sed -n '1,80p'; zipinfo -l /home/qm/p7_ws/p7_ws_1.7.8.9.zip src/core_planning/frenet_planner/ | tail -n 1`
-> - Ran `gio trash /home/qm/temp/p7-version-import.eGtCZ7; test ! -e /home/qm/temp/p7-version-import.eGtCZ7; test ! -e /home/qm/p7_ws/.git`
+> - Ran `test ! -e ~/p7_ws/.git; ls -ld ~/temp/p7-version-import.eGtCZ7 ~/temp/p7-version-import.eGtCZ7/src/core_planning/frenet_planner; git -C ~/temp/p7-version-import.eGtCZ7 tag --sort=version:refname; git -C ~/temp/p7-version-import.eGtCZ7 status --short | sed -n '1,80p'; zipinfo -l ~/p7_ws/p7_ws_1.7.8.9.zip src/core_planning/frenet_planner/ | tail -n 1`
+> - Ran `gio trash ~/temp/p7-version-import.eGtCZ7; test ! -e ~/temp/p7-version-import.eGtCZ7; test ! -e ~/p7_ws/.git`
 > - Ran `set -eu
-> archive_dir=/home/qm/p7_ws
-> target_workspace=/home/qm/p7_ws
-> import_stage=$(mktemp -d /home/qm/temp/p7-version-import.XXXXXX)
+> archive_dir=~/p7_ws
+> target_workspace=~/p7_ws
+> import_stage=$(mktemp -d ~/temp/p7-version-import.XXXXXX)
 > case "$import_stage" in
->   /home/qm/temp/p7-version-import.*) ;;
+>   ~/temp/p7-version-import.*) ;;
 >   *) exit 1 ;;
 > esac
 >
@@ -2619,19 +2621,19 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > </details>
 >
-> 12 个版本已全部导入并通过 Git 完整性检查，仓库已接入 `/home/qm/p7_ws/.git`。现在补充本地忽略规则，让 ZIP 备份、`build/devel`、`lane_editor` 和缓存不出现在“当前修改”中；这些文件仍保留原位置，不会被删除。
+> 12 个版本已全部导入并通过 Git 完整性检查，仓库已接入 `~/p7_ws/.git`。现在补充本地忽略规则，让 ZIP 备份、`build/devel`、`lane_editor` 和缓存不出现在“当前修改”中；这些文件仍保留原位置，不会被删除。
 >
 > <details><summary>Edited a file, ran 4 commands</summary>
 >
 > - Wrote `~/p7_ws/.git/info/exclude` (+11 -0)
 > - Ran `git status --short --ignored | sed -n '1,260p'; find . -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | sort`
 > - Ran `git diff --stat; git diff --summary | sed -n '1,240p'; git ls-files | wc -l; du -sh .git; readlink src/CMakeLists.txt; git show v1.7.8.9.7:src/CMakeLists.txt`
-> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/home/qm/catkin_ws/package/fetch-version-manager/src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("/home/qm/p7_ws")); print("branch:", r.current_branch()); print("history:", len(r.history())); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("versions:", ", ".join(r.tags()))'; dpkg-query -W -f='${Version}\n' fetch-version-manager`
+> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("~/catkin_ws/package/fetch-version-manager/src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("~/p7_ws")); print("branch:", r.current_branch()); print("history:", len(r.history())); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("versions:", ", ".join(r.tags()))'; dpkg-query -W -f='${Version}\n' fetch-version-manager`
 > - Ran `git status --short --branch; git tag --sort=version:refname; git log --decorate --oneline --date=short --pretty='%h %ad %d %s' -n 20; git fsck --strict`
 >
 > </details>
 >
-> 仓库验证通过：12 个标签完整，Git 增量存储仅 `11.5 MB`，而原 ZIP 合计约 `120 MB`；当前 `/home/qm/p7_ws` 相比最后版本的规划代码修改已作为未保存工作区修改保留。接下来再排除未跟踪的嵌套 ZIP 备份，并把软件默认打开路径切换到 `/home/qm/p7_ws`。
+> 仓库验证通过：12 个标签完整，Git 增量存储仅 `11.5 MB`，而原 ZIP 合计约 `120 MB`；当前 `~/p7_ws` 相比最后版本的规划代码修改已作为未保存工作区修改保留。接下来再排除未跟踪的嵌套 ZIP 备份，并把软件默认打开路径切换到 `~/p7_ws`。
 >
 > <details><summary>Edited 2 files, ran a command</summary>
 >
@@ -2643,7 +2645,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 > import zipfile
 > from pathlib import Path
 >
-> root = Path('/home/qm/p7_ws')
+> root = Path('~/p7_ws')
 > for archive_path in sorted(root.glob('p7_ws_*.zip'), key=lambda path: tuple(int(x) for x in path.stem.removeprefix('p7_ws_').split('.'))):
 >     version = archive_path.stem.removeprefix('p7_ws_')
 >     exported = subprocess.run(
@@ -2664,7 +2666,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > git status --short --branch
 > git tag --sort=version:refname
-> sed -n '1,80p' /home/qm/.config/fetch-version-manager/settings.ini`
+> sed -n '1,80p' ~/.config/fetch-version-manager/settings.ini`
 >
 > </details>
 >
@@ -2678,7 +2680,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 > import zipfile
 > from pathlib import Path
 >
-> root = Path('/home/qm/p7_ws')
+> root = Path('~/p7_ws')
 >
 > def version_from(path):
 >     return path.stem[len('p7_ws_'):]
@@ -2703,19 +2705,19 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > </details>
 >
-> 严格校验发现首个 ZIP 有 3 个被归档内 `.gitignore` 排除的文件（两个 `.gitkeep` 和一个 `package.xml`），初次导入没有把它们加入 Git。现有仓库可用但还不够精确；我会从头重建，使用强制加入来保证每个标签与对应 ZIP 的文件集合和内容逐字节一致。新仓库验证通过后再替换，当前这份不完整 `.git` 会移到 `/home/qm/temp` 作为可恢复备份。
+> 严格校验发现首个 ZIP 有 3 个被归档内 `.gitignore` 排除的文件（两个 `.gitkeep` 和一个 `package.xml`），初次导入没有把它们加入 Git。现有仓库可用但还不够精确；我会从头重建，使用强制加入来保证每个标签与对应 ZIP 的文件集合和内容逐字节一致。新仓库验证通过后再替换，当前这份不完整 `.git` 会移到 `~/temp` 作为可恢复备份。
 >
 > <details><summary>Ran a command</summary>
 >
 > - Ran `set -eu
-> archive_dir=/home/qm/p7_ws
-> target_workspace=/home/qm/p7_ws
-> incomplete_backup=/home/qm/temp/p7_ws-git-incomplete-import
+> archive_dir=~/p7_ws
+> target_workspace=~/p7_ws
+> incomplete_backup=~/temp/p7_ws-git-incomplete-import
 > [ -e "$target_workspace/.git" ]
 > [ ! -e "$incomplete_backup" ]
-> import_stage=$(mktemp -d /home/qm/temp/p7-version-import.XXXXXX)
+> import_stage=$(mktemp -d ~/temp/p7-version-import.XXXXXX)
 > case "$import_stage" in
->   /home/qm/temp/p7-version-import.*) ;;
+>   ~/temp/p7-version-import.*) ;;
 >   *) exit 1 ;;
 > esac
 >
@@ -2801,7 +2803,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 > <details><summary>Edited a file, ran a command</summary>
 >
 > - Wrote `~/p7_ws/.git/info/exclude` (+12 -0)
-> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/home/qm/catkin_ws/package/fetch-version-manager/src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("/home/qm/p7_ws")); print("branch:", r.current_branch()); print("history:", len(r.history())); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status())); print(r.changelog_text(), end="")'; git fsck --strict; git status --short --branch; du -sh .git; dpkg-query -W -f='installed app: ${Version}\n' fetch-version-manager`
+> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("~/catkin_ws/package/fetch-version-manager/src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("~/p7_ws")); print("branch:", r.current_branch()); print("history:", len(r.history())); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status())); print(r.changelog_text(), end="")'; git fsck --strict; git status --short --branch; du -sh .git; dpkg-query -W -f='installed app: ${Version}\n' fetch-version-manager`
 >
 > </details>
 >
@@ -2809,7 +2811,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `pkexec apt-get install --yes /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.9_all.deb`
+> - Ran `pkexec apt-get install --yes ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.9_all.deb`
 >
 > </details>
 >
@@ -2817,12 +2819,12 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `gio trash /home/qm/temp/p7_ws-git-incomplete-import; test ! -e /home/qm/temp/p7_ws-git-incomplete-import; find /home/qm/temp -maxdepth 1 -type d -name 'p7-version-import.*' -print; dpkg-query -W -f='${Status}\n${Version}\n' fetch-version-manager; PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("/home/qm/p7_ws")); print("branch:", r.current_branch()); print("history:", len(r.history())); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status())); print("latest:", r.history()[0].tags[0])'; sed -n '1,20p' /home/qm/.config/fetch-version-manager/settings.ini; git -C /home/qm/p7_ws fsck --strict; sha256sum /home/qm/p7_ws/p7_ws_*.zip | wc -l; ls -lh package/fetch-version-manager/dist/fetch-version-manager_2.4.9_all.deb`
+> - Ran `gio trash ~/temp/p7_ws-git-incomplete-import; test ! -e ~/temp/p7_ws-git-incomplete-import; find ~/temp -maxdepth 1 -type d -name 'p7-version-import.*' -print; dpkg-query -W -f='${Status}\n${Version}\n' fetch-version-manager; PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("~/p7_ws")); print("branch:", r.current_branch()); print("history:", len(r.history())); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status())); print("latest:", r.history()[0].tags[0])'; sed -n '1,20p' ~/.config/fetch-version-manager/settings.ini; git -C ~/p7_ws fsck --strict; sha256sum ~/p7_ws/p7_ws_*.zip | wc -l; ls -lh package/fetch-version-manager/dist/fetch-version-manager_2.4.9_all.deb`
 >
 > </details>
 </details>
 
-已完成 `/home/qm/p7_ws` 的版本管理导入：
+已完成 `~/p7_ws` 的版本管理导入：
 
 - 导入 12 个 ZIP：`v1.7.8.5` 至 `v1.7.8.9.7`
 - 每个标签均与对应 ZIP 逐文件、逐字节一致
@@ -2830,7 +2832,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 - Git 增量历史占用 `11.6 MB`
 - 当前后续开发保留为 33 项未保存修改
 - 下一个默认版本号为 `v1.7.8.9.8`
-- 软件默认工作空间已切换为 `/home/qm/p7_ws`
+- 软件默认工作空间已切换为 `~/p7_ws`
 
 版本管理器已升级到 `2.4.9`，支持任意多段版本号。现在打开软件即可查看、比较、下载或删除这 12 个版本。
 
@@ -2846,19 +2848,19 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran 3 commands</summary>
 >
-> - Ran `dpkg-query -W -f='${Status}\n${Version}\n' fetch-version-manager 2>/dev/null || true; sed -n '1,40p' /home/qm/.config/fetch-version-manager/settings.ini 2>/dev/null; sed -n '1,40p' /home/qmd/.config/fetch-version-manager/settings.ini 2>/dev/null`
-> - Ran `find /home/qm /home/qmd -maxdepth 5 -type d -name 'm9_ws*' -printf '%p\n' 2>/dev/null | sort; find /home/qm /home/qmd -maxdepth 4 -type f -name 'm9_ws*.zip' -printf '%p\n' 2>/dev/null | sort -V`
-> - Ran `find /home/qm /home/qmd -type f -name 'm9_ws_*.zip' -printf '%p\t%s bytes\n' 2>/dev/null | sort -V`
+> - Ran `dpkg-query -W -f='${Status}\n${Version}\n' fetch-version-manager 2>/dev/null || true; sed -n '1,40p' ~/.config/fetch-version-manager/settings.ini 2>/dev/null; sed -n '1,40p' ~d/.config/fetch-version-manager/settings.ini 2>/dev/null`
+> - Ran `find ~ ~d -maxdepth 5 -type d -name 'm9_ws*' -printf '%p\n' 2>/dev/null | sort; find ~ ~d -maxdepth 4 -type f -name 'm9_ws*.zip' -printf '%p\n' 2>/dev/null | sort -V`
+> - Ran `find ~ ~d -type f -name 'm9_ws_*.zip' -printf '%p\t%s bytes\n' 2>/dev/null | sort -V`
 >
 > </details>
 >
-> 已找到 `/home/qm/m9_ws` 中从 `1.1.4.0` 到 `1.1.9` 的完整长序列，数量较多，并包含 `1.1.5.0_1` 这类下划线后缀版本；导入标签会规范化为 `v1.1.5.0.1`，避免软件无法识别。现在检查 `/home/qm/m9_ws` 与 `/home/qm/git_ws/m9_ws` 的现有 Git 关系，并统计每个 ZIP 中将被移除的 `src/**/*.zip`。
+> 已找到 `~/m9_ws` 中从 `1.1.4.0` 到 `1.1.9` 的完整长序列，数量较多，并包含 `1.1.5.0_1` 这类下划线后缀版本；导入标签会规范化为 `v1.1.5.0.1`，避免软件无法识别。现在检查 `~/m9_ws` 与 `~/git_ws/m9_ws` 的现有 Git 关系，并统计每个 ZIP 中将被移除的 `src/**/*.zip`。
 >
 > <details><summary>Ran 4 commands</summary>
 >
 > - Ran `python3 - <<'PY'
 > from pathlib import Path
-> files = sorted(Path('/home/qm/m9_ws').glob('m9_ws_*.zip'), key=lambda p: [int(part) for part in p.stem[len('m9_ws_'):].replace('_', '.').split('.')])
+> files = sorted(Path('~/m9_ws').glob('m9_ws_*.zip'), key=lambda p: [int(part) for part in p.stem[len('m9_ws_'):].replace('_', '.').split('.')])
 > seen = {}
 > for path in files:
 >     version = path.stem[len('m9_ws_'):].replace('_', '.')
@@ -2867,11 +2869,11 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >     seen[version] = path.name
 > print('count', len(files), 'first', files[0].name, 'last', files[-1].name, 'unique tags', len(seen))
 > PY`
-> - Ran `for path in /home/qm/m9_ws /home/qm/git_ws/m9_ws /home/qm/m9_ws_1.1.4.1; do printf '%s\t' "$path"; if [ -e "$path/.git" ]; then ls -ld "$path/.git"; else echo NO_GIT; fi; du -sh "$path" 2>/dev/null; done; find /home/qm/m9_ws -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | sort | sed -n '1,180p'`
-> - Ran `for path in /home/qm/m9_ws /home/qm/git_ws/m9_ws /home/qm/m9_ws_1.1.4.1; do echo "$path"; git -C "$path" status --short --branch 2>&1 | sed -n '1,100p'; git -C "$path" remote -v 2>/dev/null | sed -n '1,20p'; git -C "$path" tag --sort=version:refname 2>/dev/null | tail -n 20; done`
+> - Ran `for path in ~/m9_ws ~/git_ws/m9_ws ~/m9_ws_1.1.4.1; do printf '%s\t' "$path"; if [ -e "$path/.git" ]; then ls -ld "$path/.git"; else echo NO_GIT; fi; du -sh "$path" 2>/dev/null; done; find ~/m9_ws -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | sort | sed -n '1,180p'`
+> - Ran `for path in ~/m9_ws ~/git_ws/m9_ws ~/m9_ws_1.1.4.1; do echo "$path"; git -C "$path" status --short --branch 2>&1 | sed -n '1,100p'; git -C "$path" remote -v 2>/dev/null | sed -n '1,20p'; git -C "$path" tag --sort=version:refname 2>/dev/null | tail -n 20; done`
 > - Ran `set -eu
 > count=0
-> for archive in $(find /home/qm/m9_ws -maxdepth 1 -type f -name 'm9_ws_*.zip' | sort -V); do
+> for archive in $(find ~/m9_ws -maxdepth 1 -type f -name 'm9_ws_*.zip' | sort -V); do
 >   count=$((count+1))
 >   name=$(basename "$archive")
 >   roots=$(unzip -Z1 "$archive" | awk -F/ 'NF {print $1}' | sort -u | paste -sd, -)
@@ -2883,7 +2885,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > </details>
 >
-> 序列确认共有 102 个版本，版本名规范化后无冲突；每个 ZIP 的 `src/` 中有 8 到 46 个嵌套 ZIP，导入时会从对应快照删除。`/home/qm/m9_ws/.git` 虽然存在，但不是有效仓库，我会先检查并保留它，再构建新的增量历史；远程仓库 `/home/qm/git_ws/m9_ws` 不会改动。
+> 序列确认共有 102 个版本，版本名规范化后无冲突；每个 ZIP 的 `src/` 中有 8 到 46 个嵌套 ZIP，导入时会从对应快照删除。`~/m9_ws/.git` 虽然存在，但不是有效仓库，我会先检查并保留它，再构建新的增量历史；远程仓库 `~/git_ws/m9_ws` 不会改动。
 >
 > <details><summary>Explored 3 lists, ran 3 commands</summary>
 >
@@ -2895,14 +2897,14 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > </details>
 >
-> - Ran `df -h /home/qm/m9_ws /home/qm/temp; du -sh /home/qm/m9_ws/src /home/qm/m9_ws/build /home/qm/m9_ws/devel /home/qm/m9_ws/lane_editor 2>/dev/null; find /home/qm/m9_ws/src -type f -iname '*.zip' -printf '%p\t%s\n' | sed -n '1,200p'`
+> - Ran `df -h ~/m9_ws ~/temp; du -sh ~/m9_ws/src ~/m9_ws/build ~/m9_ws/devel ~/m9_ws/lane_editor 2>/dev/null; find ~/m9_ws/src -type f -iname '*.zip' -printf '%p\t%s\n' | sed -n '1,200p'`
 >
-> - Ran `stat -c '%n\t%y' /home/qm/m9_ws/m9_ws_*.zip | sort -V | sed -n '1,140p'; sha256sum /home/qm/m9_ws/m9_ws_1.1.9.zip /home/qm/git_ws/m9_ws_1.1.9.zip`
+> - Ran `stat -c '%n\t%y' ~/m9_ws/m9_ws_*.zip | sort -V | sed -n '1,140p'; sha256sum ~/m9_ws/m9_ws_1.1.9.zip ~/git_ws/m9_ws_1.1.9.zip`
 >
 > - Ran `set -eu
 > total=0
 > instances=0
-> for archive in $(find /home/qm/m9_ws -maxdepth 1 -type f -name 'm9_ws_*.zip' | sort -V); do
+> for archive in $(find ~/m9_ws -maxdepth 1 -type f -name 'm9_ws_*.zip' | sort -V); do
 >   values=$(unzip -l "$archive" | awk 'BEGIN{IGNORECASE=1;n=0;s=0} $4 ~ /^src\/.*\.zip$/ {n++;s+=$1} END{print n, s}')
 >   n=${values%% *}
 >   s=${values##* }
@@ -2919,13 +2921,13 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran 3 commands</summary>
 >
-> - Ran `unzip -Z1 /home/qm/m9_ws/m9_ws_1.1.9.zip | awk 'BEGIN{IGNORECASE=1} /^src\/[^/]+\.zip$/ {print}'`
-> - Ran `for archive in /home/qm/m9_ws/m9_ws_1.1.4.0.zip /home/qm/m9_ws/m9_ws_1.1.4.8.5.zip /home/qm/m9_ws/m9_ws_1.1.9.zip; do echo "===== $(basename "$archive") ====="; unzip -Z1 "$archive" | awk 'BEGIN{IGNORECASE=1} /^src\/.*\.zip$/ {print}' | sed -n '1,160p'; done`
+> - Ran `unzip -Z1 ~/m9_ws/m9_ws_1.1.9.zip | awk 'BEGIN{IGNORECASE=1} /^src\/[^/]+\.zip$/ {print}'`
+> - Ran `for archive in ~/m9_ws/m9_ws_1.1.4.0.zip ~/m9_ws/m9_ws_1.1.4.8.5.zip ~/m9_ws/m9_ws_1.1.9.zip; do echo "===== $(basename "$archive") ====="; unzip -Z1 "$archive" | awk 'BEGIN{IGNORECASE=1} /^src\/.*\.zip$/ {print}' | sed -n '1,160p'; done`
 > - Ran `set -eu
 > direct_instances=0
 > recursive_instances=0
 > direct_bytes=0
-> for archive in $(find /home/qm/m9_ws -maxdepth 1 -type f -name 'm9_ws_*.zip' | sort -V); do
+> for archive in $(find ~/m9_ws -maxdepth 1 -type f -name 'm9_ws_*.zip' | sort -V); do
 >   values=$(unzip -l "$archive" | awk 'BEGIN{IGNORECASE=1;d=0;r=0;s=0} $4 ~ /^src\/.*\.zip$/ {r++} $4 ~ /^src\/[^/]+\.zip$/ {d++;s+=$1} END{print d, r, s}')
 >   d=$(printf '%s' "$values" | awk '{print $1}')
 >   rec=$(printf '%s' "$values" | awk '{print $2}')
@@ -2943,14 +2945,14 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran 2 commands</summary>
 >
-> - Ran `for archive in /home/qm/m9_ws/m9_ws_1.1.4.0.zip /home/qm/m9_ws/m9_ws_1.1.4.1.zip /home/qm/m9_ws/m9_ws_1.1.4.2.zip /home/qm/m9_ws/m9_ws_1.1.4.7.0.zip /home/qm/m9_ws/m9_ws_1.1.4.7.1.zip /home/qm/m9_ws/m9_ws_1.1.4.8.4.zip /home/qm/m9_ws/m9_ws_1.1.4.8.5.zip /home/qm/m9_ws/m9_ws_1.1.6.6.zip /home/qm/m9_ws/m9_ws_1.1.8.zip /home/qm/m9_ws/m9_ws_1.1.8.1.zip /home/qm/m9_ws/m9_ws_1.1.8.2.zip /home/qm/m9_ws/m9_ws_1.1.9.zip; do printf '%s\touter=' "$(basename "$archive")"; stat -c '%y' "$archive" | cut -d. -f1; printf '\tREADME='; zipinfo -T "$archive" README.md 2>/dev/null | tail -n 1 | awk '{print $7}'; done`
+> - Ran `for archive in ~/m9_ws/m9_ws_1.1.4.0.zip ~/m9_ws/m9_ws_1.1.4.1.zip ~/m9_ws/m9_ws_1.1.4.2.zip ~/m9_ws/m9_ws_1.1.4.7.0.zip ~/m9_ws/m9_ws_1.1.4.7.1.zip ~/m9_ws/m9_ws_1.1.4.8.4.zip ~/m9_ws/m9_ws_1.1.4.8.5.zip ~/m9_ws/m9_ws_1.1.6.6.zip ~/m9_ws/m9_ws_1.1.8.zip ~/m9_ws/m9_ws_1.1.8.1.zip ~/m9_ws/m9_ws_1.1.8.2.zip ~/m9_ws/m9_ws_1.1.9.zip; do printf '%s\touter=' "$(basename "$archive")"; stat -c '%y' "$archive" | cut -d. -f1; printf '\tREADME='; zipinfo -T "$archive" README.md 2>/dev/null | tail -n 1 | awk '{print $7}'; done`
 > - Ran `python3 - <<'PY'
 > from datetime import datetime
 > from pathlib import Path
 > from zipfile import ZipFile
 > samples = ['1.1.4.0','1.1.4.1','1.1.4.2','1.1.4.7.0','1.1.4.7.1','1.1.4.8.4','1.1.4.8.5','1.1.6.6','1.1.8','1.1.8.1','1.1.8.2','1.1.9']
 > for version in samples:
->     path = Path('/home/qm/m9_ws/m9_ws_{}.zip'.format(version))
+>     path = Path('~/m9_ws/m9_ws_{}.zip'.format(version))
 >     with ZipFile(path) as bundle:
 >         dates = sorted(datetime(*item.date_time) for item in bundle.infolist() if not item.is_dir() and item.date_time[0] <= 2026)
 >     print(path.name, 'latest_file=', dates[-1], 'p99=', dates[int(len(dates) * 0.99)])
@@ -2958,7 +2960,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > </details>
 >
-> 导入方案已按新范围固定：每个快照只删除直接位于根 `src/` 下的 `*.zip`，深层目录中的 ZIP 全部保留；原始外层 ZIP 也全部保留。新仓库会在临时目录完成 102 次提交、标签、完整性检查和过滤后内容校验，全部成功后才替换 `/home/qm/m9_ws` 中那个空的 `.git` 目录。
+> 导入方案已按新范围固定：每个快照只删除直接位于根 `src/` 下的 `*.zip`，深层目录中的 ZIP 全部保留；原始外层 ZIP 也全部保留。新仓库会在临时目录完成 102 次提交、标签、完整性检查和过滤后内容校验，全部成功后才替换 `~/m9_ws` 中那个空的 `.git` 目录。
 >
 > 导入正在正常进行，已完成前 18 个版本；目前只在 `1.1.4.6.1` 至 `.6.5` 中各移除了一个直接位于 `src/` 的 ZIP，深层 ZIP 均保留。目标工作空间尚未切换到新仓库。
 >
@@ -2966,7 +2968,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > 已完成到 `v1.1.6.6`，包括下划线版本已正确规范化为 `v1.1.5.0.1` 至 `.0.4`。Git 正在自动压缩重复对象，说明增量存储已开始合并相同文件。
 >
-> 102 个版本已全部生成，最后版本为 `v1.1.9`。现在处于仓库压缩和逐版本校验阶段，只有校验全部通过才会接入 `/home/qm/m9_ws`。
+> 102 个版本已全部生成，最后版本为 `v1.1.9`。现在处于仓库压缩和逐版本校验阶段，只有校验全部通过才会接入 `~/m9_ws`。
 >
 > 完整性检查报告的是被清理掉的顶层 ZIP 形成的“悬空对象”，不是提交损坏。它们没有被任何版本引用；校验完成后我会执行立即清理，确保这些已排除 ZIP 不占用最终 Git 空间。
 >
@@ -2974,7 +2976,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > 压缩进程仍在运行且没有报错。我继续等待其完成，不会在中途接入未验证仓库。
 >
-> 当前仍是 Git 对约百个快照执行对象打包，属于预期的 CPU/磁盘处理阶段。现有 `/home/qm/m9_ws/.git` 仍保持原来的空目录，工作文件没有变化。
+> 当前仍是 Git 对约百个快照执行对象打包，属于预期的 CPU/磁盘处理阶段。现有 `~/m9_ws/.git` 仍保持原来的空目录，工作文件没有变化。
 >
 > 处理继续正常进行，目前没有错误输出。完成后还会逐版本核对过滤后的文件清单、CRC、大小、符号链接和可执行属性。
 >
@@ -2993,15 +2995,15 @@ pre-v0.0.8-version-management-migration-2026-08-30
 > <details><summary>Ran a command</summary>
 >
 > - Ran `set -eu
-> archive_dir=/home/qm/m9_ws
-> target_workspace=/home/qm/m9_ws
-> empty_git_backup=/home/qm/temp/m9_ws-empty-git-before-import
+> archive_dir=~/m9_ws
+> target_workspace=~/m9_ws
+> empty_git_backup=~/temp/m9_ws-empty-git-before-import
 > [ -d "$target_workspace/.git" ]
 > [ ! -e "$target_workspace/.git/HEAD" ]
 > [ ! -e "$empty_git_backup" ]
-> import_stage=$(mktemp -d /home/qm/temp/m9-version-import.XXXXXX)
+> import_stage=$(mktemp -d ~/temp/m9-version-import.XXXXXX)
 > case "$import_stage" in
->   /home/qm/temp/m9-version-import.*) ;;
+>   ~/temp/m9-version-import.*) ;;
 >   *) exit 1 ;;
 > esac
 >
@@ -3096,7 +3098,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > Git GC 继续运行。该阶段没有交互需求，我会在出现校验结果或错误时立即报告。
 >
-> 102 个版本全部通过过滤后校验并已接入 `/home/qm/m9_ws/.git`。现在写入本地忽略规则，隐藏外层 ZIP、构建产物和编辑器代理缓存，同时把版本管理器默认工作空间切换到 `/home/qm/m9_ws`；不会忽略或删除深层 `src` 中保留的 ZIP。
+> 102 个版本全部通过过滤后校验并已接入 `~/m9_ws/.git`。现在写入本地忽略规则，隐藏外层 ZIP、构建产物和编辑器代理缓存，同时把版本管理器默认工作空间切换到 `~/m9_ws`；不会忽略或删除深层 `src` 中保留的 ZIP。
 >
 > <details><summary>Edited 2 files</summary>
 >
@@ -3131,13 +3133,13 @@ pre-v0.0.8-version-management-migration-2026-08-30
 > printf 'deep src zip entries in latest='; git ls-tree -r --name-only v1.1.9 | awk 'BEGIN{IGNORECASE=1;n=0} /^src\/.*\.zip$/ && $0 !~ /^src\/[^/]+\.zip$/{n++} END{print n}'
 > printf 'outer archives preserved=%s\n' "$(find . -maxdepth 1 -type f -name 'm9_ws_*.zip' | wc -l)"
 > git fsck --strict
-> PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("/home/qm/m9_ws")); print("branch:", r.current_branch()); print("history:", len(r.history())); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status())); print("latest:", r.history()[0].tags[0])'
+> PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("~/m9_ws")); print("branch:", r.current_branch()); print("history:", len(r.history())); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status())); print("latest:", r.history()[0].tags[0])'
 > git status --short --branch | sed -n '1,160p'
 > git check-ignore -v src/core_planning_0.0.1.zip src/core_planning_段错误缓存.zip m9_ws_1.1.9.zip
 > dpkg-query -W -f='app version: ${Version}\n' fetch-version-manager
-> sed -n '1,20p' /home/qm/.config/fetch-version-manager/settings.ini
+> sed -n '1,20p' ~/.config/fetch-version-manager/settings.ini
 > du -sh .git
-> ls -lh /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.9_all.deb`
+> ls -lh ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.9_all.deb`
 >
 > </details>
 >
@@ -3158,8 +3160,8 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran 2 commands</summary>
 >
-> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; desktop-file-validate data/fetch-version-manager.desktop; git -C /home/qm/catkin_ws diff --check -- package/fetch-version-manager; sh build_deb.sh`
-> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("/home/qm/m9_ws")); h=r.history(); print("history:", len(h)); print("first:", h[0].tags[0]); print("last:", h[-1].tags[0]); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status()))'; dpkg-deb --field dist/fetch-version-manager_2.4.10_all.deb Package Version Depends; dpkg-deb --fsys-tarfile dist/fetch-version-manager_2.4.10_all.deb | tar -xOf - ./usr/lib/fetch-version-manager/fetch_version_manager.py | rg -n 'return sorted|version_key\(tag\)'; ls -lh dist/fetch-version-manager_2.4.10_all.deb`
+> - Ran `python3 -m unittest discover -s tests -v; python3 -m py_compile src/fetch_version_manager.py tests/test_backend.py; sh -n build_deb.sh; desktop-file-validate data/fetch-version-manager.desktop; git -C ~/catkin_ws diff --check -- package/fetch-version-manager; sh build_deb.sh`
+> - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("src/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("~/m9_ws")); h=r.history(); print("history:", len(h)); print("first:", h[0].tags[0]); print("last:", h[-1].tags[0]); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status()))'; dpkg-deb --field dist/fetch-version-manager_2.4.10_all.deb Package Version Depends; dpkg-deb --fsys-tarfile dist/fetch-version-manager_2.4.10_all.deb | tar -xOf - ./usr/lib/fetch-version-manager/fetch_version_manager.py | rg -n 'return sorted|version_key\(tag\)'; ls -lh dist/fetch-version-manager_2.4.10_all.deb`
 >
 > </details>
 >
@@ -3167,7 +3169,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `pkexec apt-get install --yes /home/qm/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.10_all.deb`
+> - Ran `pkexec apt-get install --yes ~/catkin_ws/package/fetch-version-manager/dist/fetch-version-manager_2.4.10_all.deb`
 >
 > </details>
 >
@@ -3175,12 +3177,12 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `gio trash /home/qm/temp/m9_ws-empty-git-before-import; test ! -e /home/qm/temp/m9_ws-empty-git-before-import; find /home/qm/temp -maxdepth 1 -type d -name 'm9-version-import.*' -print; dpkg-query -W -f='${Status}\n${Version}\n' fetch-version-manager; PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("/home/qm/m9_ws")); h=r.history(); print("branch:", r.current_branch()); print("history:", len(h)); print("first:", h[0].tags[0]); print("last:", h[-1].tags[0]); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status()))'; printf 'direct tracked zip entries='; for tag in $(git -C /home/qm/m9_ws tag); do git -C /home/qm/m9_ws ls-tree -r --name-only "$tag"; done | awk 'BEGIN{IGNORECASE=1;n=0} /^src\/[^/]+\.zip$/{n++} END{print n}'; printf 'deep zip entries in v1.1.9='; git -C /home/qm/m9_ws ls-tree -r --name-only v1.1.9 | awk 'BEGIN{IGNORECASE=1;n=0} /^src\/.*\.zip$/ && $0 !~ /^src\/[^/]+\.zip$/{n++} END{print n}'; printf 'outer archives='; find /home/qm/m9_ws -maxdepth 1 -type f -name 'm9_ws_*.zip' | wc -l; git -C /home/qm/m9_ws fsck --strict; sed -n '1,20p' /home/qm/.config/fetch-version-manager/settings.ini; ps -eo pid,args | rg '[p]ython3 /usr/lib/fetch-version-manager/fetch_version_manager.py|[g]it (gc|repack)' || true; du -sh /home/qm/m9_ws/.git; ls -lh package/fetch-version-manager/dist/fetch-version-manager_2.4.10_all.deb`
+> - Ran `gio trash ~/temp/m9_ws-empty-git-before-import; test ! -e ~/temp/m9_ws-empty-git-before-import; find ~/temp -maxdepth 1 -type d -name 'm9-version-import.*' -print; dpkg-query -W -f='${Status}\n${Version}\n' fetch-version-manager; PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("~/m9_ws")); h=r.history(); print("branch:", r.current_branch()); print("history:", len(h)); print("first:", h[0].tags[0]); print("last:", h[-1].tags[0]); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status()))'; printf 'direct tracked zip entries='; for tag in $(git -C ~/m9_ws tag); do git -C ~/m9_ws ls-tree -r --name-only "$tag"; done | awk 'BEGIN{IGNORECASE=1;n=0} /^src\/[^/]+\.zip$/{n++} END{print n}'; printf 'deep zip entries in v1.1.9='; git -C ~/m9_ws ls-tree -r --name-only v1.1.9 | awk 'BEGIN{IGNORECASE=1;n=0} /^src\/.*\.zip$/ && $0 !~ /^src\/[^/]+\.zip$/{n++} END{print n}'; printf 'outer archives='; find ~/m9_ws -maxdepth 1 -type f -name 'm9_ws_*.zip' | wc -l; git -C ~/m9_ws fsck --strict; sed -n '1,20p' ~/.config/fetch-version-manager/settings.ini; ps -eo pid,args | rg '[p]ython3 /usr/lib/fetch-version-manager/fetch_version_manager.py|[g]it (gc|repack)' || true; du -sh ~/m9_ws/.git; ls -lh package/fetch-version-manager/dist/fetch-version-manager_2.4.10_all.deb`
 >
 > </details>
 </details>
 
-已完成 `/home/qm/m9_ws` 的本地版本管理：
+已完成 `~/m9_ws` 的本地版本管理：
 
 - 导入 102 个版本：`v1.1.4.0` 至 `v1.1.9`
 - 下划线版本已规范化，例如 `1.1.5.0_1` 对应 `v1.1.5.0.1`
@@ -3193,7 +3195,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 - 当前 14 项后续修改保持未保存状态
 - 下一个默认版本为 `v1.1.10`
 
-版本管理器已升级至 `2.4.10`，默认工作空间已切换为 `/home/qm/m9_ws`。远程目录 `/home/qm/git_ws/m9_ws` 未修改，也未向远程服务器推送。
+版本管理器已升级至 `2.4.10`，默认工作空间已切换为 `~/m9_ws`。远程目录 `~/git_ws/m9_ws` 未修改，也未向远程服务器推送。
 
 安装包：[fetch-version-manager_2.4.10_all.deb](./package/fetch-version-manager/dist/fetch-version-manager_2.4.10_all.deb)
 
@@ -3201,7 +3203,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 
 > 对工作目录的zip进行版本管理
 
-当前已经是对 `/home/qm/m9_ws` 工作目录中的 102 个外层 ZIP 逐个进行版本管理：
+当前已经是对 `~/m9_ws` 工作目录中的 102 个外层 ZIP 逐个进行版本管理：
 
 - 每个外层 ZIP 对应一个 Git 版本标签。
 - 导入的是 ZIP 解压后的工作空间内容。
@@ -3221,7 +3223,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > - Ran `find '/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws' -maxdepth 1 -type f -iname '*.zip' -printf '%f\t%s bytes\t%TY-%Tm-%Td %TH:%TM:%TS\n' 2>/dev/null | sort -V`
 > - Ran `find '/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws' -maxdepth 3 -type f -iname '*2.1*.zip' -printf '%p\n' 2>/dev/null | sort -V | sed -n '1,300p'`
-> - Ran `df -Th '/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws' /home/qm/temp; mount | rg 'A022BB0822BAE308|/media/qm' | sed -n '1,40p'; dpkg-query -W -f='${Version}\n' fetch-version-manager 2>/dev/null; sed -n '1,30p' /home/qm/.config/fetch-version-manager/settings.ini 2>/dev/null`
+> - Ran `df -Th '/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws' ~/temp; mount | rg 'A022BB0822BAE308|/media/qm' | sed -n '1,40p'; dpkg-query -W -f='${Version}\n' fetch-version-manager 2>/dev/null; sed -n '1,30p' ~/.config/fetch-version-manager/settings.ini 2>/dev/null`
 > - Ran `target='/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws'; ls -ld "$target" "$target/.git" 2>/dev/null || true; git -C "$target" status --short --branch 2>&1 | sed -n '1,180p'; git -C "$target" tag --sort=version:refname 2>/dev/null | sed -n '1,180p'; find "$target" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' 2>/dev/null | sort | sed -n '1,220p'; du -sh "$target" 2>/dev/null`
 >
 > </details>
@@ -3263,7 +3265,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran 3 commands</summary>
 >
-> - Ran `command -v rsync; command -v unzip; command -v git; df -h /home/qm/temp '/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws'`
+> - Ran `command -v rsync; command -v unzip; command -v git; df -h ~/temp '/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws'`
 > - Ran `target='/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws'; readlink "$target/src/CMakeLists.txt" 2>/dev/null || true; stat -c '%F %a %n' "$target/src/CMakeLists.txt" 2>/dev/null; find "$target/src" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | sort | sed -n '1,120p'`
 > - Ran `python3 - <<'PY'
 > from collections import defaultdict
@@ -3307,9 +3309,9 @@ pre-v0.0.8-version-management-migration-2026-08-30
 > archive_dir='/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws'
 > target_workspace="$archive_dir"
 > [ ! -e "$target_workspace/.git" ]
-> work_root=$(mktemp -d /home/qm/temp/t5-version-import.XXXXXX)
+> work_root=$(mktemp -d ~/temp/t5-version-import.XXXXXX)
 > case "$work_root" in
->   /home/qm/temp/t5-version-import.*) ;;
+>   ~/temp/t5-version-import.*) ;;
 >   *) exit 1 ;;
 > esac
 > import_stage="$work_root/repository"
@@ -3503,12 +3505,12 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >
 > <details><summary>Ran 2 commands</summary>
 >
-> - Ran `find /home/qm/temp -maxdepth 1 -type d -name 't5-version-import.*' -printf '%p\n'; for stage in /home/qm/temp/t5-version-import.*/repository; do [ -d "$stage/.git" ] || continue; echo "$stage"; git -C "$stage" config --show-origin --get core.autocrlf || true; git -C "$stage" config --show-origin --get core.filemode || true; git -C "$stage" status --short --branch | sed -n '1,40p'; git -C "$stage" tag | wc -l; done; test ! -e '/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws/.git' && echo TARGET_UNCHANGED`
+> - Ran `find ~/temp -maxdepth 1 -type d -name 't5-version-import.*' -printf '%p\n'; for stage in ~/temp/t5-version-import.*/repository; do [ -d "$stage/.git" ] || continue; echo "$stage"; git -C "$stage" config --show-origin --get core.autocrlf || true; git -C "$stage" config --show-origin --get core.filemode || true; git -C "$stage" status --short --branch | sed -n '1,40p'; git -C "$stage" tag | wc -l; done; test ! -e '/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws/.git' && echo TARGET_UNCHANGED`
 > - Ran `python3 - <<'PY'
 > import io, stat, subprocess, zipfile
 > from pathlib import Path
 > archive = Path('/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws/1.0.0-2.1.0.zip')
-> repo = Path('/home/qm/temp/t5-version-import.cJDSHL/repository')
+> repo = Path('~/temp/t5-version-import.cJDSHL/repository')
 > exported = subprocess.run(['git','-C',str(repo),'archive','--format=zip','v1.0.0'],check=True,stdout=subprocess.PIPE).stdout
 > names = ['global_optimal_planner/CHANGELOG.rst','global_optimal_planner/CMakeLists.txt','global_optimal_planner/README.md']
 > with zipfile.ZipFile(archive) as original, zipfile.ZipFile(io.BytesIO(exported)) as imported:
@@ -3520,10 +3522,10 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >         print(' imported', b.CRC, b.file_size, oct(b.external_attr >> 16), repr(imported.read(b)[:80]))
 > PY
 >
-> git -C /home/qm/temp/t5-version-import.cJDSHL/repository check-attr -a -- src/global_optimal_planner/CHANGELOG.rst src/global_optimal_planner/CMakeLists.txt src/global_optimal_planner/README.md
+> git -C ~/temp/t5-version-import.cJDSHL/repository check-attr -a -- src/global_optimal_planner/CHANGELOG.rst src/global_optimal_planner/CMakeLists.txt src/global_optimal_planner/README.md
 > git config --global --get core.autocrlf || true
 > git config --global --get core.attributesfile || true
-> find /home/qm/temp/t5-version-import.cJDSHL/repository -name .gitattributes -print -exec sed -n '1,120p' {} \;`
+> find ~/temp/t5-version-import.cJDSHL/repository -name .gitattributes -print -exec sed -n '1,120p' {} \;`
 >
 > </details>
 >
@@ -3532,7 +3534,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 > <details><summary>Ran a command</summary>
 >
 > - Ran `set -eu
-> work_root=/home/qm/temp/t5-version-import.cJDSHL
+> work_root=~/temp/t5-version-import.cJDSHL
 > import_stage="$work_root/repository"
 > bundle_extract="$work_root/bundle"
 > single_extract="$work_root/single"
@@ -3685,7 +3687,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 > PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util; from pathlib import Path; p=Path("/usr/lib/fetch-version-manager/fetch_version_manager.py"); s=importlib.util.spec_from_file_location("fvm", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.GitRepository(Path("/media/qm/A022BB0822BAE308/ROS/RobotCode/Arithmetic_ws/t5_ws")); h=r.history(); print("branch:", r.current_branch()); print("history:", len(h)); print("first:", h[0].tags[0]); print("last:", h[-1].tags[0]); print("next:", r.next_version()); print("storage:", m.format_storage_size(r.storage_size())); print("changes:", len(r.status()))'
 > git fsck --strict
 > printf 'outer archives='; find . -maxdepth 1 -type f -iname '*.zip' | wc -l
-> sed -n '1,20p' /home/qm/.config/fetch-version-manager/settings.ini
+> sed -n '1,20p' ~/.config/fetch-version-manager/settings.ini
 > dpkg-query -W -f='app version: ${Version}\n' fetch-version-manager
 > du -sh .git`
 >
@@ -3723,7 +3725,7 @@ pre-v0.0.8-version-management-migration-2026-08-30
 >         print(relative, 'content_equal=', expected == actual, 'expected_symlink=', mode == b'120000', 'current_symlink=', actual_link)
 > PY
 >
-> find /home/qm/temp -maxdepth 1 -type d -name 't5-version-import.*' -print
+> find ~/temp -maxdepth 1 -type d -name 't5-version-import.*' -print
 > ps -eo pid,args | rg '[g]it (gc|repack)' || true`
 >
 > </details>
@@ -3974,7 +3976,7 @@ move_control/src/move_control.cpp
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `find /home/qm/code-version-manager/code-version-manager/src/__pycache__ /home/qm/code-version-manager/code-version-manager/tests/__pycache__ -type f -name '*.pyc' -delete 2>/dev/null; rmdir /home/qm/code-version-manager/code-version-manager/src/__pycache__ /home/qm/code-version-manager/code-version-manager/tests/__pycache__ 2>/dev/null || true; find src tests -maxdepth 2 -type f -print | sort`
+> - Ran `find ~/code-version-manager/code-version-manager/src/__pycache__ ~/code-version-manager/code-version-manager/tests/__pycache__ -type f -name '*.pyc' -delete 2>/dev/null; rmdir ~/code-version-manager/code-version-manager/src/__pycache__ ~/code-version-manager/code-version-manager/tests/__pycache__ 2>/dev/null || true; find src tests -maxdepth 2 -type f -print | sort`
 >
 > </details>
 >
@@ -4028,7 +4030,7 @@ move_control/src/move_control.cpp
 >
 > </details>
 >
-> - Ran `find /home/qm/code-version-manager/code-version-manager -maxdepth 2 -type f -not -path '*/build/*' -not -path '*/dist/*' -printf '%P\n' | sort; test -f /home/qm/code-version-manager/code-version-manager/CHANGELOG.rst && sed -n '1,240p' /home/qm/code-version-manager/code-version-manager/CHANGELOG.rst || true`
+> - Ran `find ~/code-version-manager/code-version-manager -maxdepth 2 -type f -not -path '*/build/*' -not -path '*/dist/*' -printf '%P\n' | sort; test -f ~/code-version-manager/code-version-manager/CHANGELOG.rst && sed -n '1,240p' ~/code-version-manager/code-version-manager/CHANGELOG.rst || true`
 >
 > <details><summary>Explored a search</summary>
 >
@@ -4074,9 +4076,9 @@ move_control/src/move_control.cpp
 >
 > </details>
 >
-> - Ran `find /home/qm -type f \( -iname 'fetch-version-manager_v0.0.6.zip' -o -iname 'fetch-version-manager_v0.0.7.zip' -o -iname 'fetch-version-manager_v0.0.8.zip' -o -iname 'code-version-manager_v0.0.6.zip' -o -iname 'code-version-manager_v0.0.7.zip' -o -iname 'code-version-manager_v0.0.8.zip' \) -print 2>/dev/null`
+> - Ran `find ~ -type f \( -iname 'fetch-version-manager_v0.0.6.zip' -o -iname 'fetch-version-manager_v0.0.7.zip' -o -iname 'fetch-version-manager_v0.0.8.zip' -o -iname 'code-version-manager_v0.0.6.zip' -o -iname 'code-version-manager_v0.0.7.zip' -o -iname 'code-version-manager_v0.0.8.zip' \) -print 2>/dev/null`
 >
-> - Ran `find /home/qm -maxdepth 5 -type f -iname '*version-manager*v0.0.*.zip' -printf '%p\t%s\n' 2>/dev/null | sort -V`
+> - Ran `find ~ -maxdepth 5 -type f -iname '*version-manager*v0.0.*.zip' -printf '%p\t%s\n' 2>/dev/null | sort -V`
 >
 > </details>
 >
@@ -4099,7 +4101,7 @@ move_control/src/move_control.cpp
 > </details>
 </details>
 
-目前无法完整导入 `v0.0.1` 至 `v0.0.8`：目录及 `/home/qm` 下只有 `v0.0.1` 至 `v0.0.5`，缺少：
+目前无法完整导入 `v0.0.1` 至 `v0.0.8`：目录及 `~` 下只有 `v0.0.1` 至 `v0.0.5`，缺少：
 
 - `fetch-version-manager_v0.0.6.zip`
 - `fetch-version-manager_v0.0.7.zip`
@@ -4107,7 +4109,7 @@ move_control/src/move_control.cpp
 
 现有五版已确认分别对应软件版本 `2.4.0`、`2.4.2`、`2.4.5`、`2.4.6`、`2.4.10`。为避免伪造版本快照，我尚未初始化 Git 或生成不完整的 `CHANGELOG.rst`。
 
-请将缺失的三个 ZIP 放入 `/home/qm/code-version-manager/`；如果这三个压缩包原本就不存在，需要你确认允许我根据 README 中的修改记录重建 `v0.0.6` 至 `v0.0.8`。
+请将缺失的三个 ZIP 放入 `~/code-version-manager/`；如果这三个压缩包原本就不存在，需要你确认允许我根据 README 中的修改记录重建 `v0.0.6` 至 `v0.0.8`。
 
 > 确认允许我根据 README 中的修改记录重建 `v0.0.6` 至 `v0.0.8`
 
@@ -4134,8 +4136,8 @@ move_control/src/move_control.cpp
 >
 > - Wrote `./code-version-manager/README.md` (+1 -0)
 > - Ran `set -euo pipefail
-> archive_root=/home/qm/code-version-manager
-> workspace=/home/qm/code-version-manager/code-version-manager
+> archive_root=~/code-version-manager
+> workspace=~/code-version-manager/code-version-manager
 > import_root=$(mktemp -d /tmp/code-version-manager-import.XXXXXX)
 > case "$import_root" in
 >   /tmp/code-version-manager-import.*) ;;
@@ -4205,7 +4207,7 @@ move_control/src/move_control.cpp
 > printf 'tag=%s commit=%s files=%s\n'   "$(git describe --tags --exact-match HEAD)"   "$(git rev-parse --short HEAD)"   "$(git ls-tree -r --name-only HEAD | wc -l)"
 > git status --short`
 > - Ran `set -euo pipefail
-> workspace=/home/qm/code-version-manager/code-version-manager
+> workspace=~/code-version-manager/code-version-manager
 > git rm -r -q --ignore-unmatch -- .
 > rsync -a   --exclude='.git/'   --exclude='build/'   --exclude='dist/'   --exclude='CHANGELOG.rst'   "$workspace/" .
 > git status --short | sed -n '1,100p'`
@@ -4244,7 +4246,7 @@ move_control/src/move_control.cpp
 > <details><summary>Explored a file, ran 4 commands</summary>
 >
 > - Ran `set -euo pipefail
-> workspace=/home/qm/code-version-manager/code-version-manager
+> workspace=~/code-version-manager/code-version-manager
 > rsync -a   --exclude='.git/'   --exclude='build/'   --exclude='dist/'   "$workspace/" .
 > git add -A
 > git diff --cached --stat
@@ -4342,7 +4344,7 @@ move_control/src/move_control.cpp
 >
 > <details><summary>Ran 5 commands</summary>
 >
-> - Ran `rsync -anrc --delete --exclude='.git/' --exclude='build/' --exclude='dist/' /home/qm/code-version-manager/code-version-manager/ ./`
+> - Ran `rsync -anrc --delete --exclude='.git/' --exclude='build/' --exclude='dist/' ~/code-version-manager/code-version-manager/ ./`
 > - Ran `git diff --name-status v0.0.5 v0.0.6 | sed -n '1,200p'; git diff --name-status v0.0.6 v0.0.7; git diff --name-status v0.0.7 v0.0.8`
 > - Ran `git fsck --strict; git status --short --branch; git tag --sort=version:refname | paste -sd ' ' -; git rev-list --count HEAD`
 > - Ran `python3 - <<'PY'
@@ -4352,7 +4354,7 @@ move_control/src/move_control.cpp
 > import zipfile
 > from pathlib import Path
 >
-> archive_root = Path("/home/qm/code-version-manager")
+> archive_root = Path("~/code-version-manager")
 > repository = Path("/tmp/code-version-manager-import.Y8c9bX/repository")
 > prefix = "fetch-version-manager/"
 >
@@ -4404,7 +4406,7 @@ move_control/src/move_control.cpp
 > <details><summary>Ran 6 commands</summary>
 >
 > - Ran `set -euo pipefail
-> archive_root=/home/qm/code-version-manager
+> archive_root=~/code-version-manager
 > old_repository="/tmp/code-version-manager-import.Y8c9bX/repository"
 > new_root=$(mktemp -d /tmp/code-version-manager-import.XXXXXX)
 > case "$new_root" in
@@ -4472,7 +4474,7 @@ move_control/src/move_control.cpp
 >   printf 'rebuilt v0.0.%s %s files=%s\n'     "$number"     "$(git -C "$repository" rev-parse --short HEAD)"     "$(git -C "$repository" ls-tree -r --name-only HEAD | wc -l)"
 > done
 > printf 'NEW_IMPORT_ROOT=%s\n' "$new_root"`
-> - Ran `rsync -anrc --delete --exclude='.git/' --exclude='build/' --exclude='dist/' /home/qm/code-version-manager/code-version-manager/ ./`
+> - Ran `rsync -anrc --delete --exclude='.git/' --exclude='build/' --exclude='dist/' ~/code-version-manager/code-version-manager/ ./`
 > - Ran `printf 'v0.0.6 old names='; git ls-tree -r --name-only v0.0.6 | rg -c 'fetch|fetch_version' || true; printf 'v0.0.6 metadata='; git show v0.0.6:src/code_version_manager.py | rg 'MANIFEST_DIRECTORY|MANAGER_CHANGELOG' | head -n 2; printf 'v0.0.7 metadata='; git show v0.0.7:src/code_version_manager.py | rg 'METADATA_DIRECTORY|MANIFEST_DIRECTORY|MANIFEST_SUFFIX' | head -n 3; printf 'v0.0.8 changelog='; git cat-file -e v0.0.8:CHANGELOG.rst && echo yes`
 > - Ran `git fsck --strict; git status --short --branch; git tag --sort=version:refname | paste -sd ' ' -; git rev-list --count HEAD`
 > - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -q tests/test_backend.py; git diff --check v0.0.7 v0.0.8`
@@ -4483,7 +4485,7 @@ move_control/src/move_control.cpp
 > import zipfile
 > from pathlib import Path
 >
-> archive_root = Path("/home/qm/code-version-manager")
+> archive_root = Path("~/code-version-manager")
 > repository = Path("/tmp/code-version-manager-import.PIDrrt/repository")
 > prefix = "fetch-version-manager/"
 >
@@ -4608,7 +4610,7 @@ move_control/src/move_control.cpp
 > git count-objects -vH`
 > - Ran `git log --oneline --decorate --graph --all; printf 'tags: '; git tag --sort=version:refname | paste -sd ' ' -; git status --short --branch; git ls-files | sort`
 > - Ran `dpkg-deb -f dist/code-version-manager_2.4.11_all.deb Package Version; dpkg-deb --fsys-tarfile dist/code-version-manager_2.4.11_all.deb | tar -tf - | rg 'code-version-manager|code_version_manager'; git diff --check`
-> - Ran `cmp CHANGELOG.rst .git/code-version-manager/CHANGELOG.rst && echo 'internal changelog matches'; git status --ignored --short | sed -n '1,80p'; find /home/qm/code-version-manager -maxdepth 1 -type f -name 'fetch-version-manager_v0.0.*.zip' -printf '%f\t%s\n' | sort -V; du -sh .git build dist 2>/dev/null`
+> - Ran `cmp CHANGELOG.rst .git/code-version-manager/CHANGELOG.rst && echo 'internal changelog matches'; git status --ignored --short | sed -n '1,80p'; find ~/code-version-manager -maxdepth 1 -type f -name 'fetch-version-manager_v0.0.*.zip' -printf '%f\t%s\n' | sort -V; du -sh .git build dist 2>/dev/null`
 > - Ran `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -q tests/test_backend.py; sh -n build_deb.sh data/code-version-manager debian/postinst debian/postrm; desktop-file-validate data/code-version-manager.desktop; xmllint --noout data/code-version-manager.svg`
 > - Ran `PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
 > import importlib.util
@@ -4893,7 +4895,7 @@ move_control/src/move_control.cpp
 >
 > <details><summary>Ran a command</summary>
 >
-> - Ran `pkexec apt-get install --yes --allow-downgrades /home/qm/code-version-manager/code-version-manager/dist/code-version-manager_0.0.9_all.deb`
+> - Ran `pkexec apt-get install --yes --allow-downgrades ~/code-version-manager/code-version-manager/dist/code-version-manager_0.0.9_all.deb`
 >
 > </details>
 >
@@ -4901,7 +4903,7 @@ move_control/src/move_control.cpp
 >
 > <details><summary>Ran 8 commands</summary>
 >
-> - Ran `command -v xdotool || true; command -v import || true; printf 'display=%s desktop=%s\n' "$DISPLAY" "$XDG_CURRENT_DESKTOP"; sed -n '1,20p' /home/qm/.config/code-version-manager/settings.ini 2>/dev/null || true`
+> - Ran `command -v xdotool || true; command -v import || true; printf 'display=%s desktop=%s\n' "$DISPLAY" "$XDG_CURRENT_DESKTOP"; sed -n '1,20p' ~/.config/code-version-manager/settings.ini 2>/dev/null || true`
 > - Ran `ps -eo pid,args | rg '[p]ython3 /usr/lib/code-version-manager/code_version_manager.py' || true`
 > - Ran `dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\t${Version}\n' code-version-manager; cat /usr/lib/code-version-manager/VERSION; rg -n '发布版本|保存版本|help-about|set_version' /usr/lib/code-version-manager/code_version_manager.py; sed -n '1,15p' /usr/share/applications/code-version-manager.desktop`
 > - Ran `gtk-launch code-version-manager`
@@ -5020,14 +5022,14 @@ move_control/src/move_control.cpp
 > <details><summary>Ran a command</summary>
 >
 > - Ran `set -euo pipefail
-> for directory in   /home/qm/code-version-manager/code-version-manager/build/code-version-manager_2.4.11_all   /home/qm/code-version-manager/code-version-manager/build/code-version-manager_2.4.12_all
+> for directory in   ~/code-version-manager/code-version-manager/build/code-version-manager_2.4.11_all   ~/code-version-manager/code-version-manager/build/code-version-manager_2.4.12_all
 > do
 >   if [ -d "$directory" ]; then
 >     find "$directory" -depth -delete
 >     printf 'removed generated directory %s\n' "$directory"
 >   fi
 > done
-> for file in   /home/qm/code-version-manager/code-version-manager/dist/code-version-manager_2.4.11_all.deb   /home/qm/code-version-manager/code-version-manager/dist/code-version-manager_2.4.12_all.deb   /tmp/code-version-manager-v0.0.9-main.png   /tmp/code-version-manager-v0.0.9-about.png   /tmp/code-version-manager-hover.png
+> for file in   ~/code-version-manager/code-version-manager/dist/code-version-manager_2.4.11_all.deb   ~/code-version-manager/code-version-manager/dist/code-version-manager_2.4.12_all.deb   /tmp/code-version-manager-v0.0.9-main.png   /tmp/code-version-manager-v0.0.9-about.png   /tmp/code-version-manager-hover.png
 > do
 >   if [ -f "$file" ]; then
 >     find "$file" -delete
