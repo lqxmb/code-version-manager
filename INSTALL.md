@@ -25,7 +25,7 @@
 
 ```bash
 sudo apt update
-sudo apt install ./code-version-manager_0.2.3_all.deb
+sudo apt install ./code-version-manager_0.2.4_all.deb
 ```
 
 自动安装缺失依赖需要电脑能够访问 Ubuntu 软件源。如果电脑离线，必须先准备好缺少的依赖安装包。
@@ -33,7 +33,7 @@ sudo apt install ./code-version-manager_0.2.3_all.deb
 不要使用下面的命令进行首次安装：
 
 ```bash
-sudo dpkg -i code-version-manager_0.2.3_all.deb
+sudo dpkg -i code-version-manager_0.2.4_all.deb
 ```
 
 `dpkg -i` 只检查依赖，不会联网下载缺少的软件包；`apt install` 才会自动补齐依赖。
@@ -76,7 +76,7 @@ python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository impo
 进入 `.deb` 文件所在目录后执行：
 
 ```bash
-sudo apt install ./code-version-manager_0.2.3_all.deb
+sudo apt install ./code-version-manager_0.2.4_all.deb
 ```
 
 使用 `apt install` 可以自动检查并安装系统依赖。通过 Ubuntu 图形软件安装器打开 `.deb` 时也会检查依赖，但终端命令能够清楚显示下载和安装过程。
@@ -96,7 +96,7 @@ code-version-manager
 ```bash
 sudo apt update
 sudo apt --fix-broken install
-sudo apt install ./code-version-manager_0.2.3_all.deb
+sudo apt install ./code-version-manager_0.2.4_all.deb
 ```
 
 ### 点击对比没有反应
@@ -115,7 +115,7 @@ Beyond Compare 不是 Ubuntu 默认自带软件，需要单独安装。
 
 ### 本地发布成功，但远程同步失败
 
-0.2.0 起，“发布版本”仅保存到本地。使用 0.2.3 时，点击“同步本地”以远程分支和版本标签覆盖本地，或点击“同步远程”以本地覆盖远程；执行前会显示引用差异并要求确认。网络或权限问题修复后点击“刷新”重新检查。升级前启用的自动同步配置不再触发上传。
+0.2.0 起，“发布版本”仅保存到本地。使用 0.2.4 时，点击“同步本地”以远程分支和版本标签覆盖本地，或点击“同步远程”以本地覆盖远程；执行前会显示引用差异并要求确认。网络或权限问题修复后点击“刷新”重新检查。升级前启用的自动同步配置不再触发上传。
 
 “Git 账号”优先填入当前工作空间的 `origin` 地址，GitHub HTTPS 地址会转换为 SSH，例如 `git@github.com:lqxmb/code-version-manager.git`。没有远程配置时会按工作空间名提示地址示例，需填写实际账号或组织及仓库名。点击“SSH 公钥设置”，复制 `.pub` 公钥并在 GitHub 中以 `Authentication Key` 类型添加。没有公钥时，可在窗口内填写邮箱和可选口令，点击“生成新的 SSH 密钥”。软件调用 `ssh-keygen` 在本机生成密钥，已有同名文件时使用新文件名，界面只显示公钥。首次连接请在终端运行 `ssh -T git@github.com` 并核对官方主机指纹。加密或使用新文件名的密钥需按窗口提示用 `ssh-add` 加载；自定义 SSH 主机别名由系统配置管理。
 
@@ -134,7 +134,7 @@ Beyond Compare 不是 Ubuntu 默认自带软件，需要单独安装。
 
 远程连接和预检查的超时为 120 秒；实际推送默认允许 15 分钟，可在“Git 账号 → 高级设置：推送超时”中修改为 1–60 分钟。此设置仍用于限制实际上传的等待时间，一般使用默认值即可。超时会清理本次传输子进程并保留本地版本；远程可能已经更新，恢复网络后重试同步即可检查并补齐。读取成功不代表上传链路正常，不要只靠反复延长时限处理网络问题。
 
-升级到 0.2.3 时先退出软件，在项目目录执行 `sudo apt install ./dist/code-version-manager_0.2.3_all.deb`，再重新打开。完整配置和同步范围请查看 [README.md](README.md)。
+升级到 0.2.4 时先退出软件，在项目目录执行 `sudo apt install ./dist/code-version-manager_0.2.4_all.deb`，再重新打开。完整配置和同步范围请查看 [README.md](README.md)。
 
 ## 5. 卸载
 

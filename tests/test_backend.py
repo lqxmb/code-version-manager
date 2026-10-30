@@ -252,17 +252,24 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertIn("v0.0.1", self.repository.tags())
         self.assertIn("v0.0.2", self.repository.tags())
 
-    def test_delete_latest_version_commit_rejects_staged_changes(self):
+    def test_delete_latest_version_commit_preserves_staged_changes(self):
         self.git("branch", "-m", "main")
         (self.path / "robot.txt").write_text("two\n", encoding="utf-8")
         self.repository.save_version("v0.0.2", "second", ["robot.txt"])
         (self.path / "other.txt").write_text("staged\n", encoding="utf-8")
         self.repository.run(["add", "other.txt"])
+        staged_before = self.repository.run(["ls-files", "--stage", "-z"])
+        parent = self.repository.run(["rev-parse", "HEAD^"]).strip()
+        (self.path / "other.txt").write_text("unstaged edits\n", encoding="utf-8")
 
-        with self.assertRaises(MODULE.GitError):
-            self.repository.delete_latest_version_commit("v0.0.2")
+        self.repository.delete_latest_version_commit("v0.0.2")
 
-        self.assertIn("v0.0.2", self.repository.tags())
+        self.assertNotIn("v0.0.2", self.repository.tags())
+        self.assertEqual(parent, self.repository.run(["rev-parse", "HEAD"]).strip())
+        self.assertEqual(staged_before, self.repository.run(["ls-files", "--stage", "-z"]))
+        self.assertEqual("staged\n", self.repository.run(["show", ":other.txt"]))
+        self.assertEqual("unstaged edits\n", (self.path / "other.txt").read_text(encoding="utf-8"))
+        self.assertEqual("two\n", (self.path / "robot.txt").read_text(encoding="utf-8"))
 
     def test_delete_latest_version_commit_rejects_initial_commit(self):
         self.git("branch", "-m", "main")

@@ -382,9 +382,18 @@ class GitRepository:
         self.metadata_path = Path(git_directory).resolve() / METADATA_DIRECTORY
         self.last_local_sync_stash_ref: Optional[str] = None
 
-    def run(self, args: Sequence[str], check: bool = True) -> str:
+    def run(
+        self,
+        args: Sequence[str],
+        check: bool = True,
+        *,
+        input: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> str:
         result = subprocess.run(
             ["git", "-C", str(self.path), *args],
+            input=input,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -924,7 +933,13 @@ class GitRepository:
 
     def deleted_files(self) -> List[str]:
         raw = self.run(["ls-files", "--deleted", "-z"])
-        return [path for path in raw.split("\0") if path]
+        raw += self.run([
+            "diff", "--cached", "--name-only", "--diff-filter=D", "--no-renames", "-z",
+        ])
+        return sorted({
+            path for path in raw.split("\0")
+            if path and not os.path.lexists(self.path / path)
+        })
 
     def changed_paths(self) -> List[str]:
         raw = self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
@@ -957,7 +972,7 @@ class GitRepository:
             absolute = self.path / path
             if absolute.is_file() or absolute.is_symlink():
                 paths.append(path)
-        return sorted(set(paths))
+        return self.filter_ignored(sorted(set(paths)))
 
     def tags(self) -> List[str]:
         output = self.run(["tag", "--sort=version:refname"])
@@ -1112,16 +1127,21 @@ class GitRepository:
     def download_changelog(self, destination: Path) -> None:
         destination.write_text(self.changelog_text(), encoding="utf-8")
 
-    def _add_paths(self, paths: Sequence[str]) -> None:
+    def _add_paths(
+        self, paths: Sequence[str], *, env: Optional[Dict[str, str]] = None,
+    ) -> None:
         for start in range(0, len(paths), 200):
-            self.run(["--literal-pathspecs", "add", "--", *paths[start : start + 200]])
+            self.run(
+                ["--literal-pathspecs", "add", "--", *paths[start : start + 200]],
+                env=env,
+            )
 
     def filter_ignored(self, paths: Sequence[str]) -> List[str]:
         if not paths:
             return []
         payload = "\0".join(paths) + "\0"
         result = subprocess.run(
-            ["git", "-C", str(self.path), "check-ignore", "--stdin", "-z"],
+            ["git", "-C", str(self.path), "check-ignore", "--no-index", "--stdin", "-z"],
             input=payload.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1135,6 +1155,14 @@ class GitRepository:
             if value
         }
         return [path for path in paths if path not in ignored]
+
+    def ignored_tracked_files(self) -> List[str]:
+        # Include HEAD as well as the index so staged removals are not missed.
+        raw = self.run(["ls-files", "--cached", "-z"])
+        if self.run(["rev-parse", "--verify", "HEAD"], check=False).strip():
+            raw += self.run(["ls-tree", "-r", "--name-only", "-z", "HEAD"])
+        tracked = sorted({path for path in raw.split("\0") if path})
+        return sorted(set(tracked) - set(self.filter_ignored(tracked)))
 
     def save_version(
         self,
@@ -1159,20 +1187,49 @@ class GitRepository:
         selected = validate_selected_files(self.path, selected_files)
         selected = self.filter_ignored(selected)
         scopes = validate_top_level_scopes(selected_scopes or [])
-        deleted = [
+        deleted = self.filter_ignored([
             path for path in self.deleted_files()
             if any(path == scope or path.startswith(scope + "/") for scope in scopes)
-        ]
-        if not selected and not deleted:
+        ])
+        ignored_removals = self.ignored_tracked_files()
+        if not selected and not deleted and not ignored_removals:
             raise GitError("至少选择一个未被 .gitignore 排除的文件或已删除项。")
-        staged = self.run(["diff", "--cached", "--name-only"]).strip()
-        if staged:
-            raise GitError("Git 暂存区已有其他文件。请先处理这些暂存内容再发布版本。")
-        if scopes:
-            self.run(["--literal-pathspecs", "add", "-u", "--", *scopes])
-        self._add_paths(selected)
+        if self.run(["ls-files", "--unmerged", "-z"]):
+            raise GitError("Git 工作区存在尚未解决的合并冲突。请先解决冲突再发布版本。")
+        if any(
+            self.run(["rev-parse", "--verify", "--quiet", state], check=False).strip()
+            for state in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
+        ):
+            raise GitError("Git 工作区有尚未完成的合并、拣选或还原操作。请先完成该操作再发布版本。")
         self.metadata_path.mkdir(parents=True, exist_ok=True)
-        self.run(["commit", "--allow-empty", "-m", commit_message])
+        added_paths = sorted(set(selected) | set(deleted))
+        paths = sorted(set(added_paths) | set(ignored_removals))
+        with tempfile.TemporaryDirectory(prefix="publish-", dir=self.metadata_path) as temporary:
+            # Start from HEAD so unrelated staged content stays out of this version.
+            # A failed add or commit leaves the user's index unchanged.
+            environment = os.environ.copy()
+            environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
+            has_head = self.run(["rev-parse", "--verify", "HEAD"], check=False).strip()
+            self.run(
+                ["read-tree", "HEAD"] if has_head else ["read-tree", "--empty"],
+                env=environment,
+            )
+            self._add_paths(added_paths, env=environment)
+            if ignored_removals:
+                # Remove ignored historical files from the version, never from disk.
+                self.run(
+                    ["update-index", "--force-remove", "-z", "--stdin"],
+                    input="\0".join(ignored_removals) + "\0",
+                    env=environment,
+                )
+            self.run(["commit", "--allow-empty", "-m", commit_message], env=environment)
+            # Match the real index to the new commit only for published paths.
+            # NUL-delimited stdin handles large selections and literal filenames.
+            self.run(
+                ["--literal-pathspecs", "reset", "--quiet", "HEAD",
+                 "--pathspec-from-file=-", "--pathspec-file-nul"],
+                input="\0".join(paths) + "\0",
+            )
         self.run(["tag", "-a", version, "-m", commit_message])
         self._write_manifest(version, selected)
         self._write_changelog(None)
@@ -1220,9 +1277,10 @@ class GitRepository:
         parent = self.run(["rev-parse", f"{commit}^"], check=False).strip()
         if not parent:
             raise GitError("首个 Git 提交不能用此方式删除。")
-        if self.run(["diff", "--cached", "--name-only"]).strip():
-            raise GitError("暂存区已有文件。请先处理暂存内容再删除提交。")
-        self.run(["reset", "--mixed", parent])
+        # A soft reset preserves existing staged content, including partial edits.
+        # Without staged changes, keep the removed commit's changes unstaged.
+        staged = self.run(["diff", "--cached", "--name-only", "-z"])
+        self.run(["reset", "--soft" if staged else "--mixed", parent])
         self.run(["tag", "--delete", version])
         self._remove_version_metadata(version)
 
@@ -1537,6 +1595,7 @@ class FileSelectionDialog(Gtk.Dialog):
         changed_files: Sequence[str],
         title: str = "选择版本封装文件",
         deleted_entries: Sequence[str] = (),
+        ignored_removals: Sequence[str] = (),
     ):
         super().__init__(title=title, transient_for=parent, modal=True)
         self.set_default_size(820, 620)
@@ -1548,6 +1607,15 @@ class FileSelectionDialog(Gtk.Dialog):
         content = self.get_content_area()
         content.set_spacing(8)
         content.set_border_width(12)
+
+        if ignored_removals:
+            hint = Gtk.Label(
+                label=f"新版本将停止跟踪 {len(ignored_removals)} 个已被忽略的文件，本地文件保留。",
+                xalign=0,
+            )
+            hint.set_line_wrap(True)
+            hint.set_tooltip_text("\n".join(ignored_removals))
+            content.pack_start(hint, False, False, 0)
 
         if deleted:
             hint = Gtk.Label(
@@ -2582,9 +2650,17 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if not metadata:
             return
         version, message = metadata
-        groups = top_level_package_groups(self.workspace_path, repository.deleted_files())
+        deleted = repository.filter_ignored(repository.deleted_files())
+        ignored_removals = repository.ignored_tracked_files()
+        groups = top_level_package_groups(self.workspace_path, deleted)
+        allowed = set(repository.filter_ignored(expand_package_groups(groups, list(groups))))
+        groups = {
+            entry: [path for path in paths if path in allowed]
+            for entry, paths in groups.items()
+            if not paths or any(path in allowed for path in paths)
+        }
         entries = list(groups)
-        if not entries:
+        if not entries and not ignored_removals:
             self.show_error("工作空间中没有可以封装的文件。")
             return
         default_files = self.repository.default_package_files()
@@ -2598,6 +2674,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             changed_entries,
             title="选择工作空间顶层文件或目录",
             deleted_entries=[entry for entry in entries if not groups[entry]],
+            ignored_removals=ignored_removals,
         )
         if selected_entries is None:
             return
@@ -2647,10 +2724,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         changed_files: Sequence[str],
         title: str = "选择版本封装文件",
         deleted_entries: Sequence[str] = (),
+        ignored_removals: Sequence[str] = (),
     ) -> Optional[List[str]]:
         dialog = FileSelectionDialog(
             self, files, selected_files, changed_files, title=title,
-            deleted_entries=deleted_entries,
+            deleted_entries=deleted_entries, ignored_removals=ignored_removals,
         )
         dialog.show_all()
         response = dialog.run()
@@ -2658,7 +2736,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.destroy()
         if response != Gtk.ResponseType.OK:
             return None
-        if not selected:
+        if not selected and not ignored_removals:
             self.show_error("至少选择一个需要封装的文件、目录或已删除项。")
             return None
         return selected
@@ -2847,7 +2925,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.format_secondary_text(
             "“仅删除版本”保留 Git 提交。\n"
             "“删除版本及提交”仅适用于 main 的最新版本；"
-            "main 将退回上一提交，当前文件保留为未提交修改。"
+            "main 将退回上一提交，当前文件保留为未提交修改。\n"
+            "已有暂存内容会保留；此时被删除提交的改动也会成为暂存中的修改。"
         )
         dialog.add_button("取消", Gtk.ResponseType.CANCEL)
         delete_tag_button = dialog.add_button("仅删除版本", DELETE_TAG_RESPONSE)
@@ -2865,7 +2944,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         elif response == DELETE_COMMIT_RESPONSE:
             operation = lambda: self.repository.delete_latest_version_commit(version)
             busy = "正在删除版本及提交..."
-            success = f"版本 {version} 及其 Git 提交已删除。"
+            success = f"版本 {version} 及其 Git 提交已删除，当前文件和原有暂存内容已保留。"
         else:
             return
         self.run_background(busy, operation, success)
