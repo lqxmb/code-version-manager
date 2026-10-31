@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import gi
 
@@ -70,6 +70,12 @@ DEFAULT_EXCLUDED_DIRECTORIES = {
 # The order is the same as Beyond Compare's Name Filters view: include files,
 # include folders, then the excluded file/folder masks.
 BCOMPARE_FILTER = "*;*;-.git\\;-*.zip;-__pycache__/"
+COMPARE_TOOLS = {
+    "bcompare": ("Beyond Compare", "bcompare"),
+    "meld": ("Meld", "meld"),
+    "kdiff3": ("KDiff3", "kdiff3"),
+}
+DEFAULT_COMPARE_TOOL = "bcompare"
 
 class GitError(RuntimeError):
     pass
@@ -250,6 +256,39 @@ def suggested_ssh_remote(remote_url: str) -> str:
         return "git@github.com:{}/{}.git".format(*coordinates) if coordinates else ""
 
 
+def repository_web_url(remote_url: str) -> str:
+    remote_url = remote_url.strip()
+    if not remote_url:
+        raise GitError("请先填写 SSH 仓库地址。")
+    try:
+        validate_remote_url(remote_url, allow_https=True)
+        if "://" in remote_url:
+            parsed = urlsplit(remote_url)
+            if parsed.scheme not in ("ssh", "https"):
+                raise GitError("本地仓库地址没有对应的仓库网页。")
+            host = parsed.hostname
+            path = parsed.path
+        else:
+            match = re.fullmatch(r"[^@/:\s]+@([^:/\s]+):(.+)", remote_url)
+            if not match:
+                raise GitError("无法从该地址识别仓库网页，请检查 SSH 地址。")
+            host, path = match.groups()
+    except ValueError:
+        raise GitError("SSH 仓库地址格式无效，无法打开网页。") from None
+
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if (
+        not host
+        or not re.fullmatch(r"[A-Za-z0-9.-]+", host)
+        or not path
+        or any(ord(char) < 32 for char in path)
+    ):
+        raise GitError("无法从该地址识别仓库网页，请检查 SSH 地址。")
+    return "https://{}/{}".format(host, quote(path, safe="/-._~"))
+
+
 def github_repository_creation_url(remote_url: str, workspace_name: str) -> str:
     parameters = {"visibility": "private"}
     if remote_url.strip():
@@ -365,6 +404,12 @@ def validate_git_identity(name: str, email: str) -> None:
         raise GitError("提交信息不能包含换行或控制字符。")
 
 
+def validate_compare_tool(value: str) -> str:
+    if value not in COMPARE_TOOLS:
+        raise GitError("对比工具配置无效，请在“Git 账号”中重新选择。")
+    return value
+
+
 class GitRepository:
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
@@ -431,15 +476,26 @@ class GitRepository:
             raise GitError("推送超时必须为 1–60 分钟，请在“Git 账号”中重新设置。")
         return seconds
 
+    def compare_tool(self) -> str:
+        configured = self.run(
+            ["config", "--get", "codeversionmanager.compareTool"], check=False
+        ).strip()
+        if not configured:
+            return DEFAULT_COMPARE_TOOL
+        return validate_compare_tool(configured)
+
     def configure_remote(
         self,
         remote_url: str,
         name: str,
         email: str,
         push_timeout: Optional[int] = None,
+        compare_tool: Optional[str] = None,
     ) -> None:
         remote_url = validate_remote_url(remote_url)
         validate_git_identity(name, email)
+        if compare_tool is not None:
+            compare_tool = validate_compare_tool(compare_tool)
         if push_timeout is not None and (
             not isinstance(push_timeout, int) or not 60 <= push_timeout <= MAX_PUSH_TIMEOUT
         ):
@@ -455,6 +511,11 @@ class GitRepository:
         self.run(["config", "--local", "--unset-all", "codeversionmanager.autoSync"], check=False)
         if push_timeout is not None:
             self.run(["config", "--local", "codeversionmanager.pushTimeout", str(push_timeout)])
+        if compare_tool is not None:
+            self.run([
+                "config", "--local", "codeversionmanager.compareTool",
+                compare_tool,
+            ])
 
     def _run_remote(self, args: Sequence[str], remote_url: str) -> str:
         remote_url = validate_remote_url(remote_url)
@@ -1319,8 +1380,10 @@ class GitRepository:
             bundle.extractall(destination)
 
     def compare(self, left: str, right: Optional[str] = None) -> None:
-        if not shutil.which("bcompare"):
-            raise GitError("没有找到 Beyond Compare。")
+        compare_tool = self.compare_tool()
+        tool_label, command_name = COMPARE_TOOLS[compare_tool]
+        if not shutil.which(command_name):
+            raise GitError(f"没有找到 {tool_label}，请先安装或在“Git 账号”中选择其他对比工具。")
         with tempfile.TemporaryDirectory(prefix="code-version-manager-compare-") as temporary:
             root = Path(temporary)
             left_directory = root / reference_folder_name(left, "left")
@@ -1332,25 +1395,22 @@ class GitRepository:
             else:
                 right_directory = self.path
                 read_only_option = "-leftreadonly"
-            config_home = prepare_bcompare_config(root)
             environment = os.environ.copy()
-            environment["XDG_CONFIG_HOME"] = str(config_home)
+            command = [command_name]
+            if compare_tool == "bcompare":
+                config_home = prepare_bcompare_config(root)
+                environment["XDG_CONFIG_HOME"] = str(config_home)
+                command.extend(["-solo", read_only_option, f"-filters={BCOMPARE_FILTER}"])
+            command.extend([str(left_directory), str(right_directory)])
             result = subprocess.run(
-                [
-                    "bcompare",
-                    "-solo",
-                    read_only_option,
-                    f"-filters={BCOMPARE_FILTER}",
-                    str(left_directory),
-                    str(right_directory),
-                ],
+                command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 env=environment,
             )
             if result.returncode not in (0, 1):
-                raise GitError(result.stderr.strip() or "Beyond Compare 启动失败。")
+                raise GitError(result.stderr.strip() or f"{tool_label} 启动失败。")
 
     def export(self, reference: str, destination: Path) -> None:
         paths = self.manifest(reference)
@@ -2249,6 +2309,10 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         configured_remote = repository.remote_url() if repository else ""
         suggested_remote = suggested_ssh_remote(configured_remote)
         remote_placeholder = f"git@github.com:<你的GitHub账号>/{workspace_repository_name(self.workspace_path.name)}.git"
+        try:
+            configured_compare_tool = repository.compare_tool() if repository else DEFAULT_COMPARE_TOOL
+        except GitError:
+            configured_compare_tool = DEFAULT_COMPARE_TOOL
         values = [
             ("SSH 仓库地址", suggested_remote or configured_remote, remote_placeholder),
             (
@@ -2271,6 +2335,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             entry.set_hexpand(True)
             grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
             grid.attach(entry, 1, row, 1, 1)
+            if row == 0:
+                open_repository = Gtk.Button(label="打开网页")
+                open_repository.set_tooltip_text("在浏览器中打开此 SSH 地址对应的仓库页面")
+                open_repository.connect(
+                    "clicked",
+                    lambda _button: self.open_repository_web_page(dialog, entries[0]),
+                )
+                grid.attach(open_repository, 2, row, 1, 1)
             entries.append(entry)
         if suggested_remote:
             source = "已读取当前工作空间的 origin 地址。"
@@ -2296,14 +2368,21 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         advanced_grid = Gtk.Grid(column_spacing=14, row_spacing=8, margin_top=8)
         advanced_grid.attach(Gtk.Label(label="推送超时（分钟）", xalign=0), 0, 0, 1, 1)
         advanced_grid.attach(push_timeout, 1, 0, 1, 1)
+        compare_tool_combo = Gtk.ComboBoxText()
+        for tool_id, (tool_label, _command) in COMPARE_TOOLS.items():
+            compare_tool_combo.append(tool_id, tool_label)
+        compare_tool_combo.set_active_id(configured_compare_tool)
+        compare_tool_combo.set_tooltip_text("选择发布版本比较时使用的图形对比工具")
+        advanced_grid.attach(Gtk.Label(label="对比工具", xalign=0), 0, 1, 1, 1)
+        advanced_grid.attach(compare_tool_combo, 1, 1, 1, 1)
         timeout_notice = Gtk.Label(
-            label="默认 15 分钟，范围 1–60 分钟，仅用于实际上传。连接和推送预检查的时限为 120 秒。",
+            label="推送超时默认 15 分钟，范围 1–60 分钟；对比工具支持 Beyond Compare、Meld 和 KDiff3。",
             xalign=0,
         )
         timeout_notice.set_line_wrap(True)
         timeout_notice.set_max_width_chars(68)
-        advanced_grid.attach(timeout_notice, 0, 1, 2, 1)
-        advanced = Gtk.Expander(label="高级设置：推送超时")
+        advanced_grid.attach(timeout_notice, 0, 2, 2, 1)
+        advanced = Gtk.Expander(label="高级设置：推送超时与对比工具")
         advanced.add(advanced_grid)
         remote_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         create_remote = Gtk.Button(label="创建远程仓库（网页）")
@@ -2344,12 +2423,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             try:
                 remote_url = validate_remote_url(remote_url)
                 validate_git_identity(name, email)
+                selected_compare_tool = validate_compare_tool(compare_tool_combo.get_active_id())
                 if repository is None:
                     repository = create_repository(self.workspace_path)
                     self.repository = repository
                 repository.configure_remote(
                     remote_url, name, email,
                     push_timeout=push_timeout.get_value_as_int() * 60,
+                    compare_tool=selected_compare_tool,
                 )
             except (GitError, OSError, ValueError) as error:
                 self.show_error(str(error))
@@ -2369,6 +2450,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def open_github_repository_creation(self, dialog, remote_entry) -> None:
         try:
             url = github_repository_creation_url(remote_entry.get_text(), self.workspace_path.name)
+            Gtk.show_uri_on_window(dialog, url, Gdk.CURRENT_TIME)
+        except (GitError, GLib.Error, OSError) as error:
+            self.show_error(str(error))
+
+
+    def open_repository_web_page(self, dialog, remote_entry) -> None:
+        try:
+            url = repository_web_url(remote_entry.get_text())
             Gtk.show_uri_on_window(dialog, url, Gdk.CURRENT_TIME)
         except (GitError, GLib.Error, OSError) as error:
             self.show_error(str(error))
@@ -2856,7 +2945,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         older = selected[positions.index(max(positions))]
         newer = selected[positions.index(min(positions))]
         self.run_background(
-            "Beyond Compare 已打开...",
+            "对比工具已打开...",
             lambda: self.repository.compare(older.reference, newer.reference),
             "版本比较已关闭。",
         )
@@ -2870,7 +2959,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             return
         entry = selected[0]
         self.run_background(
-            "Beyond Compare 已打开...",
+            "对比工具已打开...",
             lambda: self.repository.compare(entry.reference),
             "版本与当前工作空间的比较已关闭。",
         )

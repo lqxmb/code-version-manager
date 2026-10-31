@@ -18,8 +18,9 @@
 - 版本历史按多段版本号从新到旧排序，不受文件日期影响
 - 查看版本历史和版本标签
 - 手动修改已发布版本的修改说明，并同步更新 Git 标签和 CHANGELOG
-- 使用 Beyond Compare 比较两个完整版本目录
-- 选择一个历史版本，使用 Beyond Compare 与完整当前工作空间比较并修改当前文件
+- 使用 Beyond Compare、Meld 或 KDiff3 比较两个完整版本目录
+- 选择一个历史版本，使用已配置的对比工具与完整当前工作空间比较并修改当前文件
+- 在“Git 账号 → 高级设置”中选择当前工作空间使用的对比工具，默认使用 Beyond Compare
 - Beyond Compare 每次比较都加载软件内置的 `BCSessions.xml` 默认配置：按文件大小比较、关闭时间戳和内容快速比较、启用 Unicode 规范化，排除 `.git`、`*.zip` 和 `__pycache__`，目录树默认折叠
 - 任意选择一个历史版本并下载为 ZIP，默认文件名为 `工作空间名_版本号.zip`（如 `m9_ws_v1.2.0.zip`）
 - 删除所选版本标签，不改写提交历史或删除工作空间文件
@@ -112,18 +113,18 @@
 
 旧版仅扫描仍存在的文件，整个顶层目录或文件被删除后会从发布列表消失，导致删除未提交。ZIP 按本机封装清单导出，而 Git 标签和 GitHub 仍保留旧文件，因此同一版本可能出现不同文件清单。升级后发布新版本时，勾选这些已删除项即可修正新版本；已经发布的旧标签需要另行修正，升级本身不会改写已有版本。
 
-## 构建 0.2.4 安装包
+## 构建 0.2.5 安装包
 
 构建脚本要求 `VERSION` 和 `debian/control` 中的版本号一致。执行以下命令同步版本号并打包：
 
 ```bash
 # 在 code-version-manager/ 目录中执行
-printf '0.2.4\n' > VERSION
-sed -i 's/^Version:.*/Version: 0.2.4/' debian/control
+printf '0.2.5\n' > VERSION
+sed -i 's/^Version:.*/Version: 0.2.5/' debian/control
 sh build_deb.sh
 ```
 
-生成的安装包为 `dist/code-version-manager_0.2.4_all.deb`。
+生成的安装包为 `dist/code-version-manager_0.2.5_all.deb`。
 
 安装前先关闭正在运行的版本管理器。需要卸载旧版时可执行（直接升级无需卸载）：
 
@@ -134,7 +135,7 @@ sudo apt remove code-version-manager
 在项目目录中执行以下命令安装或升级：
 
 ```bash
-sudo apt install ./dist/code-version-manager_0.2.4_all.deb
+sudo apt install ./dist/code-version-manager_0.2.5_all.deb
 ```
 
 
