@@ -406,7 +406,7 @@ def validate_git_identity(name: str, email: str) -> None:
 
 def validate_compare_tool(value: str) -> str:
     if value not in COMPARE_TOOLS:
-        raise GitError("对比工具配置无效，请在“Git 账号”中重新选择。")
+        raise GitError("对比工具配置无效，请在“设置”中重新选择。")
     return value
 
 
@@ -483,6 +483,12 @@ class GitRepository:
         if not configured:
             return DEFAULT_COMPARE_TOOL
         return validate_compare_tool(configured)
+
+    def configure_compare_tool(self, compare_tool: str) -> None:
+        self.run([
+            "config", "--local", "codeversionmanager.compareTool",
+            validate_compare_tool(compare_tool),
+        ])
 
     def configure_remote(
         self,
@@ -1383,7 +1389,7 @@ class GitRepository:
         compare_tool = self.compare_tool()
         tool_label, command_name = COMPARE_TOOLS[compare_tool]
         if not shutil.which(command_name):
-            raise GitError(f"没有找到 {tool_label}，请先安装或在“Git 账号”中选择其他对比工具。")
+            raise GitError(f"没有找到 {tool_label}，请先安装或在“设置”中选择其他对比工具。")
         with tempfile.TemporaryDirectory(prefix="code-version-manager-compare-") as temporary:
             root = Path(temporary)
             left_directory = root / reference_folder_name(left, "left")
@@ -1768,6 +1774,7 @@ class FileSelectionDialog(Gtk.Dialog):
 class VersionManagerWindow(Gtk.ApplicationWindow):
     def __init__(self, application: Gtk.Application, initial_path: Path):
         super().__init__(application=application, title=APP_NAME)
+        self.get_style_context().add_class("version-manager-app")
         self.set_default_size(1120, 720)
         self.set_icon_name("code-version-manager")
         self.repository: Optional[GitRepository] = None
@@ -1789,8 +1796,10 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def _build_header(self) -> None:
         header = Gtk.HeaderBar()
+        header.get_style_context().add_class("app-header")
         self.header = header
         header.set_show_close_button(True)
+        header.set_decoration_layout(":minimize,maximize,close")
         header.props.title = APP_NAME
         self.set_titlebar(header)
 
@@ -1810,17 +1819,24 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.recent_button.set_popover(self.recent_popover)
         header.pack_start(self.recent_button)
 
+        settings_button = self._command_button(
+            "设置", "preferences-system-symbolic", self.on_settings
+        )
+        header.pack_start(settings_button)
+
         self.git_account_button = self._command_button(
             "Git 账号", "avatar-default-symbolic", self.on_git_account
         )
         header.pack_end(self.git_account_button)
         sync_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.sync_local_button = self._command_button(
-            "同步本地", "go-down-symbolic", self.on_sync_local
-        )
-        self.sync_remote_button = self._command_button(
-            "同步远程", "go-up-symbolic", self.on_sync_remote
-        )
+        self.sync_local_button = Gtk.Button(label="↓  同步本地")
+        self.sync_local_button.set_tooltip_text("以远程分支和版本标签更新本地")
+        self.sync_local_button.connect("clicked", self.on_sync_local)
+        self.sync_local_button.get_style_context().add_class("sync-action")
+        self.sync_remote_button = Gtk.Button(label="↑  同步远程")
+        self.sync_remote_button.set_tooltip_text("以本地分支和版本标签覆盖远程")
+        self.sync_remote_button.connect("clicked", self.on_sync_remote)
+        self.sync_remote_button.get_style_context().add_class("sync-action")
         self.sync_local_button.set_sensitive(False)
         self.sync_remote_button.set_sensitive(False)
         sync_actions.pack_start(self.sync_local_button, False, False, 0)
@@ -1849,10 +1865,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def _add_maximize_button(dialog: Gtk.Dialog) -> Gtk.Button:
         dialog.set_type_hint(Gdk.WindowTypeHint.NORMAL)
         header = Gtk.HeaderBar()
+        header.get_style_context().add_class("app-header")
         header.set_title(dialog.get_title())
         header.set_show_close_button(True)
+        header.set_decoration_layout(":close")
         button = Gtk.Button.new_from_icon_name(
-            "view-fullscreen-symbolic", Gtk.IconSize.BUTTON
+            "window-maximize-symbolic", Gtk.IconSize.BUTTON
         )
         button.set_tooltip_text("最大化窗口")
         button.connect(
@@ -1875,7 +1893,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     @staticmethod
     def _on_dialog_window_state(_dialog, event, button: Gtk.Button) -> bool:
         maximized = bool(event.new_window_state & Gdk.WindowState.MAXIMIZED)
-        icon = "view-restore-symbolic" if maximized else "view-fullscreen-symbolic"
+        icon = "window-restore-symbolic" if maximized else "window-maximize-symbolic"
         tooltip = "还原窗口" if maximized else "最大化窗口"
         button.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
         button.set_tooltip_text(tooltip)
@@ -1883,6 +1901,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def _build_content(self) -> None:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.get_style_context().add_class("app-shell")
         self.add(root)
 
         self.info_bar = Gtk.InfoBar()
@@ -1898,6 +1917,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.toolbar = toolbar
         toolbar.get_style_context().add_class("command-bar")
         self.save_button = self._command_button("发布版本", "document-save-symbolic", self.on_save_version)
+        self.save_button.get_style_context().add_class("primary-action")
         self.save_button.set_tooltip_text("仅在本地创建版本，不上传到远程仓库")
         self.compare_button = self._command_button("比较所选版本", "edit-copy-symbolic", self.on_compare_versions)
         self.current_button = self._command_button(
@@ -1910,13 +1930,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.delete_button = self._icon_button(
             "edit-delete-symbolic", "删除所选版本", self.on_delete_version
         )
+        self.delete_button.get_style_context().add_class("destructive-action")
         self.changelog_button = self._command_button(
             "查看 CHANGELOG", "document-properties-symbolic", self.on_view_changelog
         )
         self.download_changelog_button = self._command_button(
             "下载 CHANGELOG", "document-save-symbolic", self.on_download_changelog
         )
-        for button in (
+        buttons = (
             self.save_button,
             self.compare_button,
             self.current_button,
@@ -1925,7 +1946,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.delete_button,
             self.changelog_button,
             self.download_changelog_button,
-        ):
+        )
+        for index, button in enumerate(buttons):
+            if index in (1, 3, 5, 7):
+                separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+                separator.get_style_context().add_class("command-separator")
+                toolbar.pack_start(separator, False, False, 4)
             toolbar.pack_start(button, False, False, 0)
         root.pack_start(toolbar, False, False, 0)
 
@@ -1937,11 +1963,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         footer.get_style_context().add_class("footer")
         self.repo_label = Gtk.Label(xalign=0, ellipsize=3)
+        self.repo_label.get_style_context().add_class("workspace-status")
         self.storage_label = Gtk.Label(xalign=1)
+        self.storage_label.get_style_context().add_class("storage-status")
         self.storage_label.set_tooltip_text(
             "当前工作空间 Git 增量版本历史实际占用的磁盘空间，不包含工作空间源文件"
         )
         self.status_label = Gtk.Label(xalign=1)
+        self.status_label.get_style_context().add_class("operation-status")
         footer.pack_start(self.repo_label, True, True, 0)
         footer.pack_end(self.status_label, False, False, 0)
         footer.pack_end(self.storage_label, False, False, 0)
@@ -1951,6 +1980,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.history_store = Gtk.ListStore(str, str, str, str, str)
         self.history_tree = Gtk.TreeView(model=self.history_store)
         self.history_tree.set_headers_clickable(True)
+        self.history_tree.get_style_context().add_class("data-table")
+        self.history_tree.set_rules_hint(True)
         self.history_tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.history_tree.connect("row-activated", self.on_history_activated)
         columns = (
@@ -1974,6 +2005,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def _build_changes_view(self) -> Gtk.Widget:
         self.change_store = Gtk.ListStore(str, str)
         tree = Gtk.TreeView(model=self.change_store)
+        tree.get_style_context().add_class("data-table")
+        tree.set_rules_hint(True)
         status_renderer = Gtk.CellRendererText()
         path_renderer = Gtk.CellRendererText()
         tree.append_column(Gtk.TreeViewColumn("状态", status_renderer, text=0))
@@ -1987,19 +2020,115 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def _apply_style(self) -> None:
         css = b"""
-        .command-bar { padding: 8px 10px; border-bottom: 1px solid alpha(@borders, 0.8); }
-        .command-bar button { min-height: 30px; padding: 2px 10px; }
-        .footer { padding: 7px 12px; border-top: 1px solid alpha(@borders, 0.8); }
-        treeview { padding: 2px; }
-        button.sync-synced, button.sync-synced:disabled {
-            background-image: none; background-color: #278044; color: white;
-            border-color: #206b39; text-shadow: none; box-shadow: none; opacity: 1;
+        window.version-manager-app { background-color: #f3f6f8; color: #24313b; }
+        headerbar.app-header, headerbar.app-header:backdrop {
+            min-height: 48px; padding: 4px 10px; background-image: none;
+            background-color: #ffffff; border-bottom: 1px solid #d9e0e5;
+            color: #24313b; box-shadow: none; text-shadow: none;
         }
-        button.sync-pending, button.sync-pending:disabled {
+        headerbar.app-header .title, headerbar.app-header .subtitle {
+            color: #24313b; text-shadow: none;
+        }
+        headerbar.app-header button {
+            min-height: 28px; min-width: 24px; padding: 4px 8px;
+            background-image: none; background-color: #ffffff; color: #26343e;
+            border: 1px solid #d4dce2; border-radius: 4px;
+            box-shadow: none; text-shadow: none;
+        }
+        headerbar.app-header button label, headerbar.app-header button image {
+            color: inherit; -gtk-icon-shadow: none;
+        }
+        headerbar.app-header button:hover {
+            background-color: #edf3f5; border-color: #9eafb9;
+        }
+        headerbar.app-header button:disabled {
+            color: #89959d; background-color: #f3f5f6;
+        }
+        headerbar.app-header button.sync-action {
+            min-width: 112px; padding: 4px 10px; font-weight: bold;
+        }
+        headerbar.app-header button.titlebutton.close:hover {
+            background-color: #bb3030; border-color: #982727; color: white;
+        }
+        .command-bar {
+            padding: 9px 12px; background-color: #f8fafb;
+            border-bottom: 1px solid #d9e0e5;
+        }
+        .command-bar button {
+            min-height: 32px; padding: 3px 9px; border-radius: 4px;
+            border: 1px solid #d4dce2; background-image: none;
+            background-color: #ffffff; color: #26343e;
+        }
+        .command-bar button:hover { background-color: #edf3f5; border-color: #9eafb9; }
+        .command-bar button:disabled { color: #89959d; background-color: #f3f5f6; }
+        .command-bar button.primary-action,
+        .command-bar button.primary-action:disabled {
+            color: #ffffff; background-color: #197d87; border-color: #126a73;
+            text-shadow: none; opacity: 1;
+        }
+        .command-bar button.primary-action:hover { background-color: #126d76; }
+        .command-bar button.destructive-action { color: #a73232; }
+        .command-bar button.destructive-action:hover {
+            color: #8f2222; background-color: #fff0ef; border-color: #d99a96;
+        }
+        .command-separator { margin: 3px 3px; background-color: #d5dde2; }
+        notebook { padding: 8px 12px 10px; }
+        notebook > header { background-color: transparent; border-bottom: 1px solid #d5dde2; }
+        notebook > header > tabs > tab { padding: 8px 14px; color: #5d6a73; }
+        notebook > header > tabs > tab:checked {
+            color: #126d76; border-bottom: 2px solid #197d87;
+        }
+        treeview.data-table.view {
+            padding: 2px; background-color: #ffffff; color: #26343e;
+            border: 1px solid #d9e0e5;
+        }
+        treeview.data-table.view:selected,
+        treeview.data-table.view:selected:focus {
+            background-color: #d9eff0; color: #17383b;
+        }
+        treeview.data-table header button {
+            min-height: 32px; padding: 4px 8px; color: #43525c;
+            background-image: none; background-color: #edf2f4;
+            border: 0; border-right: 1px solid #d9e0e5;
+            border-bottom: 1px solid #d9e0e5; border-radius: 0;
+            font-weight: bold;
+        }
+        .footer {
+            min-height: 34px; padding: 6px 12px; background-color: #ffffff;
+            border-top: 1px solid #d9e0e5;
+        }
+        .workspace-status { color: #43525c; }
+        .storage-status { color: #687780; }
+        .operation-status { color: #126d76; font-weight: bold; }
+        .dialog-title { color: #24343e; font-size: 14pt; font-weight: bold; }
+        dialog { background-color: #f3f6f8; color: #26343e; }
+        dialog entry, dialog spinbutton, dialog combobox button {
+            min-height: 30px; padding: 3px 7px; border-radius: 4px;
+            background-color: #ffffff; color: #26343e;
+            border: 1px solid #cbd5db;
+        }
+        dialog entry:focus, dialog spinbutton:focus, dialog combobox button:focus {
+            border-color: #197d87;
+        }
+        dialog button { min-height: 30px; padding: 3px 10px; border-radius: 4px; }
+        dialog scrolledwindow { border: 1px solid #d9e0e5; }
+        infobar.warning { background-color: #fff3dc; color: #654d1b; }
+        headerbar.app-header button.sync-pending,
+        headerbar.app-header button.sync-pending:disabled {
             background-image: none; background-color: #bb3030; color: white;
             border-color: #982727; text-shadow: none; box-shadow: none; opacity: 1;
         }
-        button.sync-pending:hover { background-color: #a32929; }
+        headerbar.app-header button.sync-pending:hover { background-color: #a32929; }
+        headerbar.app-header button.sync-synced,
+        headerbar.app-header button.sync-synced:disabled {
+            background-image: none; background-color: #32804f; color: white;
+            border-color: #286b41; text-shadow: none; box-shadow: none; opacity: 1;
+        }
+        headerbar.app-header button.sync-unavailable,
+        headerbar.app-header button.sync-unavailable:disabled {
+            background-image: none; background-color: #f1f4f5; color: #89959d;
+            border-color: #d5dde2; text-shadow: none; box-shadow: none; opacity: 1;
+        }
         """
         provider = Gtk.CssProvider()
         provider.load_from_data(css)
@@ -2132,18 +2261,21 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         context = button.get_style_context()
         context.remove_class("sync-synced")
         context.remove_class("sync-pending")
+        context.remove_class("sync-unavailable")
         if self.remote_status.state == "checking":
+            context.add_class("sync-unavailable")
             message = "正在检查远程分支和版本标签。"
         elif pending:
             context.add_class("sync-pending")
             message = active_message if can_sync else (inactive_message or active_message)
-        elif self.remote_status.state == "synced":
+        elif self.remote_status.state == "unavailable":
+            context.add_class("sync-unavailable")
+            message = inactive_message or self.remote_status.message
+        else:
             context.add_class("sync-synced")
             message = "本地分支和版本标签已与远程一致。"
-        else:
-            message = inactive_message
         button.set_tooltip_text(message)
-        button.set_sensitive(can_sync and not self.busy)
+        button.set_sensitive(pending and can_sync and not self.busy)
 
     def _refresh_remote_status(self) -> None:
         if self.busy:
@@ -2289,6 +2421,64 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.run()
         dialog.destroy()
 
+    def on_settings(self, _button) -> None:
+        if not self.repository:
+            self.show_error("请先启用版本管理，再配置对比工具。")
+            return
+        try:
+            configured_tool = self.repository.compare_tool()
+        except GitError:
+            configured_tool = DEFAULT_COMPARE_TOOL
+        dialog = Gtk.Dialog(title="设置", transient_for=self, modal=True)
+        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "保存", Gtk.ResponseType.OK)
+        dialog.set_default_size(520, 300)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin=20)
+        title = Gtk.Label(label="工作空间设置", xalign=0)
+        title.get_style_context().add_class("dialog-title")
+        content.pack_start(title, False, False, 0)
+        description = Gtk.Label(
+            label="选择当前工作空间用于版本比较的图形工具。设置保存在当前仓库，不影响其他工作空间。",
+            xalign=0,
+        )
+        description.set_line_wrap(True)
+        description.set_max_width_chars(60)
+        content.pack_start(description, False, False, 0)
+        grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        combo = Gtk.ComboBoxText()
+        for tool_id, (tool_label, _command) in COMPARE_TOOLS.items():
+            combo.append(tool_id, tool_label)
+        combo.set_active_id(configured_tool)
+        combo.set_hexpand(True)
+        combo.set_tooltip_text("选择发布版本比较时使用的图形对比工具")
+        grid.attach(Gtk.Label(label="对比工具", xalign=0), 0, 0, 1, 1)
+        grid.attach(combo, 1, 0, 1, 1)
+        note = Gtk.Label(
+            label="支持 Beyond Compare、Meld 和 KDiff3。所选工具需要先安装；默认使用 Beyond Compare。",
+            xalign=0,
+        )
+        note.set_line_wrap(True)
+        note.set_max_width_chars(60)
+        grid.attach(note, 0, 1, 2, 1)
+        content.pack_start(grid, False, False, 0)
+        content.pack_start(
+            Gtk.Label(label=f"当前工作空间：{self.workspace_path}", xalign=0),
+            False, False, 0,
+        )
+        dialog.get_content_area().add(content)
+        dialog.show_all()
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            try:
+                self.repository.configure_compare_tool(combo.get_active_id())
+                self.status_label.set_text(
+                    f"对比工具已设置为 {COMPARE_TOOLS[combo.get_active_id()][0]}"
+                )
+            except (GitError, OSError, ValueError) as error:
+                dialog.destroy()
+                self.show_error(str(error))
+                return
+        dialog.destroy()
+
     def on_git_account(self, _button) -> None:
         repository = self.repository
         dialog = Gtk.Dialog(title="Git 账号与远程仓库", transient_for=self, modal=True)
@@ -2309,10 +2499,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         configured_remote = repository.remote_url() if repository else ""
         suggested_remote = suggested_ssh_remote(configured_remote)
         remote_placeholder = f"git@github.com:<你的GitHub账号>/{workspace_repository_name(self.workspace_path.name)}.git"
-        try:
-            configured_compare_tool = repository.compare_tool() if repository else DEFAULT_COMPARE_TOOL
-        except GitError:
-            configured_compare_tool = DEFAULT_COMPARE_TOOL
         values = [
             ("SSH 仓库地址", suggested_remote or configured_remote, remote_placeholder),
             (
@@ -2368,21 +2554,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         advanced_grid = Gtk.Grid(column_spacing=14, row_spacing=8, margin_top=8)
         advanced_grid.attach(Gtk.Label(label="推送超时（分钟）", xalign=0), 0, 0, 1, 1)
         advanced_grid.attach(push_timeout, 1, 0, 1, 1)
-        compare_tool_combo = Gtk.ComboBoxText()
-        for tool_id, (tool_label, _command) in COMPARE_TOOLS.items():
-            compare_tool_combo.append(tool_id, tool_label)
-        compare_tool_combo.set_active_id(configured_compare_tool)
-        compare_tool_combo.set_tooltip_text("选择发布版本比较时使用的图形对比工具")
-        advanced_grid.attach(Gtk.Label(label="对比工具", xalign=0), 0, 1, 1, 1)
-        advanced_grid.attach(compare_tool_combo, 1, 1, 1, 1)
         timeout_notice = Gtk.Label(
-            label="推送超时默认 15 分钟，范围 1–60 分钟；对比工具支持 Beyond Compare、Meld 和 KDiff3。",
+            label="推送超时默认 15 分钟，范围 1–60 分钟，仅用于实际上传。连接和推送预检查的时限为 120 秒。",
             xalign=0,
         )
         timeout_notice.set_line_wrap(True)
         timeout_notice.set_max_width_chars(68)
-        advanced_grid.attach(timeout_notice, 0, 2, 2, 1)
-        advanced = Gtk.Expander(label="高级设置：推送超时与对比工具")
+        advanced_grid.attach(timeout_notice, 0, 1, 2, 1)
+        advanced = Gtk.Expander(label="高级设置：推送超时")
         advanced.add(advanced_grid)
         remote_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         create_remote = Gtk.Button(label="创建远程仓库（网页）")
@@ -2423,14 +2602,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             try:
                 remote_url = validate_remote_url(remote_url)
                 validate_git_identity(name, email)
-                selected_compare_tool = validate_compare_tool(compare_tool_combo.get_active_id())
                 if repository is None:
                     repository = create_repository(self.workspace_path)
                     self.repository = repository
                 repository.configure_remote(
                     remote_url, name, email,
                     push_timeout=push_timeout.get_value_as_int() * 60,
-                    compare_tool=selected_compare_tool,
                 )
             except (GitError, OSError, ValueError) as error:
                 self.show_error(str(error))

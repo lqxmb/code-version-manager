@@ -20,7 +20,7 @@
 - 手动修改已发布版本的修改说明，并同步更新 Git 标签和 CHANGELOG
 - 使用 Beyond Compare、Meld 或 KDiff3 比较两个完整版本目录
 - 选择一个历史版本，使用已配置的对比工具与完整当前工作空间比较并修改当前文件
-- 在“Git 账号 → 高级设置”中选择当前工作空间使用的对比工具，默认使用 Beyond Compare
+- 在标题栏“设置”中选择当前工作空间使用的对比工具，默认使用 Beyond Compare
 - Beyond Compare 每次比较都加载软件内置的 `BCSessions.xml` 默认配置：按文件大小比较、关闭时间戳和内容快速比较、启用 Unicode 规范化，排除 `.git`、`*.zip` 和 `__pycache__`，目录树默认折叠
 - 任意选择一个历史版本并下载为 ZIP，默认文件名为 `工作空间名_版本号.zip`（如 `m9_ws_v1.2.0.zip`）
 - 删除所选版本标签，不改写提交历史或删除工作空间文件
@@ -34,7 +34,7 @@
 
 ## Git 账号与远程同步
 
-远程同步统一使用 SSH；本地仓库路径也可用于同步。配置界面包含 SSH 仓库地址、提交姓名和邮箱，推送超时放在“高级设置”中。0.2.0 起发布版本只保存到本地，移除自动同步选项；旧版启用的自动同步配置也不再触发上传。
+远程同步统一使用 SSH；本地仓库路径也可用于同步。配置界面包含 SSH 仓库地址、提交姓名和邮箱，推送超时放在“Git 账号”的高级设置中；对比工具通过标题栏“设置”配置。0.2.0 起发布版本只保存到本地，移除自动同步选项；旧版启用的自动同步配置也不再触发上传。
 
 1. 在 GitHub、Gitee、GitLab 或其他 Git 服务上先创建远程仓库，并确保 SSH 密钥所属账号具有写入权限。GitHub 可点击“Git 账号”中的“创建远程仓库（网页）”，在官方网页登录并确认创建。
 2. 打开工作空间，点击“Git 账号”。软件优先填入该工作空间的 `origin` 地址，并将 GitHub 的 HTTPS 地址转换为 SSH。例如，本项目的地址为 `git@github.com:lqxmb/code-version-manager.git`。没有 `origin` 时，按工作空间目录名显示地址示例；请填写真实的 GitHub 账号或组织，确认远程仓库名，再填写提交姓名和邮箱。自定义 SSH 主机别名和端口按系统 SSH 配置使用。
@@ -113,18 +113,18 @@
 
 旧版仅扫描仍存在的文件，整个顶层目录或文件被删除后会从发布列表消失，导致删除未提交。ZIP 按本机封装清单导出，而 Git 标签和 GitHub 仍保留旧文件，因此同一版本可能出现不同文件清单。升级后发布新版本时，勾选这些已删除项即可修正新版本；已经发布的旧标签需要另行修正，升级本身不会改写已有版本。
 
-## 构建 0.2.5 安装包
+## 构建 0.2.6 安装包
 
 构建脚本要求 `VERSION` 和 `debian/control` 中的版本号一致。执行以下命令同步版本号并打包：
 
 ```bash
 # 在 code-version-manager/ 目录中执行
-printf '0.2.5\n' > VERSION
-sed -i 's/^Version:.*/Version: 0.2.5/' debian/control
+printf '0.2.6\n' > VERSION
+sed -i 's/^Version:.*/Version: 0.2.6/' debian/control
 sh build_deb.sh
 ```
 
-生成的安装包为 `dist/code-version-manager_0.2.5_all.deb`。
+生成的安装包为 `dist/code-version-manager_0.2.6_all.deb`。
 
 安装前先关闭正在运行的版本管理器。需要卸载旧版时可执行（直接升级无需卸载）：
 
@@ -135,7 +135,7 @@ sudo apt remove code-version-manager
 在项目目录中执行以下命令安装或升级：
 
 ```bash
-sudo apt install ./dist/code-version-manager_0.2.5_all.deb
+sudo apt install ./dist/code-version-manager_0.2.6_all.deb
 ```
 
 
