@@ -50,6 +50,9 @@ METADATA_DIRECTORY = "code-version-manager"
 MANIFEST_DIRECTORY = "versions"
 MANIFEST_SUFFIX = ".manifest"
 MANAGER_CHANGELOG = "CHANGELOG.rst"
+WORKSPACE_CHANGELOG = "CHANGELOG.rst"
+WORKSPACE_VERSION = "VERSION"
+VERSION_SYNC_CONFIG = "codeversionmanager.syncVersionFile"
 RECENT_WORKSPACE_LIMIT = 10
 DELETE_TAG_RESPONSE = 1
 DELETE_COMMIT_RESPONSE = 2
@@ -66,6 +69,36 @@ DEFAULT_EXCLUDED_DIRECTORIES = {
     "log",
     "logs",
 }
+DEFAULT_WORKSPACE_GITIGNORE = """# Catkin-generated output
+/build/
+/devel/
+/install/
+/build_isolated/
+/devel_isolated/
+/install_isolated/
+/.catkin_workspace
+
+# Local editor settings
+/.vscode/
+
+# Logs and caches
+/log/
+/logs/
+/.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor temporary files
+*.swp
+*~
+
+# ZIP exports
+*.zip
+
+# Local release notes, read by the publish dialog
+/CHANGELOG.rst
+"""
 # Ubuntu's bcompare launcher re-quotes arguments, so this must not end in a backslash.
 # The order is the same as Beyond Compare's Name Filters view: include files,
 # include folders, then the excluded file/folder masks.
@@ -577,6 +610,15 @@ class GitRepository:
             "config", "--local", "codeversionmanager.compareTool",
             validate_compare_tool(compare_tool),
         ])
+
+    def sync_version_file_enabled(self) -> bool:
+        configured = self.run(["config", "--local", "--get", VERSION_SYNC_CONFIG], check=False)
+        if not configured:
+            return (self.path / WORKSPACE_VERSION).is_file()
+        return self.run(["config", "--local", "--bool", "--get", VERSION_SYNC_CONFIG]).strip() == "true"
+
+    def configure_version_file(self, enabled: bool) -> None:
+        self.run(["config", "--local", VERSION_SYNC_CONFIG, "true" if enabled else "false"])
 
     def configure_remote(
         self,
@@ -1411,7 +1453,7 @@ class GitRepository:
             for value in result.stdout.split(b"\0")
             if value
         }
-        return [path for path in paths if path not in ignored]
+        return [path for path in paths if path not in ignored and path != WORKSPACE_CHANGELOG]
 
     def ignored_tracked_files(self) -> List[str]:
         # Include HEAD as well as the index so staged removals are not missed.
@@ -1427,6 +1469,8 @@ class GitRepository:
         message: str,
         selected_files: Sequence[str],
         selected_scopes: Optional[Sequence[str]] = None,
+        *,
+        sync_version_file: Optional[bool] = None,
     ) -> None:
         if self.current_branch() is None:
             raise GitError("当前正在查看历史版本。请先返回 main，再发布新版本。")
@@ -1441,8 +1485,21 @@ class GitRepository:
         commit_message = changes[0]
         if len(changes) > 1:
             commit_message += "\n\n" + "\n".join(changes[1:])
+        if not self.run(["rev-parse", "--verify", "HEAD"], check=False).strip():
+            added = prepare_workspace_release_files(self.path)
+            selected_files = sorted(set(selected_files) | set(added))
         selected = validate_selected_files(self.path, selected_files)
         selected = self.filter_ignored(selected)
+        sync_version = (
+            self.sync_version_file_enabled() if sync_version_file is None else sync_version_file
+        )
+        version_path = self.path / WORKSPACE_VERSION
+        if sync_version:
+            if version_path.is_symlink() or (version_path.exists() and not version_path.is_file()):
+                raise GitError("同步 VERSION 需要根目录下的普通文件，请先检查 VERSION 的路径类型。")
+            if not self.filter_ignored([WORKSPACE_VERSION]):
+                raise GitError("VERSION 被 .gitignore 排除，请先移除对应忽略规则，或关闭 VERSION 同步。")
+            selected = sorted(set(selected) | {WORKSPACE_VERSION})
         scopes = validate_top_level_scopes(selected_scopes or [])
         deleted = self.filter_ignored([
             path for path in self.deleted_files()
@@ -1471,15 +1528,26 @@ class GitRepository:
                 ["read-tree", "HEAD"] if has_head else ["read-tree", "--empty"],
                 env=environment,
             )
-            self._add_paths(added_paths, env=environment)
-            if ignored_removals:
-                # Remove ignored historical files from the version, never from disk.
-                self.run(
-                    ["update-index", "--force-remove", "-z", "--stdin"],
-                    input="\0".join(ignored_removals) + "\0",
-                    env=environment,
-                )
-            self.run(["commit", "--allow-empty", "-m", commit_message], env=environment)
+            previous_version = version_path.read_bytes() if sync_version and version_path.exists() else None
+            try:
+                if sync_version:
+                    version_path.write_text(version[1:] + "\n", encoding="utf-8")
+                self._add_paths(added_paths, env=environment)
+                if ignored_removals:
+                    # Remove ignored historical files from the version, never from disk.
+                    self.run(
+                        ["update-index", "--force-remove", "-z", "--stdin"],
+                        input="\0".join(ignored_removals) + "\0",
+                        env=environment,
+                    )
+                self.run(["commit", "--allow-empty", "-m", commit_message], env=environment)
+            except Exception:
+                if sync_version:
+                    if previous_version is None:
+                        version_path.unlink(missing_ok=True)
+                    else:
+                        version_path.write_bytes(previous_version)
+                raise
             # Match the real index to the new commit only for published paths.
             # NUL-delimited stdin handles large selections and literal filenames.
             self.run(
@@ -1490,6 +1558,7 @@ class GitRepository:
         self.run(["tag", "-a", version, "-m", commit_message])
         self._write_manifest(version, selected)
         self._write_changelog(None)
+        self.configure_version_file(sync_version)
 
     def update_version_message(self, version: str, message: str) -> None:
         if not VERSION_PATTERN.match(version) or version not in self.tags():
@@ -1668,6 +1737,72 @@ def normalize_changes(message: str) -> List[str]:
     return changes
 
 
+def workspace_version_message(root: Path, version: str) -> Optional[str]:
+    """Read only the requested RST release section, without changing the file."""
+    if not VERSION_PATTERN.fullmatch(version):
+        return None
+    try:
+        lines = (root / WORKSPACE_CHANGELOG).read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeError):
+        return None
+
+    def is_heading(index: int) -> bool:
+        title = lines[index].strip()
+        underline = lines[index + 1].strip() if index + 1 < len(lines) else ""
+        return bool(
+            title and not lines[index][0].isspace()
+            and len(underline) >= max(3, len(title))
+            and re.fullmatch(r"([=\-~^\"'+#*`:])\1+", underline)
+        )
+
+    for index, line in enumerate(lines):
+        heading = re.fullmatch(r"v?(\d+(?:\.\d+){2,})\s+\(\d{4}-\d{2}-\d{2}\)", line.strip())
+        if not heading or heading.group(1) != version[1:] or not is_heading(index):
+            continue
+        changes: List[str] = []
+        for body_index in range(index + 2, len(lines)):
+            if is_heading(body_index):
+                break
+            body = lines[body_index]
+            bullet = re.match(r"^[*+-]\s+(.+)$", body)
+            if bullet:
+                changes.append(bullet.group(1).strip())
+            elif body[:1].isspace() and body.strip() and changes:
+                changes[-1] += " " + body.strip()
+        return "\n".join(changes)
+    return None
+
+
+def prepare_workspace_release_files(root: Path) -> List[str]:
+    """Create the local notes template and return changed files to publish."""
+    changelog = root / WORKSPACE_CHANGELOG
+    if changelog.is_symlink() or (changelog.exists() and not changelog.is_file()):
+        raise GitError("无法创建 CHANGELOG.rst：根目录同名路径必须是普通文件。")
+    gitignore = root / ".gitignore"
+    if gitignore.is_symlink() or (gitignore.exists() and not gitignore.is_file()):
+        raise GitError("无法更新 .gitignore：根目录 .gitignore 必须是普通文件。")
+    if not changelog.exists() and not changelog.is_symlink():
+        title = f"Changelog for {root.name}"
+        marker = "^" * max(39, len(title))
+        heading = f"0.0.1 ({date.today().isoformat()})"
+        changelog.write_text(
+            f"{marker}\n{title}\n{marker}\n\n"
+            ".. 在下方添加版本节，例如（去掉示例前的注释标记）：\n..\n"
+            f"..    {heading}\n..    {'-' * len(heading)}\n..    * 改动内容\n",
+            encoding="utf-8",
+        )
+    if not gitignore.exists():
+        gitignore.write_text(DEFAULT_WORKSPACE_GITIGNORE, encoding="utf-8")
+        return [".gitignore"]
+    content = gitignore.read_bytes()
+    if b"/CHANGELOG.rst" not in content.splitlines():
+        newline = b"\r\n" if b"\r\n" in content else b"\n"
+        separator = b"" if not content or content.endswith(b"\n") else newline
+        gitignore.write_bytes(content + separator + b"/CHANGELOG.rst" + newline)
+        return [".gitignore"]
+    return []
+
+
 def validate_selected_files(root: Path, selected_files: Sequence[str]) -> List[str]:
     selected = []
     root = root.resolve()
@@ -1831,14 +1966,18 @@ def create_repository(path: Path) -> GitRepository:
 
 
 def initialize_repository(
-    path: Path, version: str, message: str, selected_files: Sequence[str]
+    path: Path, version: str, message: str, selected_files: Sequence[str],
+    *, sync_version_file: Optional[bool] = None,
 ) -> GitRepository:
     selected = validate_selected_files(path.expanduser().resolve(), selected_files)
     if not selected:
         raise GitError("至少选择一个需要封装的文件。")
     repository = create_repository(path)
     ensure_git_identity(repository)
-    repository.save_version(version, message, selected)
+    repository.save_version(
+        version, message, selected,
+        sync_version_file=sync_version_file,
+    )
     return repository
 
 
@@ -2651,7 +2790,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def on_settings(self, _button) -> None:
         if not self.repository:
-            self.show_error("请先启用版本管理，再配置对比工具。")
+            self.show_error("请先启用版本管理，再修改工作空间设置。")
             return
         try:
             configured_tool = self.repository.compare_tool()
@@ -2659,13 +2798,13 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             configured_tool = DEFAULT_COMPARE_TOOL
         dialog = Gtk.Dialog(title="设置", transient_for=self, modal=True)
         dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "保存", Gtk.ResponseType.OK)
-        dialog.set_default_size(520, 300)
+        dialog.set_default_size(560, 360)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin=20)
         title = Gtk.Label(label="工作空间设置", xalign=0)
         title.get_style_context().add_class("dialog-title")
         content.pack_start(title, False, False, 0)
         description = Gtk.Label(
-            label="选择当前工作空间用于版本比较的图形工具。设置保存在当前仓库，不影响其他工作空间。",
+            label="设置当前工作空间的对比工具和版本文件。设置保存在当前仓库，不影响其他工作空间。",
             xalign=0,
         )
         description.set_line_wrap(True)
@@ -2688,6 +2827,10 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         note.set_max_width_chars(60)
         grid.attach(note, 0, 1, 2, 1)
         content.pack_start(grid, False, False, 0)
+        version_sync = Gtk.CheckButton(label="发布时生成并同步 VERSION 文件")
+        version_sync.set_active(self.repository.sync_version_file_enabled())
+        version_sync.set_tooltip_text("发布时写入不带 v 的版本号，并自动纳入版本提交和 ZIP；保存设置不会立即修改文件。")
+        content.pack_start(version_sync, False, False, 0)
         content.pack_start(
             Gtk.Label(label=f"当前工作空间：{self.workspace_path}", xalign=0),
             False, False, 0,
@@ -2698,9 +2841,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if response == Gtk.ResponseType.OK:
             try:
                 self.repository.configure_compare_tool(combo.get_active_id())
-                self.status_label.set_text(
-                    f"对比工具已设置为 {COMPARE_TOOLS[combo.get_active_id()][0]}"
-                )
+                self.repository.configure_version_file(version_sync.get_active())
+                self.status_label.set_text("工作空间设置已保存")
             except (GitError, OSError, ValueError) as error:
                 dialog.destroy()
                 self.show_error(str(error))
@@ -3214,7 +3356,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         metadata = self.prompt_version_metadata(self.repository.next_version())
         if not metadata:
             return
-        version, message = metadata
+        version, message, sync_version = metadata
         deleted = repository.filter_ignored(repository.deleted_files())
         ignored_removals = repository.ignored_tracked_files()
         groups = top_level_package_groups(self.workspace_path, deleted)
@@ -3247,13 +3389,20 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.run_background(
             "正在发布版本...",
             lambda: repository.save_version(
-                version, message, selected, selected_scopes=selected_entries
+                version, message, selected, selected_scopes=selected_entries,
+                sync_version_file=sync_version,
             ),
             f"版本 {version} 已发布到本地。需要上传时请单独点击“同步远程”。",
         )
 
     def on_enable_versioning(self) -> None:
+        try:
+            prepare_workspace_release_files(self.workspace_path)
+        except (GitError, OSError) as error:
+            self.show_error(str(error))
+            return
         groups = top_level_package_groups(self.workspace_path)
+        groups.pop(WORKSPACE_CHANGELOG, None)
         entries = list(groups)
         if not entries:
             self.show_error("工作空间中没有可以封装的文件。")
@@ -3270,10 +3419,13 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         metadata = self.prompt_version_metadata("v0.0.1")
         if not metadata:
             return
-        version, message = metadata
+        version, message, sync_version = metadata
 
         def initialize() -> None:
-            initialize_repository(self.workspace_path, version, message, selected)
+            initialize_repository(
+                self.workspace_path, version, message, selected,
+                sync_version_file=sync_version,
+            )
 
         self.run_background(
             "正在启用版本管理...",
@@ -3321,11 +3473,32 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         version_row.attach(Gtk.Label(label="版本号", xalign=0), 0, 0, 1, 1)
         version_row.attach(version_entry, 1, 0, 1, 1)
         changes_view, changes_scroll = self._build_changes_editor()
+        changes_buffer = changes_view.get_buffer()
+
+        def load_changes(entry):
+            message = workspace_version_message(self.workspace_path, entry.get_text().strip())
+            if message is not None:
+                changes_buffer.set_text(message)
+
+        version_entry.connect("changed", load_changes)
+        load_changes(version_entry)
         content.pack_start(version_row, False, False, 0)
         content.pack_start(
             Gtk.Label(label="改动内容（每行一条）", xalign=0), False, False, 0
         )
         content.pack_start(changes_scroll, True, True, 0)
+        note = Gtk.Label(
+            label="版本号匹配 CHANGELOG.rst 中的版本节时，会自动载入对应说明；未匹配时保留当前内容。",
+            xalign=0,
+        )
+        note.set_line_wrap(True)
+        content.pack_start(note, False, False, 0)
+        version_sync = Gtk.CheckButton(label="发布时生成并同步 VERSION 文件（自动纳入版本包）")
+        version_sync.set_active(
+            self.repository.sync_version_file_enabled() if self.repository
+            else (self.workspace_path / WORKSPACE_VERSION).is_file()
+        )
+        content.pack_start(version_sync, False, False, 0)
         dialog.get_content_area().pack_start(content, True, True, 0)
         dialog.show_all()
         version_entry.grab_focus()
@@ -3333,7 +3506,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         response = dialog.run()
         buffer = changes_view.get_buffer()
         message = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True).strip()
-        result = (version_entry.get_text().strip(), message)
+        result = (version_entry.get_text().strip(), message, version_sync.get_active())
         dialog.destroy()
         if response != Gtk.ResponseType.OK:
             return None
@@ -3534,23 +3707,33 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def on_download_changelog(self, _button) -> None:
         if not self.repository:
             return
-        dialog = Gtk.FileChooserDialog(
-            title="下载版本管理 CHANGELOG",
-            parent=self,
-            action=Gtk.FileChooserAction.SAVE,
-        )
-        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "下载", Gtk.ResponseType.OK)
-        dialog.set_current_name("CHANGELOG.rst")
-        dialog.set_do_overwrite_confirmation(True)
-        response = dialog.run()
-        filename = dialog.get_filename()
-        dialog.destroy()
-        if response == Gtk.ResponseType.OK and filename:
-            try:
-                self.repository.download_changelog(Path(filename))
-                self.status_label.set_text(f"CHANGELOG 已下载到 {filename}")
-            except (GitError, OSError) as error:
-                self.show_error(str(error))
+        destination = self.repository.path / WORKSPACE_CHANGELOG
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            self.show_error("无法下载 CHANGELOG.rst：工作空间根目录同名路径必须是普通文件。")
+            return
+        if destination.exists():
+            dialog = Gtk.MessageDialog(
+                transient_for=self,
+                modal=True,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.NONE,
+                text="覆盖工作空间根目录的 CHANGELOG.rst？",
+            )
+            dialog.format_secondary_text(
+                f"现有文件将被 Git 标签生成的 CHANGELOG 替换。\n{destination}"
+            )
+            dialog.add_button("取消", Gtk.ResponseType.CANCEL)
+            overwrite_button = dialog.add_button("覆盖", Gtk.ResponseType.OK)
+            overwrite_button.get_style_context().add_class("destructive-action")
+            response = dialog.run()
+            dialog.destroy()
+            if response != Gtk.ResponseType.OK:
+                return
+        try:
+            self.repository.download_changelog(destination)
+            self.status_label.set_text(f"CHANGELOG 已下载到 {destination}")
+        except (GitError, OSError) as error:
+            self.show_error(str(error))
 
     def on_history_activated(self, _tree, path, _column) -> None:
         index = path.get_indices()[0]

@@ -4,3 +4,6 @@
 __pycache__/
 *.py[cod]
 
+# Local release notes, read by the publish dialog
+/CHANGELOG.rst
+
