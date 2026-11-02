@@ -243,6 +243,19 @@ def save_workspace_history(
     return paths
 
 
+def remove_recent_workspace(path: Path, config_file: Optional[Path] = None) -> None:
+    config_file = config_file or settings_file_path()
+    resolved = path.expanduser().resolve()
+    paths = [candidate for candidate in recent_workspaces(config_file) if candidate != resolved]
+    parser = _read_settings(config_file)
+    parser["recent_workspaces"] = {
+        "paths": json.dumps([str(candidate) for candidate in paths], ensure_ascii=False)
+    }
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    with config_file.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+
+
 def clear_recent_workspaces(config_file: Optional[Path] = None) -> None:
     config_file = config_file or settings_file_path()
     parser = _read_settings(config_file)
@@ -2547,7 +2560,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def on_recent_popover_show(self, popover: Gtk.Popover) -> None:
         child = popover.get_child()
         if child:
-            popover.remove(child)
+            child.destroy()
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         content.set_border_width(6)
@@ -2558,12 +2571,22 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             content.pack_start(empty, False, False, 8)
         else:
             for path in paths:
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
                 label = f"当前  ·  {path}" if path == self.workspace_path else str(path)
                 # GtkModelButton always interprets underscores as mnemonic markers.
                 button = Gtk.ModelButton(text=label.replace("_", "__"))
                 button.set_tooltip_text(str(path))
                 button.connect("clicked", self.on_open_recent_workspace, path)
-                content.pack_start(button, False, False, 0)
+                row.pack_start(button, True, True, 0)
+                remove_button = Gtk.Button.new_from_icon_name(
+                    "window-close-symbolic", Gtk.IconSize.MENU
+                )
+                remove_button.set_relief(Gtk.ReliefStyle.NONE)
+                remove_button.set_tooltip_text(f"从最近列表移除：{path}")
+                remove_button.get_accessible().set_name(f"移除最近工作空间：{path}")
+                remove_button.connect("clicked", self.on_remove_recent_workspace, path)
+                row.pack_end(remove_button, False, False, 0)
+                content.pack_start(row, False, False, 0)
 
             content.pack_start(Gtk.Separator(), False, False, 4)
             clear_button = Gtk.ModelButton(text="清空最近打开…")
@@ -2579,6 +2602,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if path == self.workspace_path:
             return
         self.load_workspace(path)
+
+    def on_remove_recent_workspace(self, _button, path: Path) -> None:
+        try:
+            remove_recent_workspace(path)
+            self.on_recent_popover_show(self.recent_popover)
+            self.status_label.set_text(f"已从最近列表移除：{path}")
+        except OSError as error:
+            self.show_error(str(error))
 
     def on_clear_recent_workspaces(self, _button) -> None:
         self.recent_popover.popdown()
