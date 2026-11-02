@@ -96,6 +96,79 @@ class RefDifference:
 
 
 @dataclass(frozen=True)
+class SyncCommit:
+    oid: str
+    date: str
+    subject: str
+    versions: Tuple[str, ...] = ()
+    version_note: str = ""
+
+
+@dataclass(frozen=True)
+class RefComparison:
+    difference: RefDifference
+    local: Optional[SyncCommit]
+    remote: Optional[SyncCommit]
+    relationship: str
+    local_count: int = 0
+    remote_count: int = 0
+
+    @property
+    def name(self) -> str:
+        ref = self.difference.ref
+        if ref.startswith("refs/heads/"):
+            return "分支 " + ref[len("refs/heads/"):]
+        return "版本 " + ref[len("refs/tags/"):]
+
+    @property
+    def summary(self) -> str:
+        return {
+            "same": "两边指向同一提交",
+            "tag_changed": "代码提交相同，标签信息不同",
+            "local_ahead": f"本地较新，领先远程 {self.local_count} 个提交",
+            "remote_ahead": f"远程较新，领先本地 {self.remote_count} 个提交",
+            "diverged": (
+                f"双方已分叉：本地独有 {self.local_count} 个提交，"
+                f"远程独有 {self.remote_count} 个提交，无法简单判断新旧"
+            ),
+            "unrelated": "双方没有共同提交历史，无法判断新旧",
+            "local_only": "仅本地存在（不能据此判断新旧）",
+            "remote_only": "仅远程存在（不能据此判断新旧）",
+            "unknown": "提交历史不完整或无法读取，暂时无法判断新旧",
+        }[self.relationship]
+
+    def effect(self, direction: str) -> str:
+        target = "本地" if direction == "local" else "远程"
+        source_oid = self.difference.remote_oid if direction == "local" else self.difference.local_oid
+        target_oid = self.difference.local_oid if direction == "local" else self.difference.remote_oid
+        if source_oid == target_oid:
+            return "保持一致，无需修改"
+        if not source_oid:
+            if self.difference.ref.startswith("refs/heads/"):
+                return f"来源不存在此分支，无法覆盖{target}"
+            return f"将删除{target}的此版本标签"
+        if not target_oid:
+            kind = "分支" if self.difference.ref.startswith("refs/heads/") else "版本标签"
+            return f"将在{target}新增此{kind}"
+        if self.relationship == "tag_changed":
+            return f"将替换{target}的标签信息，指向的代码提交相同"
+        if self.relationship in ("local_ahead", "remote_ahead"):
+            source_ahead = (
+                self.relationship == "remote_ahead" if direction == "local"
+                else self.relationship == "local_ahead"
+            )
+            count = self.local_count or self.remote_count
+            if self.difference.ref.startswith("refs/tags/"):
+                return f"将把{target}的此标签改为指向{'较新' if source_ahead else '较旧'}的提交"
+            if source_ahead:
+                return f"将更新{target}，补入 {count} 个提交"
+            return f"将回退{target}，移出当前分支的 {count} 个提交"
+        if self.relationship in ("diverged", "unrelated"):
+            return f"将覆盖{target}的历史，请先核对双方修改"
+        return f"将覆盖{target}，当前无法确认是否会回退"
+
+
+@dataclass(frozen=True)
 class RemoteSyncStatus:
     state: str
     message: str
@@ -106,6 +179,8 @@ class RemoteSyncStatus:
     remote_refs: Tuple[Tuple[str, str], ...] = ()
     local_message: str = ""
     remote_message: str = ""
+    comparisons: Tuple[RefComparison, ...] = ()
+    comparison_error: str = ""
 
 
 def settings_file_path() -> Path:
@@ -698,8 +773,12 @@ class GitRepository:
         elif not remote_changes:
             remote_message = "当前分支和版本标签已与远程一致。"
         differences = tuple(sorted(set(local_changes + remote_changes), key=lambda item: item.ref))
+        comparisons, comparison_error = (
+            self._sync_comparisons(snapshot, remote_refs) if differences else ((), "")
+        )
         message = "当前分支和版本标签已与远程一致。" if not differences else (
-            f"检测到 {len(differences)} 项差异；请分别选择以远程覆盖本地，或以本地覆盖远程。"
+            f"{comparisons[0].name}：{comparisons[0].summary}。"
+            f"共 {len(differences)} 项分支或版本标签差异，点击同步查看详情。"
         )
         return RemoteSyncStatus(
             "synced" if not differences else "pending",
@@ -711,7 +790,105 @@ class GitRepository:
             tuple(sorted(remote_refs.items())),
             local_message,
             remote_message,
+            comparisons,
+            comparison_error,
         )
+
+    def _sync_comparisons(
+        self, snapshot: RemoteSyncSnapshot, remote_refs: Dict[str, str],
+    ) -> Tuple[Tuple[RefComparison, ...], str]:
+        local_refs = dict(snapshot.refs)
+        comparison_error = ""
+        if remote_refs:
+            object_ids = sorted(set(remote_refs.values()))
+            objects = self.run(
+                ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                input="\n".join(object_ids) + "\n",
+            )
+            missing = [line.split()[0] for line in objects.splitlines() if line.endswith(" missing")]
+            if missing:
+                try:
+                    # Fetch missing objects without changing branches, tags or the worktree.
+                    self._run_remote([
+                        "fetch", "--no-tags", "--no-auto-gc", "--refmap=",
+                        "--no-recurse-submodules",
+                        snapshot.remote_url, *missing,
+                    ], snapshot.remote_url)
+                except GitError as error:
+                    comparison_error = f"获取远程提交详情失败：{error}"
+
+        commits = {}
+        for object_id in sorted(set(local_refs.values()) | set(remote_refs.values())):
+            try:
+                commit_id = self.run(["rev-parse", "--verify", f"{object_id}^{{commit}}"]).strip()
+                details = self.run([
+                    "show", "--no-patch", "--format=%H%x00%ci%x00%s", commit_id,
+                ]).strip().split("\0", 2)
+                version_note = ""
+                if object_id != commit_id:
+                    tag = self.run(["cat-file", "-p", object_id])
+                    version_note = tag.split("\n\n", 1)[-1].strip()
+                commits[object_id] = SyncCommit(*details, version_note=version_note) if len(details) == 3 else None
+            except GitError:
+                commits[object_id] = None
+
+        def with_versions(object_id: Optional[str], refs: Dict[str, str]) -> Optional[SyncCommit]:
+            commit = commits.get(object_id)
+            if not commit:
+                return None
+            versions = tuple(sorted((
+                ref[len("refs/tags/"):] for ref, oid in refs.items()
+                if ref.startswith("refs/tags/") and commits.get(oid)
+                and commits[oid].oid == commit.oid
+            ), key=version_key, reverse=True))
+            return SyncCommit(commit.oid, commit.date, commit.subject, versions, commit.version_note)
+
+        shallow = self.run(["rev-parse", "--is-shallow-repository"]).strip() == "true"
+        refs = [snapshot.branch_ref] + sorted(
+            (set(local_refs) | set(remote_refs)) - {snapshot.branch_ref},
+            key=lambda ref: version_key(ref[len("refs/tags/"):]), reverse=True,
+        )
+        comparisons = []
+        for ref in refs:
+            local_oid, remote_oid = local_refs.get(ref), remote_refs.get(ref)
+            if ref != snapshot.branch_ref and local_oid == remote_oid:
+                continue
+            local = with_versions(local_oid, local_refs)
+            remote = with_versions(remote_oid, remote_refs)
+            local_count = remote_count = 0
+            if local_oid == remote_oid:
+                relationship = "same"
+            elif not local_oid:
+                relationship = "remote_only"
+            elif not remote_oid:
+                relationship = "local_only"
+            elif not local or not remote:
+                relationship = "unknown"
+            elif local.oid == remote.oid:
+                relationship = "tag_changed"
+            elif shallow:
+                relationship = "unknown"
+            else:
+                try:
+                    counts = self.run([
+                        "rev-list", "--left-right", "--count", f"{local.oid}...{remote.oid}",
+                    ]).split()
+                    local_count, remote_count = map(int, counts)
+                    if not remote_count:
+                        relationship = "local_ahead"
+                    elif not local_count:
+                        relationship = "remote_ahead"
+                    elif self.run(["merge-base", local.oid, remote.oid], check=False).strip():
+                        relationship = "diverged"
+                    else:
+                        relationship = "unrelated"
+                except (GitError, ValueError):
+                    relationship = "unknown"
+            comparisons.append(RefComparison(
+                RefDifference(ref, local_oid, remote_oid), local, remote,
+                relationship, local_count, remote_count,
+            ))
+        return tuple(comparisons), comparison_error
 
     @staticmethod
     def _ref_differences(
@@ -1955,6 +2132,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             toolbar.pack_start(button, False, False, 0)
         root.pack_start(toolbar, False, False, 0)
 
+        self.remote_summary_label = Gtk.Label(xalign=0, margin_start=16, margin_end=16, margin_top=8)
+        self.remote_summary_label.set_line_wrap(True)
+        self.remote_summary_label.set_max_width_chars(100)
+        self.remote_summary_label.get_style_context().add_class("remote-summary")
+        root.pack_start(self.remote_summary_label, False, False, 0)
+
         self.notebook = Gtk.Notebook()
         self.notebook.append_page(self._build_history_view(), Gtk.Label(label="版本历史"))
         self.notebook.append_page(self._build_changes_view(), Gtk.Label(label="当前修改"))
@@ -2100,6 +2283,18 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         .workspace-status { color: #43525c; }
         .storage-status { color: #687780; }
         .operation-status { color: #126d76; font-weight: bold; }
+        .remote-summary { color: #43525c; }
+        .sync-summary {
+            padding: 12px; border: 1px solid #cbdde0; border-radius: 6px;
+            background-color: #eaf4f5; color: #234a50;
+        }
+        .sync-comparison {
+            padding: 14px; border-bottom: 1px solid #d9e0e5;
+            background-color: #ffffff;
+        }
+        .sync-heading { font-weight: bold; }
+        .sync-effect { color: #a73232; font-weight: bold; }
+        .sync-note { color: #687780; }
         .dialog-title { color: #24343e; font-size: 14pt; font-weight: bold; }
         dialog { background-color: #f3f6f8; color: #26343e; }
         dialog entry, dialog spinbutton, dialog combobox button {
@@ -2238,19 +2433,21 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def _set_remote_status(self, status: RemoteSyncStatus) -> None:
         self.remote_status = status
+        self.remote_summary_label.set_text(status.message.splitlines()[0][:200])
+        self.remote_summary_label.set_tooltip_text(status.message)
         pending = bool(status.local_changes or status.remote_changes)
         self._set_sync_button(
             self.sync_local_button,
             status.can_sync_local,
             pending,
-            status.local_message or "以远程分支和版本标签更新本地。",
+            status.message + "\n" + (status.local_message or "以远程分支和版本标签更新本地。"),
             status.local_message or status.message,
         )
         self._set_sync_button(
             self.sync_remote_button,
             status.can_sync_remote,
             pending,
-            status.remote_message or "以本地分支和版本标签覆盖远程差异。",
+            status.message + "\n" + (status.remote_message or "以本地分支和版本标签覆盖远程差异。"),
             status.remote_message or status.message,
         )
 
@@ -2810,6 +3007,35 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def _format_ref_oid(object_id: Optional[str]) -> str:
         return object_id[:12] if object_id else "（不存在）"
 
+    @staticmethod
+    def _sync_commit_text(commit: Optional[SyncCommit], object_id: Optional[str]) -> str:
+        if not object_id:
+            return "不存在"
+        if not commit:
+            return f"提交详情暂不可用\n引用：{object_id[:12]}"
+        versions = "、".join(commit.versions) or "未标记版本"
+        lines = [
+            f"版本：{versions}", f"提交时间：{commit.date}",
+            f"提交说明：{commit.subject}", f"提交：{commit.oid[:12]}",
+        ]
+        if commit.version_note:
+            lines.append(f"版本说明：{commit.version_note}")
+        if object_id != commit.oid:
+            lines.append(f"标签对象：{object_id[:12]}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _sync_label(text: str, style: str = "") -> Gtk.Label:
+        label = Gtk.Label(label=text, xalign=0, yalign=0)
+        label.set_line_wrap(True)
+        label.set_line_wrap_mode(2)  # Pango.WrapMode.WORD_CHAR
+        label.set_max_width_chars(48)
+        label.set_hexpand(True)
+        label.set_selectable(True)
+        if style:
+            label.get_style_context().add_class(style)
+        return label
+
     def _confirm_sync_direction(self, direction: str, status: RemoteSyncStatus) -> bool:
         if direction == "local":
             title = "确认以远程覆盖本地分支和版本标签？"
@@ -2818,7 +3044,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 "本地独有提交和标签会保存在恢复点；未提交修改和未跟踪文件会先保存，"
                 "完成后可恢复。会把可能被远程目标覆盖的被忽略文件移到恢复点。其他分支及非版本标签不变。"
             )
-            action = "同步本地"
+            action = "以远程为准，更新本地"
             differences = status.local_changes
         else:
             title = "确认以本地覆盖远程分支和版本标签？"
@@ -2827,33 +3053,75 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 "远程旧引用会先下载并保存在本机恢复点；远程协作者可能需要重新同步。"
                 "其他分支及非版本标签不变。"
             )
-            action = "同步远程（覆盖远程）"
+            action = "以本地为准，覆盖远程"
             differences = status.remote_changes
         dialog = Gtk.Dialog(title=title, transient_for=self, modal=True)
         dialog.add_button("取消", Gtk.ResponseType.CANCEL)
         confirm = dialog.add_button(action, Gtk.ResponseType.OK)
         confirm.get_style_context().add_class("destructive-action")
         dialog.set_default_response(Gtk.ResponseType.CANCEL)
-        dialog.set_default_size(760, 500)
+        dialog.set_default_size(900, 680)
+        self._add_maximize_button(dialog)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=16)
-        notice = Gtk.Label(label=description, xalign=0)
-        notice.set_line_wrap(True)
-        content.pack_start(notice, False, False, 0)
-        rows = []
-        for difference in differences:
-            local_oid = self._format_ref_oid(difference.local_oid)
-            remote_oid = self._format_ref_oid(difference.remote_oid)
-            if direction == "local":
-                rows.append(f"{difference.ref}\n  本地：{local_oid}  →  远程：{remote_oid}")
-            else:
-                rows.append(f"{difference.ref}\n  远程：{remote_oid}  →  本地：{local_oid}")
-        details = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
-        details.get_buffer().set_text("\n\n".join(rows))
+        summary = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        summary.get_style_context().add_class("sync-summary")
+        if status.comparisons:
+            branch = status.comparisons[0]
+            summary.pack_start(self._sync_label(
+                f"{branch.name}：{branch.summary}", "sync-heading",
+            ), False, False, 0)
+            summary.pack_start(self._sync_label(branch.effect(direction), "sync-effect"), False, False, 0)
+        summary.pack_start(self._sync_label(
+            "本次方向：远程 → 本地（以远程为准）" if direction == "local"
+            else "本次方向：本地 → 远程（以本地为准）",
+        ), False, False, 0)
+        content.pack_start(summary, False, False, 0)
+        content.pack_start(self._sync_label(
+            "新旧依据提交的先后关系判断；提交时间和版本号供核对。未提交的工作区修改不参与新旧判断。",
+            "sync-note",
+        ), False, False, 0)
+
+        rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        changed_refs = {difference.ref for difference in differences}
+        for comparison in status.comparisons:
+            if comparison.difference.ref not in changed_refs and comparison is not status.comparisons[0]:
+                continue
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            row.get_style_context().add_class("sync-comparison")
+            row.pack_start(self._sync_label(
+                f"{comparison.name}  ·  {comparison.summary}", "sync-heading",
+            ), False, False, 0)
+            sides = Gtk.Grid(column_spacing=24, row_spacing=6, column_homogeneous=True)
+            local_title = "本地（将被更新）" if direction == "local" else "本地（来源）"
+            remote_title = "远程（来源）" if direction == "local" else "远程（将被覆盖）"
+            sides.attach(self._sync_label(local_title, "sync-heading"), 0, 0, 1, 1)
+            sides.attach(self._sync_label(remote_title, "sync-heading"), 1, 0, 1, 1)
+            sides.attach(self._sync_label(self._sync_commit_text(
+                comparison.local, comparison.difference.local_oid,
+            )), 0, 1, 1, 1)
+            sides.attach(self._sync_label(self._sync_commit_text(
+                comparison.remote, comparison.difference.remote_oid,
+            )), 1, 1, 1, 1)
+            row.pack_start(sides, False, False, 0)
+            row.pack_start(self._sync_label(comparison.effect(direction), "sync-effect"), False, False, 0)
+            rows.pack_start(row, False, False, 0)
+        if not status.comparisons:
+            rows.pack_start(self._sync_label("暂时无法判断新旧，请核对以下引用差异。"), False, False, 0)
+            for difference in differences:
+                rows.pack_start(self._sync_label(
+                    f"{difference.ref}\n本地：{self._format_ref_oid(difference.local_oid)}\n"
+                    f"远程：{self._format_ref_oid(difference.remote_oid)}",
+                ), False, False, 8)
         scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_min_content_height(230)
-        scroll.add(details)
+        scroll.add(rows)
         content.pack_start(scroll, True, True, 0)
+        if status.comparison_error:
+            error_label = self._sync_label("部分提交详情获取失败，无法确认新旧。可取消后刷新重试。", "sync-effect")
+            error_label.set_tooltip_text(status.comparison_error)
+            content.pack_start(error_label, False, False, 0)
+        content.pack_start(self._sync_label(description, "sync-note"), False, False, 0)
         dialog.get_content_area().pack_start(content, True, True, 0)
         dialog.show_all()
         response = dialog.run()
