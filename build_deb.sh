@@ -6,12 +6,6 @@ package_name=code-version-manager
 package_version=$(tr -d '\r\n' < "$project_dir/VERSION")
 stage="$project_dir/build/${package_name}_${package_version}_all"
 output_dir="$project_dir/dist"
-control_version=$(awk '/^Version:/ { print $2; exit }' "$project_dir/debian/control")
-
-if [ "$control_version" != "$package_version" ]; then
-    echo "VERSION and debian/control do not match." >&2
-    exit 1
-fi
 
 mkdir -p \
     "$stage/DEBIAN" \
@@ -24,6 +18,7 @@ mkdir -p \
     "$output_dir"
 
 install -m 0644 "$project_dir/debian/control" "$stage/DEBIAN/control"
+sed -i "s/@VERSION@/$package_version/" "$stage/DEBIAN/control"
 install -m 0755 "$project_dir/debian/postinst" "$stage/DEBIAN/postinst"
 install -m 0755 "$project_dir/debian/postrm" "$stage/DEBIAN/postrm"
 install -m 0755 "$project_dir/src/code_version_manager.py" \
