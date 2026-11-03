@@ -11,7 +11,7 @@
 | git | 提交、标签、分支、三方合并和导出 |
 | openssh-client | 可选 SSH 远程同步 |
 
-依赖在 debian/control 中声明，APT 可自动补齐。目录比较和三方冲突处理可选择 Beyond Compare、Meld、KDiff3，需要另行安装；默认 Beyond Compare。
+依赖在 debian/control 中声明，APT 可自动补齐。目录比较和双栏冲突处理可选择 Beyond Compare、Meld、KDiff3，需要另行安装；默认 Beyond Compare。
 
 ```bash
 python3 --version
@@ -42,7 +42,7 @@ python3 src/code_version_manager.py
 
 从 main 的某个正式版本创建开发分支，固定 beta 基线。例如 branch1 从 v0.0.3 创建，即使 main 已到 v0.0.6，仍只生成 branch1/v0.0.3-beta.0.0.N。
 
-合并前显示最新已发布 beta 和 main 正式版本/提交；开发分支有新提交时先发布 beta。合并只处理本地 Git 状态。冲突通过已配置的三方工具处理，用户检查并标记解决后完成合并。
+合并前显示最新已发布 beta 和 main 正式版本/提交；开发分支有新提交时先发布 beta。合并只处理本地 Git 状态。冲突通过“对比分支与 main（完整目录）”处理：左侧 beta 只读，右侧 main 编辑副本。工具关闭后确认写回，再检查并标记解决；最后完成合并。
 
 **完成合并只是合并到 main，不发布、不创建 Tag。** VERSION 保留 main 原正式号，用户另点“发布正式版本”才创建下一个标签并更新 VERSION。开发分支始终保留继承的正式号，不写 beta VERSION。
 
@@ -77,11 +77,15 @@ sudo apt --fix-broken install
 sudo apt install ./dist/code-version-manager_$(cat VERSION)_all.deb
 ```
 
-### 点击比较或三方工具失败
+### 点击比较或完整目录对比失败
 
 确认“设置”选定的 Beyond Compare、Meld 或 KDiff3 已安装且命令可启动。Beyond Compare 可使用下载的 Ubuntu 安装包安装，例如 `sudo apt install ./bcompare-4.*_amd64.deb`。
 
-工具退出不等于合并已解决；检查文件后点击“标记已解决”，再“完成合并”。特殊文件需人工检查。取消工具不会清除冲突状态。
+目录对比首次为未编辑冲突显示干净的 main 原内容，其他文件保留自动合并结果；再次打开保留编辑。相同文件、VERSION 和特殊文件只读，按完整内容判断差异。
+
+工具退出后选择“应用到 main”或“保留副本，稍后处理”；不自动标记解决。检查文件后点击“标记已解决”，删除结果用“以删除解决”，最后“完成合并”。特殊文件需人工检查。
+
+副本和原内容备份在实际 Git 目录的 `code-version-manager/merge-review/`。若提示实际工作区、暂存区或引用变化，软件停止写回，请先保留副本并核对其他编辑器的操作。取消或失败不会删除副本或解决冲突。
 
 ### main 同步被旧正式标签冲突阻挡
 

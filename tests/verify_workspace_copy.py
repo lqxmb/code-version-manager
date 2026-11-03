@@ -80,6 +80,36 @@ def verify(workspace):
         repo.configure_remote(str(remote), 'Isolated Verification', 'verification@example.invalid')
         assert repo._sync_target() == str(remote)
         assert repo._local_refs() == original_refs
+        if source.merge_state().active:
+            # Reproduce the in-progress merge only inside the independent copy.
+            for name in ("index", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "ORIG_HEAD"):
+                original = source._git_path(name)
+                if original.is_file() and not original.is_symlink():
+                    shutil.copy2(original, copy / ".git" / name)
+            tags = repo.tags()
+            session = repo.prepare_merge_comparison(use_main=True)
+            directory, data = repo._review_session_data(session)
+            for path in repo.merge_state().conflicts:
+                if path in data["editable"]:
+                    right = directory / "main" / path
+                    left = directory / "branch" / path
+                    if right.exists() and left.exists():
+                        right.write_bytes(right.read_bytes() + b"\n" + left.read_bytes())
+                    elif left.exists():
+                        right.parent.mkdir(parents=True, exist_ok=True)
+                        right.write_bytes(left.read_bytes())
+            result = repo.merge_comparison_result(session)
+            assert repo.merge_state().active
+            repo.apply_merge_comparison(result)
+            for path in repo.merge_state().conflicts:
+                repo.resolve_merge_file(path, delete=not (copy / path).exists())
+            repo.complete_merge()
+            assert repo.tags() == tags
+            report["active_merge_two_directory_writeback_without_publication"] = "passed"
+            assert list((directory / "writeback").glob("*/state.json"))
+            # Continue the existing mirror checks from the copied original refs.
+            git(copy, "reset", "--hard", original_refs["refs/heads/main"])
+            assert repo._local_refs() == original_refs
         anomalies = {}
         for branch in repo.local_branches():
             if branch.name != 'main':

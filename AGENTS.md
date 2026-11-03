@@ -9,6 +9,7 @@ Python 3 + GTK 3 桌面 Git 工作空间管理器，支持离线发布、分支�
 | `src/code_version_manager.py` | 数据模型、GitRepository、辅助函数、GTK 窗口、应用入口 |
 | `tests/test_backend.py` | 后端、比较工具和 GTK 行为回归测试 |
 | `tests/test_workflow.py` | 固定基线、合并不发布、整仓覆盖及恢复专项测试 |
+| `tests/test_merge_comparison.py` | 双栏完整目录会话、只读保护、受控写回及界面回归 |
 | `tests/verify_workspace_copy.py` | 实仓隔离副本验证工具，不修改来源及其真实 origin |
 | `README.md` / `INSTALL.md` | 当前使用说明 / Ubuntu 安装与故障排查 |
 | `README_ai.md` | 历史讨论，不作为当前业务规则依据 |
@@ -56,7 +57,13 @@ Python 3 + GTK 3 桌面 Git 工作空间管理器，支持离线发布、分支�
 - 来源分支 HEAD 必须等于最新 beta 提交；有未发布尾部提交时要求先发布 beta。main 有未发布提交时先发布，不能回退到旧正式标签。
 - 合并仅使用本地引用，不隐式 fetch、快进或上传。需要更新远程状态时由用户先整仓同步。
 - 使用 `git merge --no-ff --no-commit` 保留双方历史；干净合并可完成合并提交，有冲突则等待人工处理。VERSION 保留 main 的值；旧 main 缺 VERSION 时不引入来源 beta 文件。
-- Beyond Compare、Meld、KDiff3 三方输入允许缺失 stage 用空文件表示；退出工具不代表解决，必须明确标记文件，随后 `complete_merge()` 或 `abort_merge()`。
+- 人工处理主要通过完整目录双栏对比；入口 `prepare_merge_comparison()`、`launch_merge_comparison()`、`merge_comparison_result()`、`apply_merge_comparison()`。`MergeComparisonSession` / `MergeComparisonResult` 分别表示持久会话及绑定输出签名的写回清单。
+- 左侧固定 beta 完整 Git 树只读，右侧 main 编辑副本保留自动合并结果；首次未编辑冲突从 main 原内容开始。记录 `initial_conflicts` 识别原始冲突；已有人工内容或旧合并不确定时让用户选择沿用或 main 原版，先备份。
+- 使用 `ls-tree` 和 `cat-file --batch` 读取完整树，不使用 manifest 或 export-ignore 裁剪；特殊文件用只读说明展示，不创建可跟随的链接。
+- 会话保存在实际 Git 目录 `code-version-manager/merge-review/<id>/`，保存左右基线签名、可编辑路径、原始工作区、引用和暂存区快照。重复打开及工具失败保留副本，工具退出后显示清单，由用户选择应用或稍后处理。
+- 相同文件、VERSION、特殊文件禁止写回；可编辑路径固定为会话初始差异，编辑成相同内容后仍可保存。校验未知路径、目录/符号链接替换、左右受保护内容及确认后的输出变化，任何越界修改拒绝写回。
+- 写回前备份文件与合并记录并再次校验快照；原冲突仍待人工确认，额外改动加入 manual_resolution，不自动 git add、完成合并或发布。部分写回失败尝试恢复，保留备份。
+- Beyond Compare 合并会话使用双目录、leftreadonly 和明确左右标题，专用配置逐字节内容比较并显示所有已跟踪文件；普通历史对比配置不变。Meld/KDiff3 同样只接收双目录并受写回校验保护。
 - `merge.json` 同时记录人工待确认文件。合并期间禁止发布、切换和同步。
 - 清理要求位于 main、工作区干净、分支全部合入且 main 最新正式标签已包含结果。默认清理分支及全部所属 beta 标签，仅改本地，保存引用和元数据恢复点。
 - 单独编辑/删除共享正式标签仍受保护；整仓覆盖有独立的显式确认语义。
@@ -88,7 +95,7 @@ Python 3 + GTK 3 桌面 Git 工作空间管理器，支持离线发布、分支�
 - `run()` / `run_bytes()` 统一使用 `git -C <目录>` 和参数列表。业务错误用具体中文 GitError，不把 traceback 当用户提示，不拼接不可信 shell 命令。
 - 远程读取、发布、切换、合并、同步、删除预检都放后台线程；工作线程不操作 GTK，通过 GLib.idle_add 回主线程。
 - branch_generation、remote_status_generation、仓库实例及整仓快照共同丢弃旧后台结果。成功后 refresh 分支、历史、修改、冲突状态和同步按钮；不要直接绕过统一状态机启用按钮。
-- 同名本地/origin 分支合并显示一行，当前分支绿色。选择已有本地分支优先普通安全切换。
+- 同名本地/origin 分支合并显示一行，当前分支绿色，标签文字不添加“当前”。选择已有本地分支优先普通安全切换。
 
 ## 6. 开发与验证
 

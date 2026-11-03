@@ -1083,122 +1083,95 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("v0.2.0", self.repository.tags())
         self.assertNotIn("test1", [branch.name for branch in self.repository.local_branches()])
 
-    def test_merge_tools_receive_three_sides_and_do_not_automatically_mark_resolved(self):
+    def test_merge_tools_receive_two_directories_and_require_explicit_application(self):
         self.repository.create_branch("test1")
-        (self.path / "robot.txt").write_text("incoming side\n", encoding="utf-8")
+        (self.path / "robot.txt").write_text("incoming side\n")
         self.repository.save_version("test1/v0.2.0-beta.0.0.1", "incoming", ["robot.txt"])
         self.repository.switch_branch("main")
-        (self.path / "robot.txt").write_text("main side\n", encoding="utf-8")
+        (self.path / "robot.txt").write_text("main side\n")
         self.repository.save_version("v0.2.1", "main", ["robot.txt"])
         self.repository.merge_to_main("test1")
+        session = self.repository.prepare_merge_comparison()
+        directory, _data = self.repository._review_session_data(session)
         original_run = MODULE.subprocess.run
-        target = self.path / "robot.txt"
         calls = []
-
         def run_tool(command, **kwargs):
             if command[0] == "git":
                 return original_run(command, **kwargs)
             calls.append(command[0])
-            contents = {Path(argument).read_text() for argument in command[1:] if Path(argument).is_file() and Path(argument) != target}
-            self.assertTrue({"base\n", "main side\n", "incoming side\n"}.issubset(contents))
-            self.assertTrue(any(str(target) in argument for argument in command))
-            target.write_text("resolved by tool\n", encoding="utf-8")
+            self.assertIn(str(directory / "branch"), command)
+            self.assertIn(str(directory / "main"), command)
+            self.assertEqual("incoming side\n", (directory / "branch" / "robot.txt").read_text())
+            (directory / "main" / "robot.txt").write_text("resolved by tool\n")
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
         for tool in ("bcompare", "meld", "kdiff3"):
             self.repository.configure_compare_tool(tool)
             with mock.patch.object(MODULE.shutil, "which", return_value="/tool"), \
                     mock.patch.object(MODULE.subprocess, "run", side_effect=run_tool):
-                self.repository.launch_merge_tool("robot.txt")
+                result = self.repository.launch_merge_comparison(session)
+            self.assertIn("<<<<<<<", (self.path / "robot.txt").read_text())
             self.assertEqual(("robot.txt",), self.repository.merge_state().conflicts)
         self.assertEqual(["bcompare", "meld", "kdiff3"], calls)
+        self.repository.apply_merge_comparison(result)
         self.repository.resolve_merge_file("robot.txt")
-        self.assertTrue(self.repository.merge_state().ready)
         self.repository.complete_merge()
 
-    def test_merge_tool_accepts_add_add_conflicts_with_empty_base(self):
+    def test_directory_comparison_accepts_add_add_conflicts(self):
         self.repository.create_branch("test1")
-        (self.path / "shared.txt").write_text("feature copy\n", encoding="utf-8")
+        (self.path / "shared.txt").write_text("feature copy\n")
         self.repository.save_version("test1/v0.2.0-beta.0.0.1", "feature", ["shared.txt"])
         self.repository.switch_branch("main")
-        (self.path / "shared.txt").write_text("main copy\n", encoding="utf-8")
+        (self.path / "shared.txt").write_text("main copy\n")
         self.repository.save_version("v0.2.1", "main", ["shared.txt"])
         self.repository.merge_to_main("test1")
-        original_run = MODULE.subprocess.run
-        target = self.path / "shared.txt"
-        seen = {}
-
-        def run_tool(command, **kwargs):
-            if command[0] == "git":
-                return original_run(command, **kwargs)
-            inputs = [Path(argument) for argument in command[1:] if Path(argument).is_file() and Path(argument) != target]
-            seen["contents"] = {path.read_text(encoding="utf-8") for path in inputs}
-            self.assertTrue(any(str(target) in argument for argument in command))
-            target.write_text("combined\n", encoding="utf-8")
-            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-        self.repository.configure_compare_tool("bcompare")
-        with mock.patch.object(MODULE.shutil, "which", return_value="/tool"), \
-                mock.patch.object(MODULE.subprocess, "run", side_effect=run_tool):
-            self.repository.launch_merge_tool("shared.txt")
-
-        self.assertIn("", seen["contents"])
-        self.assertIn("main copy\n", seen["contents"])
-        self.assertIn("feature copy\n", seen["contents"])
+        session = self.repository.prepare_merge_comparison()
+        root, _data = self.repository._review_session_data(session)
+        self.assertEqual("feature copy\n", (root / "branch" / "shared.txt").read_text())
+        self.assertEqual("main copy\n", (root / "main" / "shared.txt").read_text())
+        (root / "main" / "shared.txt").write_text("combined\n")
+        self.repository.apply_merge_comparison(self.repository.merge_comparison_result(session))
         self.assertEqual(("shared.txt",), self.repository.merge_state().conflicts)
         self.repository.resolve_merge_file("shared.txt")
         self.repository.complete_merge()
 
-    def test_merge_tool_accepts_modify_delete_conflicts_with_empty_missing_side(self):
+    def test_directory_comparison_accepts_modify_delete_conflicts(self):
         for deleted_side in ("main", "test1"):
             with self.subTest(deleted_side=deleted_side):
                 path = self.root / ("deleted-" + deleted_side)
                 path.mkdir()
-                (path / "file.txt").write_text("base\n", encoding="utf-8")
+                (path / "file.txt").write_text("base\n")
                 repository = MODULE.initialize_repository(path, "v0.2.0", "base", ["file.txt"])
                 repository.create_branch("test1")
                 if deleted_side == "test1":
                     repository.run(["rm", "file.txt"])
                     repository.run(["commit", "-m", "feature removes file"])
                 else:
-                    (path / "file.txt").write_text("feature edit\n", encoding="utf-8")
+                    (path / "file.txt").write_text("feature edit\n")
                     repository.save_version("test1/v0.2.0-beta.0.0.1", "feature", ["file.txt"])
                 repository.switch_branch("main")
                 if deleted_side == "main":
                     repository.run(["rm", "file.txt"])
                     repository.run(["commit", "-m", "main removes file"])
                 else:
-                    (path / "file.txt").write_text("main edit\n", encoding="utf-8")
+                    (path / "file.txt").write_text("main edit\n")
                     repository.save_version("v0.2.1", "main", ["file.txt"])
-                source_head = repository.run(["rev-parse", "test1"]).strip()
-                main_head = repository.run(["rev-parse", "main"]).strip()
-                repository.run(["tag", "-f", "-a", "branches/test1/v0.2.0-beta.0.0.1", "-m", "preview", source_head])
-                repository.run(["tag", "-f", "-a", "v0.2.1", "-m", "main release", main_head])
+                source = repository.run(["rev-parse", "test1"]).strip()
+                main = repository.run(["rev-parse", "main"]).strip()
+                repository.run(["tag", "-f", "-a", "branches/test1/v0.2.0-beta.0.0.1", "-m", "preview", source])
+                repository.run(["tag", "-f", "-a", "v0.2.1", "-m", "main release", main])
                 repository.merge_to_main("test1")
-                original_run = MODULE.subprocess.run
-
-                def merge_tool(command, **kwargs):
-                    if command[0] == "git":
-                        return original_run(command, **kwargs)
-                    inputs = {
-                        Path(arg).name: Path(arg).read_text()
-                        for arg in command[1:]
-                        if Path(arg).is_file() and Path(arg) != path / "file.txt"
-                    }
-                    self.assertEqual("base\n", inputs["base"])
-                    self.assertEqual("", inputs["main" if deleted_side == "main" else "incoming"])
-                    (path / "file.txt").write_text("reviewed result\n", encoding="utf-8")
-                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-                for tool in ("bcompare", "meld", "kdiff3"):
-                    repository.configure_compare_tool(tool)
-                    with mock.patch.object(MODULE.shutil, "which", return_value="/tool"), \
-                            mock.patch.object(MODULE.subprocess, "run", side_effect=merge_tool):
-                        repository.launch_merge_tool("file.txt")
-                    self.assertEqual(("file.txt",), repository.merge_state().conflicts)
-                repository.resolve_merge_file("file.txt", delete=deleted_side == "main")
+                session = repository.prepare_merge_comparison()
+                directory, _data = repository._review_session_data(session)
+                self.assertFalse((directory / ("main" if deleted_side == "main" else "branch") / "file.txt").exists())
+                if deleted_side == "main":
+                    (directory / "main" / "file.txt").write_text("restore feature\n")
+                else:
+                    (directory / "main" / "file.txt").unlink()
+                repository.apply_merge_comparison(repository.merge_comparison_result(session))
+                self.assertEqual(("file.txt",), repository.merge_state().conflicts)
+                repository.resolve_merge_file("file.txt", delete=deleted_side == "test1")
                 repository.complete_merge()
-                self.assertEqual(deleted_side != "main", (path / "file.txt").exists())
+                self.assertEqual(deleted_side == "main", (path / "file.txt").exists())
 
 
 class WorkspaceReleaseFilesTest(unittest.TestCase):
@@ -2175,7 +2148,7 @@ class BranchPresentationTest(unittest.TestCase):
 
         self.assertEqual(["feature", "main", "test1"], [choice.name for choice in choices])
         by_name = {choice.name: choice for choice in choices}
-        self.assertEqual("main（当前，本地+origin）", by_name["main"].label)
+        self.assertEqual("main（本地+origin）", by_name["main"].label)
         self.assertEqual("local", by_name["main"].source)
         self.assertEqual("local-main", by_name["main"].oid)
         self.assertEqual("feature（本地）", by_name["feature"].label)
@@ -2207,7 +2180,7 @@ class BranchPresentationTest(unittest.TestCase):
         rows = {row[0]: list(row) for row in window.branch_model}
         self.assertEqual(2, len(rows))
         self.assertEqual("branch:main", window.branch_combo.get_active_id())
-        self.assertEqual(["main（当前，本地+origin）", "#32804f", True], rows["branch:main"][1:])
+        self.assertEqual(["main（本地+origin）", "#32804f", True], rows["branch:main"][1:])
         self.assertFalse(rows["branch:feature"][3])
         renderer = window.branch_combo.get_cells()[0]
         window.branch_combo.get_area().apply_attributes(
