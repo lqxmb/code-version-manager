@@ -706,18 +706,18 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
     def test_preview_tags_are_branch_owned_and_release_tags_are_shared_read_only_baselines(self):
         self.assertEqual("main", self.repository.current_branch())
         self.repository.create_branch("test1")
-        self.assertEqual("branches/test1/v0.2.1-beta.1", self.repository.next_version())
+        self.assertEqual("branches/test1/v0.2.0-beta.0.0.1", self.repository.next_version())
         (self.path / "robot.txt").write_text("test preview\n", encoding="utf-8")
-        self.repository.save_version("test1/v0.2.1-beta.1", "test preview", ["robot.txt"])
-        self.assertEqual("branches/test1/v0.2.1-beta.2", self.repository.next_version())
+        self.repository.save_version("test1/v0.2.0-beta.0.0.1", "test preview", ["robot.txt"])
+        self.assertEqual("branches/test1/v0.2.0-beta.0.0.2", self.repository.next_version())
         (self.path / "robot.txt").write_text("second test preview\n", encoding="utf-8")
-        self.repository.save_version("test1/v0.2.1-beta.2", "second test preview", ["robot.txt"])
-        preview_ref = "refs/tags/branches/test1/v0.2.1-beta.1"
+        self.repository.save_version("test1/v0.2.0-beta.0.0.2", "second test preview", ["robot.txt"])
+        preview_ref = "refs/tags/branches/test1/v0.2.0-beta.0.0.1"
         self.assertTrue(self.repository.run(["show-ref", "--verify", preview_ref]).strip())
-        self.assertEqual("v0.2.1-beta.2", self.repository.version_tags()[0].name[len("branches/test1/"):])
+        self.assertEqual("v0.2.0-beta.0.0.2", self.repository.version_tags()[0].name[len("branches/test1/"):])
         history = self.repository.history()
         self.assertEqual(
-            {"v0.2.0", "branches/test1/v0.2.1-beta.1", "branches/test1/v0.2.1-beta.2"},
+            {"v0.2.0", "branches/test1/v0.2.0-beta.0.0.1", "branches/test1/v0.2.0-beta.0.0.2"},
             {entry.tags[0] for entry in history},
         )
         baseline = next(entry for entry in history if entry.tags == ("v0.2.0",))
@@ -729,20 +729,249 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.GitError, "test1"):
             self.repository.delete_version("v0.2.0")
 
-        self.assertEqual("branches/feature%2Fcamera/v0.2.1-beta.1", MODULE.version_tag_name(
-            "feature/camera", "v0.2.1-beta.1",
+        self.assertEqual("branches/feature%2Fcamera/v0.2.0-beta.0.0.1", MODULE.version_tag_name(
+            "feature/camera", "v0.2.0-beta.0.0.1",
         ))
-        self.assertEqual("feature/camera/v0.2.1-beta.1", MODULE.display_version(
-            "branches/feature%2Fcamera/v0.2.1-beta.1",
+        self.assertEqual("feature/camera/v0.2.0-beta.0.0.1", MODULE.display_version(
+            "branches/feature%2Fcamera/v0.2.0-beta.0.0.1",
         ))
         self.assertEqual(
-            "feature/camera", MODULE.parse_version_tag("refs/tags/branches/feature%2Fcamera/v0.2.1-beta.1")[0],
+            "feature/camera", MODULE.parse_version_tag("refs/tags/branches/feature%2Fcamera/v0.2.0-beta.0.0.1")[0],
         )
+        self.assertEqual(
+            ("test1", "v0.2.0-beta.1"),
+            MODULE.parse_version_tag("branches/test1/v0.2.0-beta.1"),
+        )
+        self.assertEqual(1, MODULE.prerelease_sequence("v0.2.0-beta.0.0.1"))
+        self.assertEqual(2, MODULE.prerelease_sequence("v0.2.0-beta.0.0.2"))
+
+    def test_development_branch_requires_a_formal_release_and_rejects_new_legacy_format(self):
+        self.repository.run(["tag", "--delete", "v0.2.0"])
+        self.repository.create_branch("without-release")
+        with self.assertRaisesRegex(MODULE.GitError, "先在 main 发布首个正式版本"):
+            self.repository.next_version()
+        head = self.repository.run(["rev-parse", "HEAD"])
+        with self.assertRaisesRegex(MODULE.GitError, "先在 main 发布首个正式版本"):
+            self.repository.save_version("without-release/v0.2.0-beta.0.0.1", "blocked", ["robot.txt"])
+        self.assertEqual(head, self.repository.run(["rev-parse", "HEAD"]))
+
+        window = mock.Mock(repository=self.repository)
+        MODULE.VersionManagerWindow.on_save_version(window, None)
+        window.show_error.assert_called_once()
+        window.prompt_version_metadata.assert_not_called()
+
+        self.repository.switch_branch("main")
+        self.repository.run(["tag", "v0.2.0"])
+        self.repository.switch_branch("without-release")
+        (self.path / "robot.txt").write_text("preview\n", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.GitError, "beta.0.0.序号"):
+            self.repository.save_version("without-release/v0.2.0-beta.1", "legacy", ["robot.txt"])
+
+    def test_preview_sequence_sorts_numerically_and_reads_legacy_labels(self):
+        self.repository.create_branch("test1")
+        self.repository.save_version(
+            "test1/v0.2.0-beta.0.0.1", "preview one", ["robot.txt"], sync_version_file=True,
+        )
+        legacy = "branches/test1/v0.2.0-beta.9"
+        self.repository.run(["tag", "-a", legacy, "-m", "legacy nine"])
+        version = "branches/test1/v0.2.0-beta.0.0.10"
+        self.assertEqual(version, self.repository.next_version())
+        self.repository.save_version(version, "preview ten", ["robot.txt"], sync_version_file=True)
+        self.assertEqual("0.2.0-beta.0.0.10\n", (self.path / "VERSION").read_text())
+        history = [entry.tags[0] for entry in self.repository.history()]
+        self.assertLess(history.index(version), history.index(legacy))
+        self.assertIn("test1/v0.2.0-beta.0.0.10 (", self.repository.changelog_text())
+        self.repository.update_version_message(legacy, "edited legacy nine")
+        self.assertEqual("edited legacy nine", self.repository.version_message(legacy))
+
+        archive = self.root / "preview.zip"
+        self.repository.export(version, archive)
+        with zipfile.ZipFile(archive) as bundle:
+            self.assertEqual(b"0.2.0-beta.0.0.10\n", bundle.read("VERSION"))
+        notes = "test1/v0.2.0-beta.0.0.10 (2026-11-03)"
+        (self.path / "CHANGELOG.rst").write_text(
+            f"{notes}\n{'-' * len(notes)}\n* preview notes\n", encoding="utf-8",
+        )
+        self.assertEqual("preview notes", MODULE.workspace_version_message(self.path, version))
+        remote = self.root / "origin.git"
+        self.git(self.root, "init", "--bare", "-q", str(remote))
+        self.repository.configure_remote(str(remote), "Test User", "test@example.com")
+        snapshot = self.repository.sync_snapshot()
+        status = self.repository.remote_sync_status(snapshot)
+        self.repository.sync_remote_from_local(snapshot, status)
+        self.assertIn(version, self.git(remote, "tag").splitlines())
+        self.assertIn(legacy, self.git(remote, "tag").splitlines())
+
+        self.repository.switch_branch("main")
+        self.repository.save_version("v0.3.0", "new formal", ["robot.txt"])
+        self.repository.switch_branch("test1")
+        self.assertEqual("branches/test1/v0.3.0-beta.0.0.1", self.repository.next_version())
+        self.repository.create_branch("test2")
+        self.assertEqual("branches/test2/v0.3.0-beta.0.0.1", self.repository.next_version())
+
+    def test_merge_keeps_main_formal_version_and_merges_branch_history(self):
+        path = self.root / "formal-workspace"
+        path.mkdir()
+        (path / "robot.txt").write_text("base\n", encoding="utf-8")
+        repository = MODULE.initialize_repository(
+            path, "v0.2.0", "base", ["robot.txt"], sync_version_file=True,
+        )
+        self.path = path
+        self.repository = repository
+        remote = self.root / "origin.git"
+        self.git(self.root, "init", "--bare", "-q", str(remote))
+        repository.configure_remote(str(remote), "Test User", "test@example.com")
+        repository.sync_remote()
+
+        repository.create_branch("test1")
+        (path / "robot.txt").write_text("feature side\n", encoding="utf-8")
+        repository.save_version(
+            "test1/v0.2.0-beta.0.0.1", "feature", ["robot.txt"], sync_version_file=True,
+        )
+        (path / "VERSION").write_text("0.2.0-beta.1\n", encoding="utf-8")
+        repository.save_version(
+            "test1/v0.2.0-beta.0.0.2", "legacy VERSION compatibility", ["VERSION"],
+            sync_version_file=False,
+        )
+        feature_head = repository.run(["rev-parse", "HEAD"]).strip()
+        repository.sync_remote()
+        repository.switch_branch("main")
+        (path / "robot.txt").write_text("main side\n", encoding="utf-8")
+        repository.save_version("v0.3.0", "main release", ["robot.txt"], sync_version_file=True)
+        release_oid = repository.run(["rev-parse", "v0.3.0"]).strip()
+        repository.sync_remote()
+
+        message = repository.merge_to_main("test1")
+
+        self.assertIn("VERSION 已保留 main 正式版本 0.3.0", message)
+        self.assertEqual("0.3.0\n", (path / "VERSION").read_text(encoding="utf-8"))
+        self.assertEqual(("robot.txt",), repository.merge_state().conflicts)
+        with self.assertRaisesRegex(MODULE.GitError, "未解决"):
+            repository.complete_merge()
+        (path / "robot.txt").write_text("main side\nfeature side\n", encoding="utf-8")
+        repository.resolve_merge_file("robot.txt")
+        repository.complete_merge()
+
+        self.assertEqual(release_oid, repository.run(["rev-parse", "v0.3.0"]).strip())
+        self.assertEqual("0.3.0\n", repository.run(["show", "main:VERSION"]))
+        self.git(path, "merge-base", "--is-ancestor", feature_head, "main")
+
+    def test_merge_handles_both_branches_adding_version_and_can_abort(self):
+        self.repository.create_branch("branch1")
+        (self.path / "robot.txt").write_text("branch1 side\n", encoding="utf-8")
+        (self.path / "branch1.txt").write_text("feature\n", encoding="utf-8")
+        self.repository.save_version(
+            "branch1/v0.2.0-beta.0.0.1", "preview", ["robot.txt", "branch1.txt"],
+            sync_version_file=True,
+        )
+        self.repository.switch_branch("main")
+        (self.path / "robot.txt").write_text("main side\n", encoding="utf-8")
+        self.repository.save_version("v0.3.0", "formal", ["robot.txt"], sync_version_file=True)
+        head = self.repository.run(["rev-parse", "HEAD"])
+
+        message = self.repository.merge_to_main("branch1")
+
+        self.assertIn("VERSION 已保留 main 正式版本", message)
+        self.assertEqual(("robot.txt",), self.repository.merge_state().conflicts)
+        self.assertEqual("0.3.0\n", (self.path / "VERSION").read_text())
+        self.assertEqual("feature\n", (self.path / "branch1.txt").read_text())
+        with self.assertRaisesRegex(MODULE.GitError, "未完成"):
+            self.repository.sync_snapshot()
+        self.repository.abort_merge()
+        self.assertEqual(head, self.repository.run(["rev-parse", "HEAD"]))
+        self.assertEqual("0.3.0\n", (self.path / "VERSION").read_text())
+        self.assertFalse((self.path / "branch1.txt").exists())
+
+    def test_merge_removes_preview_version_when_main_has_no_version_file(self):
+        self.repository.create_branch("test1")
+        (self.path / "robot.txt").write_text("feature\n", encoding="utf-8")
+        self.repository.save_version(
+            "test1/v0.2.0-beta.0.0.1", "preview", ["robot.txt"], sync_version_file=True,
+        )
+        self.assertEqual("0.2.0-beta.0.0.1\n", (self.path / "VERSION").read_text())
+        self.repository.switch_branch("main")
+
+        message = self.repository.merge_to_main("test1")
+
+        self.assertIn("已从 main 移除", message)
+        self.assertFalse((self.path / "VERSION").exists())
+        self.assertEqual("main", self.repository.current_branch())
+        self.assertIn("branches/test1/v0.2.0-beta.0.0.1", self.repository.tags())
+
+    def test_merge_keeps_newer_main_version_when_source_still_has_inherited_formal_number(self):
+        (self.path / "VERSION").write_text("0.2.0\n", encoding="utf-8")
+        self.repository.run(["add", "VERSION"])
+        self.repository.run(["commit", "-m", "add formal version file"])
+        self.repository.create_branch("test1")
+        (self.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+        self.repository.save_version(
+            "test1/v0.2.0-beta.0.0.1", "feature", ["feature.txt"], sync_version_file=False,
+        )
+        self.repository.switch_branch("main")
+        self.repository.save_version("v0.3.0", "main release", ["robot.txt"], sync_version_file=True)
+
+        self.repository.merge_to_main("test1")
+
+        self.assertFalse(self.repository.merge_state().active)
+        self.assertEqual("0.3.0\n", (self.path / "VERSION").read_text())
+        self.assertTrue((self.path / "feature.txt").is_file())
+
+    def test_unrecognized_version_file_requires_manual_merge_resolution(self):
+        self.repository.create_branch("test1")
+        (self.path / "VERSION").write_text("nightly-custom\n", encoding="utf-8")
+        (self.path / "robot.txt").write_text("feature\n", encoding="utf-8")
+        self.repository.save_version(
+            "test1/v0.2.0-beta.0.0.1", "preview", ["robot.txt", "VERSION"],
+            sync_version_file=False,
+        )
+        self.repository.switch_branch("main")
+
+        self.repository.merge_to_main("test1")
+
+        self.assertIn("VERSION", self.repository.merge_state().conflicts)
+        self.assertIn("手动检查", self.repository.merge_state().notice)
+        with self.assertRaisesRegex(MODULE.GitError, "未解决"):
+            self.repository.complete_merge()
+        original_run = MODULE.subprocess.run
+
+        def review_version(command, **kwargs):
+            if command[0] == "git":
+                return original_run(command, **kwargs)
+            inputs = [Path(arg) for arg in command[1:] if Path(arg).is_file()]
+            self.assertIn("nightly-custom\n", {item.read_text() for item in inputs})
+            self.assertIn("", {item.read_text() for item in inputs})
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch.object(MODULE.shutil, "which", return_value="/tool"), \
+                mock.patch.object(MODULE.subprocess, "run", side_effect=review_version):
+            self.repository.launch_merge_tool("VERSION")
+        self.assertIn("VERSION", self.repository.merge_state().conflicts)
+        self.repository.resolve_merge_file("VERSION")
+        self.repository.complete_merge()
+        self.assertEqual("nightly-custom\n", (self.path / "VERSION").read_text())
+
+    def test_merge_does_not_automatically_resolve_symlink_version_file(self):
+        self.repository.save_version("v0.2.1", "main version", ["robot.txt"], sync_version_file=True)
+        self.repository.create_branch("test1")
+        (self.path / "VERSION").unlink()
+        (self.path / "VERSION").symlink_to("robot.txt")
+        self.repository.save_version(
+            "test1/v0.2.1-beta.0.0.1", "symlink version", ["VERSION"], sync_version_file=False,
+        )
+        self.repository.switch_branch("main")
+
+        self.repository.merge_to_main("test1")
+
+        self.assertEqual(("VERSION",), self.repository.merge_state().conflicts)
+        self.assertEqual("base\n", (self.path / "robot.txt").read_text())
+        self.repository.abort_merge()
+        self.assertFalse((self.path / "VERSION").is_symlink())
+        self.assertEqual("0.2.1\n", (self.path / "VERSION").read_text())
 
     def test_merge_preserves_main_release_and_branch_tags_and_optional_cleanup(self):
         self.repository.create_branch("test1")
         (self.path / "test-feature.txt").write_text("from test1\n", encoding="utf-8")
-        self.repository.save_version("test1/v0.2.1-beta.1", "feature work", ["test-feature.txt"])
+        self.repository.save_version("test1/v0.2.0-beta.0.0.1", "feature work", ["test-feature.txt"])
         self.repository.switch_branch("main")
         (self.path / "robot.txt").write_text("main 0.3.0\n", encoding="utf-8")
         self.repository.save_version("v0.3.0", "main release", ["robot.txt"])
@@ -754,32 +983,32 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual("main", self.repository.current_branch())
         self.assertEqual(release_oid, self.repository.run(["rev-parse", "v0.3.0"]).strip())
         self.assertTrue((self.path / "test-feature.txt").is_file())
-        self.git(self.path, "merge-base", "--is-ancestor", "refs/tags/branches/test1/v0.2.1-beta.1", "main")
+        self.git(self.path, "merge-base", "--is-ancestor", "refs/tags/branches/test1/v0.2.0-beta.0.0.1", "main")
         self.assertEqual(["v0.3.0", "v0.2.0"], [entry.tags[0] for entry in self.repository.history()])
-        self.assertIn("branches/test1/v0.2.1-beta.1", [entry.tags[0] for entry in self.repository.history(all_versions=True)])
+        self.assertIn("branches/test1/v0.2.0-beta.0.0.1", [entry.tags[0] for entry in self.repository.history(all_versions=True)])
 
         plan = self.repository.plan_branch_deletion("test1")
         self.assertFalse(plan.cleanup_tags)
         self.repository.delete_merged_branch("test1", expected=plan)
         self.assertNotIn("test1", [branch.name for branch in self.repository.local_branches()])
-        self.assertIn("branches/test1/v0.2.1-beta.1", self.repository.tags())
+        self.assertIn("branches/test1/v0.2.0-beta.0.0.1", self.repository.tags())
         self.assertIn("v0.2.0", self.repository.tags())
 
         self.repository.create_branch("test2")
         (self.path / "test2.txt").write_text("test2\n", encoding="utf-8")
-        self.repository.save_version("test2/v0.3.1-beta.1", "test2 preview", ["test2.txt"])
+        self.repository.save_version("test2/v0.3.0-beta.0.0.1", "test2 preview", ["test2.txt"])
         self.repository.merge_to_main("test2")
         plan = self.repository.plan_branch_deletion("test2", cleanup_tags=True)
-        self.assertIn("refs/tags/branches/test2/v0.3.1-beta.1", dict(plan.local_refs))
+        self.assertIn("refs/tags/branches/test2/v0.3.0-beta.0.0.1", dict(plan.local_refs))
         self.repository.delete_merged_branch("test2", cleanup_tags=True, expected=plan)
-        self.assertNotIn("branches/test2/v0.3.1-beta.1", self.repository.tags())
-        self.assertIn("branches/test1/v0.2.1-beta.1", self.repository.tags())
+        self.assertNotIn("branches/test2/v0.3.0-beta.0.0.1", self.repository.tags())
+        self.assertIn("branches/test1/v0.2.0-beta.0.0.1", self.repository.tags())
         self.assertIn("v0.2.0", self.repository.tags())
 
     def test_merge_conflicts_block_switch_and_publish_until_resolved_and_can_abort(self):
         self.repository.create_branch("test1")
         (self.path / "robot.txt").write_text("test side\n", encoding="utf-8")
-        self.repository.save_version("test1/v0.2.1-beta.1", "test edit", ["robot.txt"])
+        self.repository.save_version("test1/v0.2.0-beta.0.0.1", "test edit", ["robot.txt"])
         test_head = self.repository.run(["rev-parse", "HEAD"]).strip()
         self.repository.switch_branch("main")
         (self.path / "robot.txt").write_text("main side\n", encoding="utf-8")
@@ -809,7 +1038,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
 
         self.repository.switch_branch("test1")
         (self.path / "robot.txt").write_text("another test side\n", encoding="utf-8")
-        self.repository.save_version("test1/v0.2.2-beta.1", "second test edit", ["robot.txt"])
+        self.repository.save_version("test1/v0.2.0-beta.0.0.2", "second test edit", ["robot.txt"])
         self.repository.switch_branch("main")
         self.repository.run(["checkout", "-q", main_head, "--", "robot.txt"])
         (self.path / "robot.txt").write_text("another main side\n", encoding="utf-8")
@@ -828,7 +1057,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.sync_remote()
         self.repository.create_branch("test1")
         (self.path / "test-feature.txt").write_text("feature\n", encoding="utf-8")
-        self.repository.save_version("test1/v0.2.1-beta.1", "feature", ["test-feature.txt"])
+        self.repository.save_version("test1/v0.2.0-beta.0.0.1", "feature", ["test-feature.txt"])
         test_head = self.repository.run(["rev-parse", "HEAD"]).strip()
         self.repository.switch_branch("main")
 
@@ -868,10 +1097,10 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.sync_remote()
         self.repository.create_branch("test1")
         (self.path / "test-feature.txt").write_text("feature\n", encoding="utf-8")
-        self.repository.save_version("test1/v0.2.1-beta.1", "preview", ["test-feature.txt"])
+        self.repository.save_version("test1/v0.2.0-beta.0.0.1", "preview", ["test-feature.txt"])
         self.repository.sync_remote()
         self.assertIn("refs/heads/test1", self.git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/"))
-        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/branches/test1/v0.2.1-beta.1"))
+        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/branches/test1/v0.2.0-beta.0.0.1"))
 
         self.repository.switch_branch("main")
         (self.path / "robot.txt").write_text("release 0.3.0\n", encoding="utf-8")
@@ -879,7 +1108,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.sync_remote()
         self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/v0.2.0"))
         self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/v0.3.0"))
-        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/branches/test1/v0.2.1-beta.1"))
+        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/branches/test1/v0.2.0-beta.0.0.1"))
 
         self.repository.merge_to_main("test1")
         self.repository.sync_remote()
@@ -889,11 +1118,11 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("refs/heads/main", remote_branches)
         self.assertNotIn("refs/heads/test1", remote_branches)
         self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/v0.2.0"))
-        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/branches/test1/v0.2.1-beta.1"))
+        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/branches/test1/v0.2.0-beta.0.0.1"))
 
         self.repository.create_branch("test2")
         (self.path / "test2.txt").write_text("test2\n", encoding="utf-8")
-        self.repository.save_version("test2/v0.3.1-beta.1", "test2 preview", ["test2.txt"])
+        self.repository.save_version("test2/v0.3.0-beta.0.0.1", "test2 preview", ["test2.txt"])
         self.repository.sync_remote()
         self.repository.merge_to_main("test2")
         self.repository.sync_remote()
@@ -901,7 +1130,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.delete_merged_branch("test2", cleanup_tags=True, delete_remote=True, expected=plan)
         missing_tag = subprocess.run([
             "git", "-C", str(remote), "show-ref", "--verify", "--quiet",
-            "refs/tags/branches/test2/v0.3.1-beta.1",
+            "refs/tags/branches/test2/v0.3.0-beta.0.0.1",
         ]).returncode
         self.assertNotEqual(0, missing_tag)
         self.assertNotIn("refs/heads/test2", self.git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/"))
@@ -940,7 +1169,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.sync_remote()
         self.repository.create_branch("feature/camera")
         (self.path / "camera.txt").write_text("camera\n", encoding="utf-8")
-        self.repository.save_version("feature/camera/v0.2.1-beta.1", "camera preview", ["camera.txt"])
+        self.repository.save_version("feature/camera/v0.2.0-beta.0.0.1", "camera preview", ["camera.txt"])
         self.repository.sync_remote()
         self.repository.switch_branch("main")
         (self.path / "robot.txt").write_text("main progress\n", encoding="utf-8")
@@ -962,7 +1191,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         status = repo.remote_sync_status(snapshot)
         self.assertTrue(status.can_sync_local, status.local_message)
         repo.sync_local_from_remote(snapshot, status)
-        self.assertIn("branches/feature%2Fcamera/v0.2.1-beta.1", repo.tags())
+        self.assertIn("branches/feature%2Fcamera/v0.2.0-beta.0.0.1", repo.tags())
         self.assertIn("v0.2.0", repo.tags())
         self.assertNotIn("v0.3.0", repo.tags())
         self.assertEqual("origin/feature/camera", self.git(imported, "rev-parse", "--abbrev-ref", "@{u}"))
@@ -988,7 +1217,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
     def test_merge_tools_receive_three_sides_and_do_not_automatically_mark_resolved(self):
         self.repository.create_branch("test1")
         (self.path / "robot.txt").write_text("incoming side\n", encoding="utf-8")
-        self.repository.save_version("test1/v0.2.1-beta.1", "incoming", ["robot.txt"])
+        self.repository.save_version("test1/v0.2.0-beta.0.0.1", "incoming", ["robot.txt"])
         self.repository.switch_branch("main")
         (self.path / "robot.txt").write_text("main side\n", encoding="utf-8")
         self.repository.save_version("v0.2.1", "main", ["robot.txt"])
@@ -1017,6 +1246,86 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.resolve_merge_file("robot.txt")
         self.assertTrue(self.repository.merge_state().ready)
         self.repository.complete_merge()
+
+    def test_merge_tool_accepts_add_add_conflicts_with_empty_base(self):
+        self.repository.create_branch("test1")
+        (self.path / "shared.txt").write_text("feature copy\n", encoding="utf-8")
+        self.repository.save_version("test1/v0.2.0-beta.0.0.1", "feature", ["shared.txt"])
+        self.repository.switch_branch("main")
+        (self.path / "shared.txt").write_text("main copy\n", encoding="utf-8")
+        self.repository.save_version("v0.2.1", "main", ["shared.txt"])
+        self.repository.merge_to_main("test1")
+        original_run = MODULE.subprocess.run
+        target = self.path / "shared.txt"
+        seen = {}
+
+        def run_tool(command, **kwargs):
+            if command[0] == "git":
+                return original_run(command, **kwargs)
+            inputs = [Path(argument) for argument in command[1:] if Path(argument).is_file() and Path(argument) != target]
+            seen["contents"] = {path.read_text(encoding="utf-8") for path in inputs}
+            self.assertTrue(any(str(target) in argument for argument in command))
+            target.write_text("combined\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        self.repository.configure_compare_tool("bcompare")
+        with mock.patch.object(MODULE.shutil, "which", return_value="/tool"), \
+                mock.patch.object(MODULE.subprocess, "run", side_effect=run_tool):
+            self.repository.launch_merge_tool("shared.txt")
+
+        self.assertIn("", seen["contents"])
+        self.assertIn("main copy\n", seen["contents"])
+        self.assertIn("feature copy\n", seen["contents"])
+        self.assertEqual(("shared.txt",), self.repository.merge_state().conflicts)
+        self.repository.resolve_merge_file("shared.txt")
+        self.repository.complete_merge()
+
+    def test_merge_tool_accepts_modify_delete_conflicts_with_empty_missing_side(self):
+        for deleted_side in ("main", "test1"):
+            with self.subTest(deleted_side=deleted_side):
+                path = self.root / ("deleted-" + deleted_side)
+                path.mkdir()
+                (path / "file.txt").write_text("base\n", encoding="utf-8")
+                repository = MODULE.initialize_repository(path, "v0.2.0", "base", ["file.txt"])
+                repository.create_branch("test1")
+                if deleted_side == "test1":
+                    repository.run(["rm", "file.txt"])
+                    repository.run(["commit", "-m", "feature removes file"])
+                else:
+                    (path / "file.txt").write_text("feature edit\n", encoding="utf-8")
+                    repository.save_version("test1/v0.2.0-beta.0.0.1", "feature", ["file.txt"])
+                repository.switch_branch("main")
+                if deleted_side == "main":
+                    repository.run(["rm", "file.txt"])
+                    repository.run(["commit", "-m", "main removes file"])
+                else:
+                    (path / "file.txt").write_text("main edit\n", encoding="utf-8")
+                    repository.save_version("v0.2.1", "main", ["file.txt"])
+                repository.merge_to_main("test1")
+                original_run = MODULE.subprocess.run
+
+                def merge_tool(command, **kwargs):
+                    if command[0] == "git":
+                        return original_run(command, **kwargs)
+                    inputs = {
+                        Path(arg).name: Path(arg).read_text()
+                        for arg in command[1:]
+                        if Path(arg).is_file() and Path(arg) != path / "file.txt"
+                    }
+                    self.assertEqual("base\n", inputs["base"])
+                    self.assertEqual("", inputs["main" if deleted_side == "main" else "incoming"])
+                    (path / "file.txt").write_text("reviewed result\n", encoding="utf-8")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                for tool in ("bcompare", "meld", "kdiff3"):
+                    repository.configure_compare_tool(tool)
+                    with mock.patch.object(MODULE.shutil, "which", return_value="/tool"), \
+                            mock.patch.object(MODULE.subprocess, "run", side_effect=merge_tool):
+                        repository.launch_merge_tool("file.txt")
+                    self.assertEqual(("file.txt",), repository.merge_state().conflicts)
+                repository.resolve_merge_file("file.txt", delete=deleted_side == "main")
+                repository.complete_merge()
+                self.assertEqual(deleted_side != "main", (path / "file.txt").exists())
 
 
 class WorkspaceReleaseFilesTest(unittest.TestCase):
@@ -1457,13 +1766,13 @@ class RemoteRepositoryTest(unittest.TestCase):
     def test_uses_actual_working_branch_instead_of_assuming_main(self):
         self.repository.run(["switch", "-c", "release"])
         self.configure()
-        self.publish("v0.0.2-beta.1")
+        self.publish("v0.0.1-beta.0.0.1")
         self.repository.sync_remote()
 
         self.assertEqual(
             "refs/heads/release", self.git(self.remote, "for-each-ref", "--format=%(refname)", "refs/heads/")
         )
-        self.assertEqual(["branches/release/v0.0.2-beta.1"], self.git(self.remote, "tag").splitlines())
+        self.assertEqual(["branches/release/v0.0.1-beta.0.0.1"], self.git(self.remote, "tag").splitlines())
 
     def test_multiple_push_destinations_are_rejected_without_losing_local_release(self):
         self.configure()
@@ -1995,13 +2304,60 @@ class BranchPresentationTest(unittest.TestCase):
 
         self.assertEqual(["feature", "main", "test1"], [choice.name for choice in choices])
         by_name = {choice.name: choice for choice in choices}
-        self.assertEqual("main（当前，本地和 origin 均有）", by_name["main"].label)
+        self.assertEqual("main（当前，本地+origin）", by_name["main"].label)
         self.assertEqual("local", by_name["main"].source)
         self.assertEqual("local-main", by_name["main"].oid)
         self.assertEqual("feature（本地）", by_name["feature"].label)
-        self.assertEqual("test1（origin，仅远程）", by_name["test1"].label)
+        self.assertEqual("test1（origin）", by_name["test1"].label)
+        self.assertEqual("#32804f", by_name["main"].foreground)
+        self.assertIsNone(by_name["feature"].foreground)
         self.assertEqual("remote", by_name["test1"].source)
         self.assertEqual("remote-test1", by_name["test1"].oid)
+
+    def test_gtk_branch_model_colors_current_branch_and_resets_after_switch(self):
+        if not MODULE.Gtk.init_check()[0]:
+            self.skipTest("GTK display is unavailable")
+        with mock.patch.object(MODULE.VersionManagerWindow, "load_workspace"):
+            window = MODULE.VersionManagerWindow(None, Path(tempfile.gettempdir()))
+        self.addCleanup(window.destroy)
+        repository = mock.Mock()
+        repository._sync_target.return_value = "local-origin"
+        repository.run.return_value = "commit"
+        repository.merge_state.return_value = MODULE.MergeState(False)
+        repository.current_branch.return_value = "main"
+        repository.local_branches.return_value = [
+            MODULE.BranchInfo("main", "local", "main-oid", True),
+            MODULE.BranchInfo("feature", "local", "feature-oid"),
+        ]
+        window.repository = repository
+        window.remote_branch_url = "local-origin"
+        window.remote_branch_choices = [MODULE.BranchInfo("main", "remote", "origin-oid")]
+        window._refresh_branch_choices()
+        rows = {row[0]: list(row) for row in window.branch_model}
+        self.assertEqual(2, len(rows))
+        self.assertEqual("branch:main", window.branch_combo.get_active_id())
+        self.assertEqual(["main（当前，本地+origin）", "#32804f", True], rows["branch:main"][1:])
+        self.assertFalse(rows["branch:feature"][3])
+        renderer = window.branch_combo.get_cells()[0]
+        window.branch_combo.get_area().apply_attributes(
+            window.branch_model, window.branch_model.get_iter("1"), False, False,
+        )
+        self.assertTrue(renderer.get_property("foreground-set"))
+        window.branch_combo.get_area().apply_attributes(
+            window.branch_model, window.branch_model.get_iter("0"), False, False,
+        )
+        self.assertFalse(renderer.get_property("foreground-set"))
+
+        repository.current_branch.return_value = "feature"
+        repository.local_branches.return_value = [
+            MODULE.BranchInfo("main", "local", "main-oid"),
+            MODULE.BranchInfo("feature", "local", "feature-oid", True),
+        ]
+        window._refresh_branch_choices()
+        rows = {row[0]: list(row) for row in window.branch_model}
+        self.assertEqual("branch:feature", window.branch_combo.get_active_id())
+        self.assertTrue(rows["branch:feature"][3])
+        self.assertFalse(rows["branch:main"][3])
 
     def test_inherited_formal_release_is_marked_read_only(self):
         temp = tempfile.TemporaryDirectory()

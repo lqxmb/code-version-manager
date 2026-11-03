@@ -46,7 +46,13 @@ APP_NAME = "工作空间版本管理"
 APP_VERSION = load_application_version()
 DEFAULT_REPOSITORY = Path.home() / "catkin_ws"
 VERSION_PATTERN = re.compile(r"^v(\d+(?:\.\d+){2,})$")
-PRERELEASE_PATTERN = re.compile(r"^(v\d+(?:\.\d+){2,})-beta\.([1-9]\d*)$")
+PRERELEASE_PATTERN = re.compile(
+    r"^(v\d+(?:\.\d+){2,})-beta\.(0\.0\.[1-9]\d*|[1-9]\d*)$"
+)
+FORMAL_VERSION_FILE_PATTERN = re.compile(r"^\d+(?:\.\d+){2,}$")
+PRERELEASE_VERSION_FILE_PATTERN = re.compile(
+    r"^\d+(?:\.\d+){2,}-beta\.(?:0\.0\.[1-9]\d*|[1-9]\d*)$"
+)
 METADATA_DIRECTORY = "code-version-manager"
 MANIFEST_DIRECTORY = "versions"
 MANIFEST_SUFFIX = ".manifest"
@@ -132,6 +138,16 @@ def version_tag_name(owner: str, version: str) -> str:
     return f"branches/{quote(owner, safe='')}/{version}"
 
 
+def prerelease_sequence(version: str) -> int:
+    parsed = PRERELEASE_PATTERN.fullmatch(version)
+    return int(parsed.group(2).split(".")[-1]) if parsed else 0
+
+
+def is_new_prerelease(version: str) -> bool:
+    parsed = PRERELEASE_PATTERN.fullmatch(version)
+    return bool(parsed and parsed.group(2).startswith("0.0."))
+
+
 def display_version(name: str) -> str:
     parsed = parse_version_tag(name)
     return f"{parsed[0]}/{parsed[1]}" if parsed and parsed[0] else name
@@ -144,8 +160,10 @@ def canonical_version(value: str, branch: Optional[str] = None) -> str:
         return value
     if branch and PRERELEASE_PATTERN.fullmatch(value):
         return version_tag_name(branch, value)
-    match = re.fullmatch(r"(.+)/(v\d+(?:\.\d+){2,}-beta\.[1-9]\d*)", value)
-    return version_tag_name(*match.groups()) if match else value
+    parts = value.rsplit("/", 1)
+    if len(parts) == 2 and parts[0] and PRERELEASE_PATTERN.fullmatch(parts[1]):
+        return version_tag_name(*parts)
+    return value
 
 
 def version_sort_key(name: str):
@@ -154,7 +172,7 @@ def version_sort_key(name: str):
         return ((-1,), 0, 0, name)
     owner, version = parsed
     base = version.split("-beta.", 1)[0]
-    return (version_key(base), int(owner is None), int(version.split("-beta.")[1]) if owner else 0, owner or "")
+    return (version_key(base), int(owner is not None), prerelease_sequence(version) if owner else 0, owner or "")
 
 
 @dataclass(frozen=True)
@@ -192,12 +210,16 @@ class BranchChoice:
         if self.current:
             details.append("当前")
         if self.local and self.remote:
-            details.append("本地和 origin 均有")
+            details.append("本地+origin")
         elif self.local:
             details.append("本地")
         else:
-            details.append("origin，仅远程")
+            details.append("origin")
         return f"{self.name}（{'，'.join(details)}）"
+
+    @property
+    def foreground(self) -> Optional[str]:
+        return "#32804f" if self.current else None
 
 
 def combine_branch_choices(
@@ -236,6 +258,7 @@ class MergeState:
     active: bool
     source: str = ""
     conflicts: Tuple[str, ...] = ()
+    notice: str = ""
 
     @property
     def ready(self) -> bool:
@@ -1555,14 +1578,98 @@ class GitRepository:
     def merge_state(self) -> MergeState:
         active = self._git_path("MERGE_HEAD").exists()
         source = ""
+        manual_resolution: List[str] = []
+        notice = ""
         try:
-            source = json.loads((self.metadata_path / "merge.json").read_text()).get("source", "")
+            merge = json.loads((self.metadata_path / "merge.json").read_text())
+            source = merge.get("source", "")
+            manual_resolution = merge.get("manual_resolution", [])
+            notice = merge.get("notice", "")
         except (OSError, ValueError, AttributeError):
             pass
-        conflicts = tuple(sorted(set(filter(None, self.run([
-            "diff", "--name-only", "--diff-filter=U", "-z",
-        ]).split("\0"))))) if active else ()
-        return MergeState(active, source if active else "", conflicts)
+        conflicts = set()
+        if active:
+            conflicts.update(filter(None, self.run([
+                "diff", "--name-only", "--diff-filter=U", "-z",
+            ]).split("\0")))
+            conflicts.update(path for path in manual_resolution if isinstance(path, str))
+        return MergeState(active, source if active else "", tuple(sorted(conflicts)), notice if active else "")
+
+    def _file_entry_at(self, reference: str, path: str) -> Optional[Tuple[str, str]]:
+        entries = self.run([
+            "--literal-pathspecs", "ls-tree", "-z", reference, "--", path,
+        ]).split("\0")
+        for entry in filter(None, entries):
+            metadata, name = entry.split("\t", 1)
+            if name == path:
+                mode, _kind, oid = metadata.split()
+                return mode, oid
+        return None
+
+    def _version_file_at(self, reference: str) -> Optional[Tuple[str, bytes]]:
+        entry = self._file_entry_at(reference, WORKSPACE_VERSION)
+        if entry is None:
+            return None
+        mode, oid = entry
+        data = self.run_bytes(["cat-file", "blob", oid]) if mode in ("100644", "100755") else b""
+        return mode, data
+
+    @staticmethod
+    def _version_merge_policy(
+        main_file: Optional[Tuple[str, bytes]], source_file: Optional[Tuple[str, bytes]],
+    ) -> Tuple[str, str]:
+        if any(entry and entry[0] not in ("100644", "100755") for entry in (main_file, source_file)):
+            return "manual", "VERSION 涉及符号链接或特殊文件，请手动检查并标记解决。"
+        if main_file == source_file:
+            return "same", ""
+        main_data = main_file[1] if main_file else None
+        source_data = source_file[1] if source_file else None
+        main_text = main_data.decode("utf-8", errors="replace").strip() if main_data is not None else None
+        source_text = source_data.decode("utf-8", errors="replace").strip() if source_data is not None else None
+        main_formal = bool(main_text and FORMAL_VERSION_FILE_PATTERN.fullmatch(main_text))
+        source_prerelease = bool(
+            source_text and PRERELEASE_VERSION_FILE_PATTERN.fullmatch(source_text)
+        )
+        source_formal = bool(source_text and FORMAL_VERSION_FILE_PATTERN.fullmatch(source_text))
+        if main_formal and (source_data is None or source_prerelease or source_formal):
+            return (
+                "keep_main",
+                f"VERSION 已保留 main 正式版本 {main_text}；开发分支预发布号不会进入正式分支。",
+            )
+        if main_data is None and source_prerelease:
+            return (
+                "remove_prerelease",
+                f"VERSION 中的开发预发布号 {source_text} 已从 main 移除；请在 main 发布正式版本时更新。",
+            )
+        return (
+            "manual",
+            "VERSION 两侧内容无法按正式版与预发布版规则安全判断，请手动检查并标记解决。",
+        )
+
+    def _apply_version_merge_policy(self, policy: str, notice: str) -> None:
+        merge_path = self.metadata_path / "merge.json"
+        try:
+            merge = json.loads(merge_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            merge = {}
+        if policy == "keep_main":
+            target = self.path / WORKSPACE_VERSION
+            if target.is_symlink() or (target.exists() and not target.is_file()):
+                policy = "manual"
+                notice = "VERSION 不是普通文件，未自动覆盖；请手动检查并标记解决。"
+            else:
+                self.run(["--literal-pathspecs", "checkout", "HEAD", "--", WORKSPACE_VERSION])
+        elif policy == "remove_prerelease":
+            self.run([
+                "--literal-pathspecs", "rm", "-f", "--ignore-unmatch", "--", WORKSPACE_VERSION,
+            ])
+        if policy == "manual":
+            pending = set(merge.get("manual_resolution", []))
+            pending.add(WORKSPACE_VERSION)
+            merge["manual_resolution"] = sorted(pending)
+        if notice:
+            merge["notice"] = notice
+        merge_path.write_text(json.dumps(merge, ensure_ascii=False), encoding="utf-8")
 
     def _assert_branch_not_in_other_worktree(self, name: str) -> None:
         worktree = ""
@@ -1632,22 +1739,30 @@ class GitRepository:
         head = self.run(["rev-parse", "HEAD"]).strip()
         if self._contains_commit(source_oid, head):
             return f"{source} 已合入 main，无需重复合并。"
+        version_policy, version_notice = self._version_merge_policy(
+            self._version_file_at(head), self._version_file_at(source_oid),
+        )
         ensure_git_identity(self)
         self.metadata_path.mkdir(parents=True, exist_ok=True)
         self._save_recovery_refs(self._recovery_namespace("merge"), {
             "refs/heads/main": head, f"refs/heads/{source}": source_oid,
         }, "before")
-        (self.metadata_path / "merge.json").write_text(json.dumps({"source": source}), encoding="utf-8")
+        (self.metadata_path / "merge.json").write_text(
+            json.dumps({"source": source}, ensure_ascii=False), encoding="utf-8",
+        )
         result = subprocess.run([
             "git", "-C", str(self.path), "merge", "--no-ff", "--no-commit", "--no-overwrite-ignore", source_oid,
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if not self._git_path("MERGE_HEAD").exists():
+            (self.metadata_path / "merge.json").unlink(missing_ok=True)
+            raise GitError(result.stderr.strip() or result.stdout.strip() or "Git 未保留待完成的合并状态。")
+        if result.returncode != 0 and not self.merge_state().conflicts:
+            raise GitError(result.stderr.strip() or result.stdout.strip() or "Git 合并未成功，请取消后重试。")
+        self._apply_version_merge_policy(version_policy, version_notice)
         state = self.merge_state()
         if state.active and state.conflicts:
-            return f"正在将 {source} 合并到 main：有 {len(state.conflicts)} 个冲突，请解决后完成合并，或取消合并。"
-        if result.returncode != 0:
-            if not state.active:
-                (self.metadata_path / "merge.json").unlink(missing_ok=True)
-            raise GitError(result.stderr.strip() or result.stdout.strip())
+            details = f"正在将 {source} 合并到 main：有 {len(state.conflicts)} 个冲突或待人工确认文件，请逐个处理后完成合并，或取消合并。"
+            return details + ("\n" + state.notice if state.notice else "")
         return self.complete_merge()
 
     def complete_merge(self) -> str:
@@ -1660,7 +1775,8 @@ class GitRepository:
         self.run(["commit", "-m", f"Merge {state.source or 'development branch'} into main"])
         (self.metadata_path / "merge.json").unlink(missing_ok=True)
         self.remember_working_branch()
-        return "合并已完成，main 保留双方提交历史；请检查结果，再发布新的正式版本并同步远程。"
+        message = "合并已完成，main 保留双方提交历史；请检查结果，再发布新的正式版本并同步远程。"
+        return message + ("\n" + state.notice if state.notice else "")
 
     def abort_merge(self) -> str:
         if not self.merge_state().active:
@@ -1670,17 +1786,29 @@ class GitRepository:
         return "合并已取消，已恢复到开始合并时的 main。合并前安全快进取得的远程提交仍保留。"
 
     def resolve_merge_file(self, path: str, delete: bool = False) -> str:
-        if path not in self.merge_state().conflicts:
+        state = self.merge_state()
+        if path not in state.conflicts:
             raise GitError("所选文件已不在冲突列表，请刷新。")
         if not delete:
             target = self.path / path
             if not target.is_file() or target.is_symlink():
                 raise GitError("请先保存合并结果，或明确选择删除此文件。")
-            if re.search(rb"^(?:<{7}|={7}|>{7})(?:\s|$)", target.read_bytes(), re.MULTILINE):
+            if re.search(
+                rb"^(?:<{7}|={7}|>{7})(?:\s|$)", target.read_bytes(), re.MULTILINE,
+            ):
                 raise GitError("文件仍有冲突标记，请处理后再标记已解决。")
             self.run(["--literal-pathspecs", "add", "--", path])
         else:
-            self.run(["--literal-pathspecs", "rm", "-f", "--", path])
+            self.run(["--literal-pathspecs", "rm", "-f", "--ignore-unmatch", "--", path])
+        merge_path = self.metadata_path / "merge.json"
+        try:
+            merge = json.loads(merge_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            merge = {}
+        merge["manual_resolution"] = [
+            item for item in merge.get("manual_resolution", []) if item != path
+        ]
+        merge_path.write_text(json.dumps(merge, ensure_ascii=False), encoding="utf-8")
         return f"已标记解决：{path}"
 
     def launch_merge_tool(self, path: str) -> str:
@@ -1695,13 +1823,25 @@ class GitRepository:
             raise GitError(f"没有找到 {label}，请安装后重试，或在设置中更换工具。")
         entries = self.run(["--literal-pathspecs", "ls-files", "--unmerged", "-z", "--", path]).split("\0")
         stages = {int(line.split("\t", 1)[0].split()[2]): line.split("\t", 1)[0].split() for line in entries if line}
-        if any(stage not in stages for stage in (1, 2, 3)) or any(value[0] not in ("100644", "100755") for value in stages.values()):
-            raise GitError("此冲突涉及新增、删除或特殊文件，请手动编辑后标记解决，或明确选择删除。")
+        if not stages and path == WORKSPACE_VERSION:
+            # Git may have merged unknown VERSION contents cleanly; retain a manual review step.
+            base = self.run(["merge-base", "HEAD", "MERGE_HEAD"]).strip()
+            for stage, reference in ((1, base), (2, "HEAD"), (3, "MERGE_HEAD")):
+                entry = self._file_entry_at(reference, path)
+                if entry:
+                    mode, oid = entry
+                    stages[stage] = (mode, oid)
+        if not stages or any(value[0] not in ("100644", "100755") for value in stages.values()):
+            raise GitError("此冲突涉及特殊文件，请手动编辑后标记解决，或明确选择删除。")
+        target.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="cvm-merge-") as temporary:
             files = []
             for stage, name in ((1, "base"), (2, "main"), (3, "incoming")):
                 file = Path(temporary) / name
-                file.write_bytes(self.run_bytes(["cat-file", "blob", stages[stage][1]]))
+                if stage in stages:
+                    file.write_bytes(self.run_bytes(["cat-file", "blob", stages[stage][1]]))
+                else:
+                    file.write_bytes(b"")
                 files.append(str(file))
             base, local, incoming = files
             if tool == "bcompare":
@@ -1965,22 +2105,21 @@ class GitRepository:
         return entries
 
     def next_version(self) -> str:
-        versions = []
-        for tag in self.tags():
-            match = VERSION_PATTERN.match(tag)
-            if match:
-                versions.append(tuple(int(value) for value in match.group(1).split(".")))
-        latest = max(versions) if versions else (0, 0, 0)
-        base = "v" + ".".join(str(value) for value in (*latest[:-1], latest[-1] + 1))
+        tags = self.tags()
+        release_tags = [tag for tag in tags if VERSION_PATTERN.fullmatch(tag)]
+        base = max(release_tags, key=version_key) if release_tags else None
         branch = self.current_branch()
         if not branch or branch == "main":
-            return base
+            latest = version_key(base) if base else (0, 0, 0)
+            return "v" + ".".join(str(value) for value in (*latest[:-1], latest[-1] + 1))
+        if not base:
+            raise GitError("尚无正式版本，请先在 main 发布首个正式版本，再创建开发预发布版本。")
         numbers = [
-            int(parsed[1].split("-beta.")[1])
-            for tag in self.tags() for parsed in [parse_version_tag(tag)]
+            prerelease_sequence(parsed[1])
+            for tag in tags for parsed in [parse_version_tag(tag)]
             if parsed and parsed[0] == branch and parsed[1].startswith(base + "-beta.")
         ]
-        return version_tag_name(branch, f"{base}-beta.{max(numbers, default=0) + 1}")
+        return version_tag_name(branch, f"{base}-beta.0.0.{max(numbers, default=0) + 1}")
 
     def manifest(self, reference: str) -> Optional[List[str]]:
         tag = self._tag_for_reference(reference)
@@ -2115,7 +2254,11 @@ class GitRepository:
         version = canonical_version(version, branch)
         parsed = parse_version_tag(version)
         if not parsed or (branch == "main" and parsed[0] is not None) or (branch != "main" and parsed[0] != branch):
-            raise GitError("main 只能发布正式版本 v0.3.1；开发分支只能发布自己的预发布版本，如 test1/v0.3.1-beta.1。")
+            raise GitError("main 只能发布正式版本；开发分支只能发布自己的预发布版本，如 test1/v0.3.0-beta.0.0.1。")
+        if branch != "main" and not is_new_prerelease(parsed[1]):
+            raise GitError("新预发布版本必须使用 beta.0.0.序号 格式，例如 v0.3.0-beta.0.0.1；旧 beta 标签仍可查看。")
+        if branch != "main" and not any(VERSION_PATTERN.fullmatch(tag) for tag in self.tags()):
+            raise GitError("尚无正式版本，请先在 main 发布首个正式版本，再创建开发预发布版本。")
         if version in self.tags():
             raise GitError(f"版本 {version} 已存在。")
         ensure_git_identity(self)
@@ -2932,10 +3075,16 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.branch_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
                                   margin_start=16, margin_end=16, margin_top=8)
         self.branch_bar.pack_start(Gtk.Label(label="分支"), False, False, 0)
-        self.branch_combo = Gtk.ComboBoxText()
-        for renderer in self.branch_combo.get_cells():
-            renderer.set_property("ellipsize", 3)
-            renderer.set_property("max-width-chars", 24)
+        self.branch_model = Gtk.ListStore(str, str, str, bool)
+        self.branch_combo = Gtk.ComboBox.new_with_model(self.branch_model)
+        self.branch_combo.set_id_column(0)
+        branch_renderer = Gtk.CellRendererText()
+        branch_renderer.set_property("ellipsize", 3)
+        branch_renderer.set_property("max-width-chars", 24)
+        self.branch_combo.pack_start(branch_renderer, True)
+        self.branch_combo.add_attribute(branch_renderer, "text", 1)
+        self.branch_combo.add_attribute(branch_renderer, "foreground", 2)
+        self.branch_combo.add_attribute(branch_renderer, "foreground-set", 3)
         self.branch_combo.connect("changed", self.on_branch_selected)
         self.branch_bar.pack_start(self.branch_combo, False, False, 0)
         self.new_branch_button = self._command_button("新建分支", "list-add-symbolic", self.on_create_branch)
@@ -3221,9 +3370,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.updating_branch_choices = True
         try:
             self.branch_choices = {}
-            self.branch_combo.remove_all()
+            self.branch_model.clear()
             if not self.repository:
-                self.branch_combo.append("none", "未启用版本管理")
+                self.branch_model.append(["none", "未启用版本管理", None, False])
                 self.branch_combo.set_active_id("none")
                 self.branch_bar.set_sensitive(False)
                 self.branch_status_label.set_text("请先发布首个版本")
@@ -3242,11 +3391,13 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             branches = repo.local_branches()
             active = "detached"
             if not repo.current_branch():
-                self.branch_combo.append(active, "历史提交（请选择分支）")
+                self.branch_model.append([active, "历史提交（请选择分支）", None, False])
             for choice in combine_branch_choices(branches, self.remote_branch_choices):
                 key = "branch:" + choice.name
                 self.branch_choices[key] = choice
-                self.branch_combo.append(key, choice.label)
+                self.branch_model.append([
+                    key, choice.label, choice.foreground, choice.foreground is not None,
+                ])
                 if choice.current:
                     active = key
             self.branch_combo.set_active_id(active)
@@ -3271,6 +3422,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.merge_status_label.set_text(
             f"正在合并 {state.source or '开发分支'} → main：{len(state.conflicts)} 个未解决冲突。"
             "解决后请标记并完成合并；也可取消。完成前禁止切换、发布和同步。"
+            + ("\n" + state.notice if state.notice else "")
         )
         self.conflict_combo.remove_all()
         for path in state.conflicts:
@@ -3517,7 +3669,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 self.save_button.set_label("发布正式版本" if branch == "main" else "发布预发布版本")
                 self.save_button.set_tooltip_text(
                     "创建全仓库正式标签，例如 v0.3.1"
-                    if branch == "main" else f"创建仅属于 {branch} 的预发布标签，例如 {branch}/v0.3.1-beta.1"
+                    if branch == "main" else f"创建仅属于 {branch} 的预发布标签，例如 {branch}/v0.3.0-beta.0.0.1"
                 )
                 branch_label = branch
             else:
@@ -4338,7 +4490,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if not self.repository:
             return
         repository = self.repository
-        metadata = self.prompt_version_metadata(display_version(self.repository.next_version()))
+        try:
+            default_version = repository.next_version()
+        except GitError as error:
+            self.show_error(str(error))
+            return
+        metadata = self.prompt_version_metadata(display_version(default_version))
         if not metadata:
             return
         version, message, sync_version = metadata
