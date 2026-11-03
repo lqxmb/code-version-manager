@@ -1,0 +1,128 @@
+#!/usr/bin/python3
+"""Read a workspace, exercise independent copies, verify the source is unchanged."""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+SOURCE = Path(__file__).resolve().parents[1] / 'src' / 'code_version_manager.py'
+SPEC = importlib.util.spec_from_file_location('cvm_isolated_verification', SOURCE)
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+
+def git(path, *args):
+    environment = dict(os.environ, GIT_OPTIONAL_LOCKS='0')
+    result = subprocess.run(['git', '-C', str(path), *args], check=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=environment)
+    return result.stdout.strip()
+
+
+def fingerprint(root):
+    digest = hashlib.sha256()
+    for directory, directories, filenames in os.walk(root, followlinks=False):
+        directories.sort()
+        for name in sorted(directories + filenames):
+            path = Path(directory) / name
+            digest.update(str(path.relative_to(root)).encode('utf-8', errors='surrogateescape'))
+            digest.update(str(path.lstat().st_mode).encode('ascii'))
+            if path.is_symlink():
+                digest.update(os.fsencode(os.readlink(path)))
+            elif path.is_file():
+                with path.open('rb') as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def managed_refs(path):
+    output = git(path, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/', 'refs/tags/')
+    return {ref: oid for ref, oid in (line.split() for line in output.splitlines())
+            if MODULE.GitRepository._managed_ref(ref)}
+
+
+def verify(workspace):
+    source = MODULE.GitRepository(workspace)
+    before = fingerprint(source.path)
+    original_refs = source._local_refs()
+    if 'refs/heads/main' not in original_refs:
+        raise MODULE.GitError('验证素材必须有 main；程序不会修改来源来补齐。')
+    report = {'workspace': str(source.path), 'source_sha256': before,
+              'source_branches': sum(ref.startswith('refs/heads/') for ref in original_refs),
+              'source_version_tags': sum(ref.startswith('refs/tags/') for ref in original_refs)}
+    with tempfile.TemporaryDirectory(prefix='cvm-workspace-verification-') as temporary:
+        root = Path(temporary)
+        copy = root / 'workspace'
+        # Both files and Git storage are independent; never reuse a .git file
+        # pointing back to a source worktree, or hard-link writable objects.
+        shutil.copytree(source.path, copy, symlinks=True, ignore=shutil.ignore_patterns('.git'))
+        bare = root / 'independent.git'
+        git(root, 'clone', '--mirror', '--no-local', '--no-hardlinks', '-q', str(source.path), str(bare))
+        shutil.move(str(bare), str(copy / '.git'))
+        git(copy, 'config', 'core.bare', 'false')
+        git(copy, 'config', '--unset-all', 'remote.origin.mirror')
+        git(copy, 'reset', '--mixed', 'HEAD')
+        if source.metadata_path.exists():
+            if any(path.is_symlink() for path in source.metadata_path.rglob('*')):
+                raise MODULE.GitError('版本元数据含符号链接，无法保证副本隔离；请先检查该元数据目录。')
+            shutil.copytree(source.metadata_path, copy / '.git' / MODULE.METADATA_DIRECTORY,
+                            symlinks=True, dirs_exist_ok=True)
+        remote = root / 'temporary-origin.git'
+        git(root, 'init', '--bare', '-q', str(remote))
+        git(remote, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+        repo = MODULE.GitRepository(copy)
+        repo.configure_remote(str(remote), 'Isolated Verification', 'verification@example.invalid')
+        assert repo._sync_target() == str(remote)
+        assert repo._local_refs() == original_refs
+        anomalies = {}
+        for branch in repo.local_branches():
+            if branch.name != 'main':
+                try:
+                    anomalies[branch.name] = {'base': repo.branch_base(branch.name)}
+                except MODULE.GitError as error:
+                    anomalies[branch.name] = {'expected_legacy_warning': str(error)}
+        report['branch_baselines'] = anomalies
+        repo.sync_remote()
+        assert managed_refs(remote) == original_refs
+        report['initial_whole_push'] = 'passed'
+        main = original_refs['refs/heads/main']
+        git(remote, 'update-ref', 'refs/heads/cvm-verification-remote-only', main)
+        git(remote, 'update-ref', 'refs/tags/cvm-verification-note', main)
+        formal = next((ref for ref in original_refs if MODULE.parse_version_tag(ref)
+                       and MODULE.parse_version_tag(ref)[0] is None), None)
+        if formal:
+            git(remote, 'update-ref', formal, main)
+        snap = repo.sync_snapshot()
+        status = repo.remote_sync_status(snap)
+        assert status.can_sync_local, status.local_message
+        repo.sync_local_from_remote(snap, status)
+        assert repo._local_refs() == managed_refs(remote)
+        assert 'cvm-verification-note' not in repo.tags()
+        report['whole_pull_with_shared_tag_change'] = 'passed'
+        repo.run(['branch', '-D', 'cvm-verification-remote-only'])
+        repo.run(['branch', 'cvm-verification-local-only', 'main'])
+        repo.sync_remote()
+        assert repo._local_refs() == managed_refs(remote)
+        assert git(remote, 'show-ref', '--verify', 'refs/tags/cvm-verification-note')
+        assert not git(remote, 'for-each-ref', '--format=%(refname)', 'refs/code-version-manager/')
+        assert list((repo.metadata_path / 'recovery').rglob('git-config'))
+        report['whole_push_with_branch_deletion'] = 'passed'
+        report['private_refs_excluded_and_recovery_created'] = 'passed'
+    after = fingerprint(source.path)
+    report['source_unchanged'] = after == before
+    if after != before:
+        raise MODULE.GitError('验证期间来源内容发生变化，请核对是否有其他程序正在操作；本工具未向来源或真实 origin 写入。')
+    return report
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('workspace', type=Path)
+    options = parser.parse_args()
+    print(json.dumps(verify(options.workspace.expanduser().resolve()), ensure_ascii=False, indent=2))
