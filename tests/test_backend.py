@@ -29,6 +29,7 @@ class GitRepositoryTest(unittest.TestCase):
         (self.path / "other.txt").write_text("other\n", encoding="utf-8")
         self.git("add", "robot.txt", "other.txt")
         self.git("commit", "-q", "-m", "initial")
+        self.git("branch", "-M", "main")
         self.git("tag", "v0.0.1")
         self.repository = MODULE.GitRepository(self.path)
 
@@ -683,6 +684,341 @@ class GitRepositoryTest(unittest.TestCase):
             self.assertNotIn("src/obsolete.txt", bundle.namelist())
 
 
+class BranchReleaseWorkflowTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.path = self.root / "workspace"
+        self.path.mkdir()
+        (self.path / "robot.txt").write_text("base\n", encoding="utf-8")
+        self.repository = MODULE.initialize_repository(
+            self.path, "v0.2.0", "base release", ["robot.txt"],
+        )
+
+    @staticmethod
+    def git(path, *args):
+        return subprocess.run(
+            ["git", "-C", str(path), *args], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ).stdout.strip()
+
+    def test_preview_tags_are_branch_owned_and_release_tags_are_shared_read_only_baselines(self):
+        self.assertEqual("main", self.repository.current_branch())
+        self.repository.create_branch("test1")
+        self.assertEqual("branches/test1/v0.2.1-beta.1", self.repository.next_version())
+        (self.path / "robot.txt").write_text("test preview\n", encoding="utf-8")
+        self.repository.save_version("test1/v0.2.1-beta.1", "test preview", ["robot.txt"])
+        self.assertEqual("branches/test1/v0.2.1-beta.2", self.repository.next_version())
+        (self.path / "robot.txt").write_text("second test preview\n", encoding="utf-8")
+        self.repository.save_version("test1/v0.2.1-beta.2", "second test preview", ["robot.txt"])
+        preview_ref = "refs/tags/branches/test1/v0.2.1-beta.1"
+        self.assertTrue(self.repository.run(["show-ref", "--verify", preview_ref]).strip())
+        self.assertEqual("v0.2.1-beta.2", self.repository.version_tags()[0].name[len("branches/test1/"):])
+        history = self.repository.history()
+        self.assertEqual(
+            {"v0.2.0", "branches/test1/v0.2.1-beta.1", "branches/test1/v0.2.1-beta.2"},
+            {entry.tags[0] for entry in history},
+        )
+        baseline = next(entry for entry in history if entry.tags == ("v0.2.0",))
+        self.assertTrue(baseline.read_only)
+
+        self.repository.switch_branch("main")
+        self.assertEqual("v0.2.1", self.repository.next_version())
+        self.assertEqual(["v0.2.0"], [entry.tags[0] for entry in self.repository.history()])
+        with self.assertRaisesRegex(MODULE.GitError, "test1"):
+            self.repository.delete_version("v0.2.0")
+
+        self.assertEqual("branches/feature%2Fcamera/v0.2.1-beta.1", MODULE.version_tag_name(
+            "feature/camera", "v0.2.1-beta.1",
+        ))
+        self.assertEqual("feature/camera/v0.2.1-beta.1", MODULE.display_version(
+            "branches/feature%2Fcamera/v0.2.1-beta.1",
+        ))
+        self.assertEqual(
+            "feature/camera", MODULE.parse_version_tag("refs/tags/branches/feature%2Fcamera/v0.2.1-beta.1")[0],
+        )
+
+    def test_merge_preserves_main_release_and_branch_tags_and_optional_cleanup(self):
+        self.repository.create_branch("test1")
+        (self.path / "test-feature.txt").write_text("from test1\n", encoding="utf-8")
+        self.repository.save_version("test1/v0.2.1-beta.1", "feature work", ["test-feature.txt"])
+        self.repository.switch_branch("main")
+        (self.path / "robot.txt").write_text("main 0.3.0\n", encoding="utf-8")
+        self.repository.save_version("v0.3.0", "main release", ["robot.txt"])
+        release_oid = self.repository.run(["rev-parse", "v0.3.0"]).strip()
+
+        result = self.repository.merge_to_main("test1")
+
+        self.assertIn("合并已完成", result)
+        self.assertEqual("main", self.repository.current_branch())
+        self.assertEqual(release_oid, self.repository.run(["rev-parse", "v0.3.0"]).strip())
+        self.assertTrue((self.path / "test-feature.txt").is_file())
+        self.git(self.path, "merge-base", "--is-ancestor", "refs/tags/branches/test1/v0.2.1-beta.1", "main")
+        self.assertEqual(["v0.3.0", "v0.2.0"], [entry.tags[0] for entry in self.repository.history()])
+        self.assertIn("branches/test1/v0.2.1-beta.1", [entry.tags[0] for entry in self.repository.history(all_versions=True)])
+
+        plan = self.repository.plan_branch_deletion("test1")
+        self.assertFalse(plan.cleanup_tags)
+        self.repository.delete_merged_branch("test1", expected=plan)
+        self.assertNotIn("test1", [branch.name for branch in self.repository.local_branches()])
+        self.assertIn("branches/test1/v0.2.1-beta.1", self.repository.tags())
+        self.assertIn("v0.2.0", self.repository.tags())
+
+        self.repository.create_branch("test2")
+        (self.path / "test2.txt").write_text("test2\n", encoding="utf-8")
+        self.repository.save_version("test2/v0.3.1-beta.1", "test2 preview", ["test2.txt"])
+        self.repository.merge_to_main("test2")
+        plan = self.repository.plan_branch_deletion("test2", cleanup_tags=True)
+        self.assertIn("refs/tags/branches/test2/v0.3.1-beta.1", dict(plan.local_refs))
+        self.repository.delete_merged_branch("test2", cleanup_tags=True, expected=plan)
+        self.assertNotIn("branches/test2/v0.3.1-beta.1", self.repository.tags())
+        self.assertIn("branches/test1/v0.2.1-beta.1", self.repository.tags())
+        self.assertIn("v0.2.0", self.repository.tags())
+
+    def test_merge_conflicts_block_switch_and_publish_until_resolved_and_can_abort(self):
+        self.repository.create_branch("test1")
+        (self.path / "robot.txt").write_text("test side\n", encoding="utf-8")
+        self.repository.save_version("test1/v0.2.1-beta.1", "test edit", ["robot.txt"])
+        test_head = self.repository.run(["rev-parse", "HEAD"]).strip()
+        self.repository.switch_branch("main")
+        (self.path / "robot.txt").write_text("main side\n", encoding="utf-8")
+        self.repository.save_version("v0.2.1", "main edit", ["robot.txt"])
+        main_head = self.repository.run(["rev-parse", "HEAD"]).strip()
+
+        message = self.repository.merge_to_main("test1")
+
+        self.assertIn("冲突", message)
+        state = self.repository.merge_state()
+        self.assertTrue(state.active)
+        self.assertEqual(("robot.txt",), state.conflicts)
+        with self.assertRaisesRegex(MODULE.GitError, "未完成"):
+            self.repository.switch_branch("test1")
+        with self.assertRaisesRegex(MODULE.GitError, "未完成"):
+            self.repository.save_version("v0.2.2", "blocked", ["robot.txt"])
+        with self.assertRaisesRegex(MODULE.GitError, "未解决"):
+            self.repository.complete_merge()
+
+        (self.path / "robot.txt").write_text("merged result\n", encoding="utf-8")
+        self.repository.resolve_merge_file("robot.txt")
+        self.assertTrue(self.repository.merge_state().ready)
+        self.repository.complete_merge()
+        self.assertEqual("merged result\n", (self.path / "robot.txt").read_text())
+        self.assertFalse(self.repository.merge_state().active)
+        self.git(self.path, "merge-base", "--is-ancestor", test_head, "main")
+
+        self.repository.switch_branch("test1")
+        (self.path / "robot.txt").write_text("another test side\n", encoding="utf-8")
+        self.repository.save_version("test1/v0.2.2-beta.1", "second test edit", ["robot.txt"])
+        self.repository.switch_branch("main")
+        self.repository.run(["checkout", "-q", main_head, "--", "robot.txt"])
+        (self.path / "robot.txt").write_text("another main side\n", encoding="utf-8")
+        self.repository.save_version("v0.2.2", "second main edit", ["robot.txt"])
+        before_abort = self.repository.run(["rev-parse", "HEAD"]).strip()
+        self.repository.merge_to_main("test1")
+        self.assertTrue(self.repository.merge_state().active)
+        self.repository.abort_merge()
+        self.assertFalse(self.repository.merge_state().active)
+        self.assertEqual(before_abort, self.repository.run(["rev-parse", "HEAD"]).strip())
+
+    def test_merge_fast_forwards_remote_main_but_rejects_diverged_remote_main(self):
+        remote = self.root / "origin.git"
+        self.git(self.root, "init", "--bare", "-q", str(remote))
+        self.repository.configure_remote(str(remote), "Test User", "test@example.com")
+        self.repository.sync_remote()
+        self.repository.create_branch("test1")
+        (self.path / "test-feature.txt").write_text("feature\n", encoding="utf-8")
+        self.repository.save_version("test1/v0.2.1-beta.1", "feature", ["test-feature.txt"])
+        test_head = self.repository.run(["rev-parse", "HEAD"]).strip()
+        self.repository.switch_branch("main")
+
+        peer = self.root / "peer"
+        self.git(self.root, "clone", "-q", "--branch", "main", str(remote), str(peer))
+        self.git(peer, "config", "user.name", "Peer")
+        self.git(peer, "config", "user.email", "peer@example.com")
+        (peer / "remote.txt").write_text("remote main\n", encoding="utf-8")
+        self.git(peer, "add", "remote.txt")
+        self.git(peer, "commit", "-q", "-m", "remote update")
+        self.git(peer, "push", "-q", "origin", "main")
+
+        self.repository.merge_to_main("test1")
+        self.assertTrue((self.path / "remote.txt").is_file())
+        self.git(self.path, "merge-base", "--is-ancestor", test_head, "main")
+
+        self.repository = MODULE.GitRepository(self.path)
+        self.repository.run(["branch", "-m", "saved-main"])
+        self.repository.run(["branch", "main", self.repository.run(["rev-parse", "origin/main"]).strip()])
+        self.repository.run(["switch", "main"])
+        (self.path / "local-divergence.txt").write_text("local\n", encoding="utf-8")
+        self.repository.save_version("v0.2.2", "local divergence", ["local-divergence.txt"])
+        divergent_head = self.repository.run(["rev-parse", "HEAD"]).strip()
+        (peer / "peer-divergence.txt").write_text("peer\n", encoding="utf-8")
+        self.git(peer, "add", "peer-divergence.txt")
+        self.git(peer, "commit", "-q", "-m", "peer divergence")
+        self.git(peer, "push", "-q", "origin", "main")
+        with self.assertRaisesRegex(MODULE.GitError, "分叉"):
+            self.repository.merge_to_main("test1")
+        self.assertEqual(divergent_head, self.repository.run(["rev-parse", "main"]).strip())
+        self.assertEqual("main", self.repository.current_branch())
+
+    def test_remote_sync_is_branch_scoped_and_branch_deletion_preserves_archived_tags(self):
+        remote = self.root / "origin.git"
+        self.git(self.root, "init", "--bare", "-q", str(remote))
+        self.repository.configure_remote(str(remote), "Test User", "test@example.com")
+        self.repository.sync_remote()
+        self.repository.create_branch("test1")
+        (self.path / "test-feature.txt").write_text("feature\n", encoding="utf-8")
+        self.repository.save_version("test1/v0.2.1-beta.1", "preview", ["test-feature.txt"])
+        self.repository.sync_remote()
+        self.assertIn("refs/heads/test1", self.git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/"))
+        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/branches/test1/v0.2.1-beta.1"))
+
+        self.repository.switch_branch("main")
+        (self.path / "robot.txt").write_text("release 0.3.0\n", encoding="utf-8")
+        self.repository.save_version("v0.3.0", "main release", ["robot.txt"])
+        self.repository.sync_remote()
+        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/v0.2.0"))
+        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/v0.3.0"))
+        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/branches/test1/v0.2.1-beta.1"))
+
+        self.repository.merge_to_main("test1")
+        self.repository.sync_remote()
+        plan = self.repository.plan_branch_deletion("test1", delete_remote=True)
+        self.repository.delete_merged_branch("test1", delete_remote=True, expected=plan)
+        remote_branches = self.git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/").splitlines()
+        self.assertIn("refs/heads/main", remote_branches)
+        self.assertNotIn("refs/heads/test1", remote_branches)
+        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/v0.2.0"))
+        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/branches/test1/v0.2.1-beta.1"))
+
+        self.repository.create_branch("test2")
+        (self.path / "test2.txt").write_text("test2\n", encoding="utf-8")
+        self.repository.save_version("test2/v0.3.1-beta.1", "test2 preview", ["test2.txt"])
+        self.repository.sync_remote()
+        self.repository.merge_to_main("test2")
+        self.repository.sync_remote()
+        plan = self.repository.plan_branch_deletion("test2", cleanup_tags=True, delete_remote=True)
+        self.repository.delete_merged_branch("test2", cleanup_tags=True, delete_remote=True, expected=plan)
+        missing_tag = subprocess.run([
+            "git", "-C", str(remote), "show-ref", "--verify", "--quiet",
+            "refs/tags/branches/test2/v0.3.1-beta.1",
+        ]).returncode
+        self.assertNotEqual(0, missing_tag)
+        self.assertNotIn("refs/heads/test2", self.git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/"))
+        self.assertTrue(self.git(remote, "show-ref", "--verify", "refs/tags/v0.2.0"))
+
+    def test_sync_and_delete_cannot_rewrite_a_formal_tag_shared_with_an_active_branch(self):
+        remote = self.root / "origin.git"
+        self.git(self.root, "init", "--bare", "-q", str(remote))
+        self.repository.configure_remote(str(remote), "Test User", "test@example.com")
+        self.repository.sync_remote()
+        self.repository.create_branch("test1")
+        self.repository.switch_branch("main")
+        peer = self.root / "peer"
+        self.git(self.root, "clone", "-q", "--branch", "main", str(remote), str(peer))
+        self.git(peer, "config", "user.name", "Peer")
+        self.git(peer, "config", "user.email", "peer@example.com")
+        (peer / "robot.txt").write_text("remote update\n", encoding="utf-8")
+        self.git(peer, "add", "robot.txt")
+        self.git(peer, "commit", "-q", "-m", "remote release update")
+        self.git(peer, "tag", "-f", "-a", "v0.2.0", "-m", "rewritten remote label")
+        self.git(peer, "push", "-q", "--force", "origin", "main", "refs/tags/v0.2.0")
+
+        snapshot = self.repository.sync_snapshot()
+        status = self.repository.remote_sync_status(snapshot)
+
+        self.assertFalse(status.can_sync_remote)
+        self.assertFalse(status.can_sync_local)
+        self.assertIn("test1", status.local_message)
+        with self.assertRaisesRegex(MODULE.GitError, "test1"):
+            self.repository.delete_version("v0.2.0")
+
+    def test_remote_branch_import_fetches_inherited_releases_and_syncs_only_its_beta_tags(self):
+        remote = self.root / "origin.git"
+        self.git(self.root, "init", "--bare", "-q", str(remote))
+        self.repository.configure_remote(str(remote), "Test User", "test@example.com")
+        self.repository.sync_remote()
+        self.repository.create_branch("feature/camera")
+        (self.path / "camera.txt").write_text("camera\n", encoding="utf-8")
+        self.repository.save_version("feature/camera/v0.2.1-beta.1", "camera preview", ["camera.txt"])
+        self.repository.sync_remote()
+        self.repository.switch_branch("main")
+        (self.path / "robot.txt").write_text("main progress\n", encoding="utf-8")
+        self.repository.save_version("v0.3.0", "main progress", ["robot.txt"])
+        self.repository.sync_remote()
+
+        imported = self.root / "imported"
+        imported.mkdir()
+        repo = MODULE.create_repository(imported)
+        repo.configure_remote(str(remote), "Test User", "test@example.com")
+        branch = next(branch for branch in repo.remote_branches() if branch.name == "feature/camera")
+        repo.switch_branch(branch.name, source="remote", expected_oid=branch.oid)
+
+        self.assertEqual("feature/camera", repo.current_branch())
+        self.assertIn("v0.2.0", repo.tags())
+        self.assertNotIn("v0.3.0", repo.tags())
+        self.assertEqual(["v0.2.0"], [entry.tags[0] for entry in repo.history()])
+        snapshot = repo.sync_snapshot()
+        status = repo.remote_sync_status(snapshot)
+        self.assertTrue(status.can_sync_local, status.local_message)
+        repo.sync_local_from_remote(snapshot, status)
+        self.assertIn("branches/feature%2Fcamera/v0.2.1-beta.1", repo.tags())
+        self.assertIn("v0.2.0", repo.tags())
+        self.assertNotIn("v0.3.0", repo.tags())
+        self.assertEqual("origin/feature/camera", self.git(imported, "rev-parse", "--abbrev-ref", "@{u}"))
+
+    def test_missing_shared_formal_tag_can_be_restored_without_allowing_remote_deletion(self):
+        remote = self.root / "origin.git"
+        self.git(self.root, "init", "--bare", "-q", str(remote))
+        self.repository.configure_remote(str(remote), "Test User", "test@example.com")
+        self.repository.sync_remote()
+        self.repository.create_branch("test1")
+        self.repository.switch_branch("main")
+        self.git(self.path, "tag", "-d", "v0.2.0")
+
+        snapshot = self.repository.sync_snapshot()
+        status = self.repository.remote_sync_status(snapshot)
+
+        self.assertTrue(status.can_sync_local, status.local_message)
+        self.assertFalse(status.can_sync_remote)
+        self.repository.sync_local_from_remote(snapshot, status)
+        self.assertIn("v0.2.0", self.repository.tags())
+        self.assertIn("test1", [branch.name for branch in self.repository.local_branches()])
+
+    def test_merge_tools_receive_three_sides_and_do_not_automatically_mark_resolved(self):
+        self.repository.create_branch("test1")
+        (self.path / "robot.txt").write_text("incoming side\n", encoding="utf-8")
+        self.repository.save_version("test1/v0.2.1-beta.1", "incoming", ["robot.txt"])
+        self.repository.switch_branch("main")
+        (self.path / "robot.txt").write_text("main side\n", encoding="utf-8")
+        self.repository.save_version("v0.2.1", "main", ["robot.txt"])
+        self.repository.merge_to_main("test1")
+        original_run = MODULE.subprocess.run
+        target = self.path / "robot.txt"
+        calls = []
+
+        def run_tool(command, **kwargs):
+            if command[0] == "git":
+                return original_run(command, **kwargs)
+            calls.append(command[0])
+            contents = {Path(argument).read_text() for argument in command[1:] if Path(argument).is_file() and Path(argument) != target}
+            self.assertTrue({"base\n", "main side\n", "incoming side\n"}.issubset(contents))
+            self.assertTrue(any(str(target) in argument for argument in command))
+            target.write_text("resolved by tool\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        for tool in ("bcompare", "meld", "kdiff3"):
+            self.repository.configure_compare_tool(tool)
+            with mock.patch.object(MODULE.shutil, "which", return_value="/tool"), \
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=run_tool):
+                self.repository.launch_merge_tool("robot.txt")
+            self.assertEqual(("robot.txt",), self.repository.merge_state().conflicts)
+        self.assertEqual(["bcompare", "meld", "kdiff3"], calls)
+        self.repository.resolve_merge_file("robot.txt")
+        self.assertTrue(self.repository.merge_state().ready)
+        self.repository.complete_merge()
+
+
 class WorkspaceReleaseFilesTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -824,7 +1160,7 @@ class RemoteProcessTest(unittest.TestCase):
         while True:
             try:
                 state = status.read_text().split()[2]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 break
             if state == "Z":
                 break
@@ -1121,13 +1457,13 @@ class RemoteRepositoryTest(unittest.TestCase):
     def test_uses_actual_working_branch_instead_of_assuming_main(self):
         self.repository.run(["switch", "-c", "release"])
         self.configure()
-        self.publish("v0.0.2")
+        self.publish("v0.0.2-beta.1")
         self.repository.sync_remote()
 
         self.assertEqual(
             "refs/heads/release", self.git(self.remote, "for-each-ref", "--format=%(refname)", "refs/heads/")
         )
-        self.assertEqual(["v0.0.1", "v0.0.2"], self.git(self.remote, "tag").splitlines())
+        self.assertEqual(["branches/release/v0.0.2-beta.1"], self.git(self.remote, "tag").splitlines())
 
     def test_multiple_push_destinations_are_rejected_without_losing_local_release(self):
         self.configure()
@@ -1376,6 +1712,7 @@ class BackgroundProgressTest(unittest.TestCase):
             with self.subTest(result=result):
                 window = mock.Mock()
                 window.busy = False
+                window.branch_generation = 0
                 operation = mock.Mock(return_value=result)
                 with mock.patch.object(MODULE.GLib, "timeout_add_seconds", return_value=42), \
                      mock.patch.object(MODULE.GLib, "idle_add") as idle_add, \
@@ -1392,6 +1729,7 @@ class BackgroundProgressTest(unittest.TestCase):
     def test_background_timer_updates_elapsed_time_and_is_removed_after_completion(self):
         window = mock.Mock()
         window.busy = False
+        window.branch_generation = 0
         window.background_timer = None
         operation = mock.Mock()
         with mock.patch.object(MODULE.time, "monotonic", side_effect=[100, 105]), \
@@ -1640,6 +1978,56 @@ class DialogMaximizeTest(unittest.TestCase):
 
         dialog.unmaximize.assert_called_once_with()
         dialog.maximize.assert_not_called()
+
+
+class BranchPresentationTest(unittest.TestCase):
+    def test_local_and_remote_refs_share_one_display_row(self):
+        local = [
+            MODULE.BranchInfo("main", "local", "local-main", True),
+            MODULE.BranchInfo("feature", "local", "local-feature"),
+        ]
+        remote = [
+            MODULE.BranchInfo("main", "remote", "remote-main"),
+            MODULE.BranchInfo("test1", "remote", "remote-test1"),
+        ]
+
+        choices = MODULE.combine_branch_choices(local, remote)
+
+        self.assertEqual(["feature", "main", "test1"], [choice.name for choice in choices])
+        by_name = {choice.name: choice for choice in choices}
+        self.assertEqual("main（当前，本地和 origin 均有）", by_name["main"].label)
+        self.assertEqual("local", by_name["main"].source)
+        self.assertEqual("local-main", by_name["main"].oid)
+        self.assertEqual("feature（本地）", by_name["feature"].label)
+        self.assertEqual("test1（origin，仅远程）", by_name["test1"].label)
+        self.assertEqual("remote", by_name["test1"].source)
+        self.assertEqual("remote-test1", by_name["test1"].oid)
+
+    def test_inherited_formal_release_is_marked_read_only(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name)
+        subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+        subprocess.run(
+            ["git", "-C", str(path), "config", "user.name", "Test User"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(path), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        (path / "file.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(path), "add", "file.txt"], check=True)
+        subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "release"], check=True)
+        subprocess.run(["git", "-C", str(path), "branch", "-M", "main"], check=True)
+        subprocess.run(["git", "-C", str(path), "tag", "-a", "v0.1.0", "-m", "release"], check=True)
+        repository = MODULE.GitRepository(path)
+        repository.create_branch("test1")
+
+        history = repository.history()
+
+        self.assertEqual("[继承的正式版本 · 只读] release", history[0].subject)
+        self.assertTrue(history[0].read_only)
 
 
 if __name__ == "__main__":

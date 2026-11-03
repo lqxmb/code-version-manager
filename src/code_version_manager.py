@@ -16,11 +16,11 @@ import threading
 import time
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import gi
 
@@ -46,6 +46,7 @@ APP_NAME = "工作空间版本管理"
 APP_VERSION = load_application_version()
 DEFAULT_REPOSITORY = Path.home() / "catkin_ws"
 VERSION_PATTERN = re.compile(r"^v(\d+(?:\.\d+){2,})$")
+PRERELEASE_PATTERN = re.compile(r"^(v\d+(?:\.\d+){2,})-beta\.([1-9]\d*)$")
 METADATA_DIRECTORY = "code-version-manager"
 MANIFEST_DIRECTORY = "versions"
 MANIFEST_SUFFIX = ".manifest"
@@ -114,11 +115,149 @@ class GitError(RuntimeError):
     pass
 
 
+def parse_version_tag(name: str) -> Optional[Tuple[Optional[str], str]]:
+    if name.startswith("refs/tags/"):
+        name = name[len("refs/tags/"):]
+    if VERSION_PATTERN.fullmatch(name):
+        return None, name
+    parts = name.split("/")
+    if len(parts) == 3 and parts[0] == "branches" and PRERELEASE_PATTERN.fullmatch(parts[2]):
+        owner = unquote(parts[1])
+        if owner and quote(owner, safe="") == parts[1]:
+            return owner, parts[2]
+    return None
+
+
+def version_tag_name(owner: str, version: str) -> str:
+    return f"branches/{quote(owner, safe='')}/{version}"
+
+
+def display_version(name: str) -> str:
+    parsed = parse_version_tag(name)
+    return f"{parsed[0]}/{parsed[1]}" if parsed and parsed[0] else name
+
+
+def canonical_version(value: str, branch: Optional[str] = None) -> str:
+    if value.startswith("refs/tags/"):
+        value = value[len("refs/tags/"):]
+    if parse_version_tag(value):
+        return value
+    if branch and PRERELEASE_PATTERN.fullmatch(value):
+        return version_tag_name(branch, value)
+    match = re.fullmatch(r"(.+)/(v\d+(?:\.\d+){2,}-beta\.[1-9]\d*)", value)
+    return version_tag_name(*match.groups()) if match else value
+
+
+def version_sort_key(name: str):
+    parsed = parse_version_tag(canonical_version(name))
+    if not parsed:
+        return ((-1,), 0, 0, name)
+    owner, version = parsed
+    base = version.split("-beta.", 1)[0]
+    return (version_key(base), int(owner is None), int(version.split("-beta.")[1]) if owner else 0, owner or "")
+
+
+@dataclass(frozen=True)
+class BranchInfo:
+    name: str
+    source: str
+    oid: str
+    current: bool = False
+
+
+@dataclass(frozen=True)
+class BranchChoice:
+    """One user-facing branch row, optionally backed by local and origin refs."""
+
+    name: str
+    local: Optional[BranchInfo] = None
+    remote: Optional[BranchInfo] = None
+
+    @property
+    def current(self) -> bool:
+        return bool(self.local and self.local.current)
+
+    @property
+    def source(self) -> str:
+        return "local" if self.local else "remote"
+
+    @property
+    def oid(self) -> str:
+        branch = self.local or self.remote
+        return branch.oid if branch else ""
+
+    @property
+    def label(self) -> str:
+        details = []
+        if self.current:
+            details.append("当前")
+        if self.local and self.remote:
+            details.append("本地和 origin 均有")
+        elif self.local:
+            details.append("本地")
+        else:
+            details.append("origin，仅远程")
+        return f"{self.name}（{'，'.join(details)}）"
+
+
+def combine_branch_choices(
+    local_branches: Sequence[BranchInfo],
+    remote_branches: Sequence[BranchInfo],
+) -> List[BranchChoice]:
+    local_by_name = {branch.name: branch for branch in local_branches}
+    remote_by_name = {branch.name: branch for branch in remote_branches}
+    return [
+        BranchChoice(name, local_by_name.get(name), remote_by_name.get(name))
+        for name in sorted(set(local_by_name) | set(remote_by_name))
+    ]
+
+
+@dataclass(frozen=True)
+class VersionTagInfo:
+    ref: str
+    owner: Optional[str]
+    kind: str
+    version: str
+    commit: str
+    oid: str
+    read_only: bool = False
+
+    @property
+    def name(self) -> str:
+        return self.ref[len("refs/tags/"):]
+
+    @property
+    def label(self) -> str:
+        return display_version(self.name)
+
+
+@dataclass(frozen=True)
+class MergeState:
+    active: bool
+    source: str = ""
+    conflicts: Tuple[str, ...] = ()
+
+    @property
+    def ready(self) -> bool:
+        return self.active and not self.conflicts
+
+
+@dataclass(frozen=True)
+class BranchDeletionPlan:
+    name: str
+    cleanup_tags: bool
+    delete_remote: bool
+    local_refs: Tuple[Tuple[str, str], ...]
+    remote_url: str = ""
+    remote_refs: Tuple[Tuple[str, str], ...] = ()
+
+
 @dataclass(frozen=True)
 class RemoteSyncSnapshot:
     remote_url: str
     branch_ref: str
     refs: Tuple[Tuple[str, str], ...]
+    all_refs: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -151,7 +290,7 @@ class RefComparison:
         ref = self.difference.ref
         if ref.startswith("refs/heads/"):
             return "分支 " + ref[len("refs/heads/"):]
-        return "版本 " + ref[len("refs/tags/"):]
+        return "版本 " + display_version(ref[len("refs/tags/"):])
 
     @property
     def summary(self) -> str:
@@ -214,6 +353,7 @@ class RemoteSyncStatus:
     remote_message: str = ""
     comparisons: Tuple[RefComparison, ...] = ()
     comparison_error: str = ""
+    all_remote_refs: Tuple[Tuple[str, str], ...] = ()
 
 
 def settings_file_path() -> Path:
@@ -311,6 +451,7 @@ class HistoryEntry:
     date: str
     subject: str
     tags: Sequence[str]
+    read_only: bool = False
 
     @property
     def reference(self) -> str:
@@ -754,23 +895,97 @@ class GitRepository:
             raise GitError("请先通过“Git 账号”配置唯一的 origin 远程仓库地址。")
         return validate_remote_url(urls[0])
 
+    @staticmethod
+    def _managed_ref(ref: str) -> bool:
+        return ref.startswith("refs/heads/") or (
+            ref.startswith("refs/tags/") and parse_version_tag(ref) is not None
+        )
+
+    @staticmethod
+    def _owned_ref(ref: str, branch: str) -> bool:
+        parsed = parse_version_tag(ref)
+        return parsed is not None and (
+            (branch == "main" and parsed[0] is None) or (branch != "main" and parsed[0] == branch)
+        )
+
+    def _local_refs(self) -> Dict[str, str]:
+        refs = {}
+        for line in self.run([
+            "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/", "refs/tags/",
+        ]).splitlines():
+            ref, oid = line.split()
+            if self._managed_ref(ref):
+                refs[ref] = oid
+        return refs
+
+    def _remote_refs(self, remote_url: str) -> Dict[str, str]:
+        refs = {}
+        for line in self._run_remote(["ls-remote", "--refs", "--", remote_url], remote_url).splitlines():
+            fields = line.split()
+            if len(fields) == 2 and self._managed_ref(fields[1]):
+                refs[fields[1]] = fields[0]
+        return refs
+
+    def _contains_commit(self, commit: str, head: str) -> bool:
+        result = subprocess.run(
+            ["git", "-C", str(self.path), "merge-base", "--is-ancestor", commit, head],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        if result.returncode not in (0, 1):
+            raise GitError(result.stderr.strip() or "无法判断提交的合并关系。")
+        return result.returncode == 0
+
+    def _ensure_objects(self, remote_url: str, refs: Dict[str, str]) -> None:
+        self._ensure_full_history()
+        if not refs:
+            return
+        output = self.run(
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input="\n".join(sorted(set(refs.values()))) + "\n",
+        )
+        missing = [line.split()[0] for line in output.splitlines() if line.endswith(" missing")]
+        if missing:
+            self._run_remote([
+                "fetch", "--no-tags", "--refmap=", "--no-auto-gc", "--no-recurse-submodules",
+                remote_url, *missing,
+            ], remote_url)
+
+    def _ensure_full_history(self) -> None:
+        if self.run(["rev-parse", "--is-shallow-repository"]).strip() == "true":
+            raise GitError("当前为浅克隆，历史不完整；请先获取完整历史再执行版本同步或合并。")
+
+    def _shared_release_branches(
+        self, oid: str, local: Dict[str, str], remote: Dict[str, str],
+    ) -> List[str]:
+        commit = self.run(["rev-parse", "--verify", f"{oid}^{{commit}}"]).strip()
+        return [
+            prefix + ref[len("refs/heads/"):]
+            for prefix, refs in (("本地 ", local), ("origin/", remote))
+            for ref, head in refs.items()
+            if ref.startswith("refs/heads/") and ref != "refs/heads/main"
+            and self._contains_commit(commit, head)
+        ]
+
+    def _validate_sync_confirmation(self, snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus) -> None:
+        if self.sync_snapshot() != snapshot:
+            raise GitError("本地分支或版本标签已变化，请刷新后重新确认。")
+        if tuple(sorted(self._remote_refs(snapshot.remote_url).items())) != status.all_remote_refs:
+            raise GitError("远程分支或版本标签已变化，请刷新后重新确认。")
+
     def sync_snapshot(self, require_versions: bool = False) -> RemoteSyncSnapshot:
+        self._assert_no_operation()
         branch = self.current_branch()
         if not branch:
             raise GitError("查看历史版本时不能同步远程，请先返回工作分支。")
         remote_url = self._sync_target()
         branch_ref = f"refs/heads/{branch}"
-        commit = self.run(["rev-parse", "--verify", branch_ref], check=False).strip()
+        all_refs = self._local_refs()
+        commit = all_refs.get(branch_ref)
         refs = [(branch_ref, commit)] if commit else []
-        for line in self.run([
-            "for-each-ref", "--format=%(refname) %(objectname)", "refs/tags/",
-        ]).splitlines():
-            ref, object_id = line.split()
-            if VERSION_PATTERN.fullmatch(ref[len("refs/tags/"):]):
-                refs.append((ref, object_id))
+        refs.extend(sorted((ref, oid) for ref, oid in all_refs.items() if self._owned_ref(ref, branch)))
         if require_versions and (not commit or not any(ref.startswith("refs/tags/") for ref, _oid in refs)):
             raise GitError("当前分支尚无可同步的版本，请先发布版本。")
-        return RemoteSyncSnapshot(remote_url, branch_ref, tuple(refs))
+        return RemoteSyncSnapshot(remote_url, branch_ref, tuple(refs), tuple(sorted(all_refs.items())))
 
     @staticmethod
     def _push_arguments(snapshot: RemoteSyncSnapshot, dry_run: bool = False) -> List[str]:
@@ -782,23 +997,17 @@ class GitRepository:
 
     def remote_sync_status(self, snapshot: RemoteSyncSnapshot) -> RemoteSyncStatus:
         try:
-            output = self._run_remote(
-                ["ls-remote", "--refs", "--", snapshot.remote_url], snapshot.remote_url
-            )
+            all_remote = self._remote_refs(snapshot.remote_url)
+            self._ensure_objects(snapshot.remote_url, all_remote)
         except GitError as error:
             return RemoteSyncStatus(
                 "unavailable", f"无法检查远程状态：{error}\n修复后点击“刷新”重新检查。"
             )
-        remote_refs = {}
-        for line in output.splitlines():
-            fields = line.split()
-            if len(fields) == 2:
-                object_id, ref = fields
-                if ref == snapshot.branch_ref or (
-                    ref.startswith("refs/tags/")
-                    and VERSION_PATTERN.fullmatch(ref[len("refs/tags/"):])
-                ):
-                    remote_refs[ref] = object_id
+        branch = snapshot.branch_ref[len("refs/heads/"):]
+        remote_refs = {
+            ref: oid for ref, oid in all_remote.items()
+            if ref == snapshot.branch_ref or self._owned_ref(ref, branch)
+        }
         local_refs = dict(snapshot.refs)
         remote_changes = self._ref_differences(local_refs, remote_refs)
         local_changes = self._ref_differences(local_refs, remote_refs)
@@ -827,6 +1036,30 @@ class GitRepository:
                 remote_message = f"远程覆盖预检查失败：{error}"
         elif not remote_changes:
             remote_message = "当前分支和版本标签已与远程一致。"
+        try:
+            local_blocks, remote_blocks = [], []
+            for change in local_changes:
+                parsed = parse_version_tag(change.ref)
+                if parsed and parsed[0] is None:
+                    owners = sorted(set(
+                        branch
+                        for oid in (change.local_oid, change.remote_oid) if oid
+                        for branch in self._shared_release_branches(oid, dict(snapshot.all_refs), all_remote)
+                    ))
+                    if owners:
+                        notice = f"{change.ref[len('refs/tags/'):]}：其他活动分支也包含此正式标签（{'、'.join(owners)}），不能改写或删除。"
+                        if change.local_oid:
+                            local_blocks.append(notice)
+                        if change.remote_oid:
+                            remote_blocks.append(notice)
+            if local_blocks:
+                local_available = False
+                local_message = "\n".join(local_blocks)
+            if remote_blocks:
+                remote_available = False
+                remote_message = "\n".join(remote_blocks)
+        except GitError as error:
+            return RemoteSyncStatus("unavailable", f"无法确认正式标签的共享范围，已停止同步：{error}")
         differences = tuple(sorted(set(local_changes + remote_changes), key=lambda item: item.ref))
         comparisons, comparison_error = (
             self._sync_comparisons(snapshot, remote_refs) if differences else ((), "")
@@ -847,6 +1080,7 @@ class GitRepository:
             remote_message,
             comparisons,
             comparison_error,
+            tuple(sorted(all_remote.items())),
         )
 
     def _sync_comparisons(
@@ -892,16 +1126,16 @@ class GitRepository:
             if not commit:
                 return None
             versions = tuple(sorted((
-                ref[len("refs/tags/"):] for ref, oid in refs.items()
+                display_version(ref[len("refs/tags/"):]) for ref, oid in refs.items()
                 if ref.startswith("refs/tags/") and commits.get(oid)
                 and commits[oid].oid == commit.oid
-            ), key=version_key, reverse=True))
+            ), key=version_sort_key, reverse=True))
             return SyncCommit(commit.oid, commit.date, commit.subject, versions, commit.version_note)
 
         shallow = self.run(["rev-parse", "--is-shallow-repository"]).strip() == "true"
         refs = [snapshot.branch_ref] + sorted(
             (set(local_refs) | set(remote_refs)) - {snapshot.branch_ref},
-            key=lambda ref: version_key(ref[len("refs/tags/"):]), reverse=True,
+            key=lambda ref: version_sort_key(ref[len("refs/tags/"):]), reverse=True,
         )
         comparisons = []
         for ref in refs:
@@ -960,7 +1194,7 @@ class GitRepository:
         snapshot: RemoteSyncSnapshot, remote_refs: Dict[str, str], dry_run: bool = False,
     ) -> List[str]:
         local_refs = dict(snapshot.refs)
-        args = ["push", "--atomic", "--porcelain"]
+        args = ["push", "--atomic", "--porcelain", "--no-follow-tags"]
         args.extend(["--dry-run", "--no-verify"] if dry_run else ["--progress"])
         refspecs = []
         for ref in sorted(set(local_refs) | set(remote_refs)):
@@ -972,7 +1206,7 @@ class GitRepository:
                 refspecs.append(f":{ref}")
             else:
                 prefix = "+" if remote_oid else ""
-                refspecs.append(f"{prefix}{ref}:{ref}")
+                refspecs.append(f"{prefix}{local_oid}:{ref}")
         if not refspecs:
             raise GitError("本地和远程没有待同步的引用差异。")
         return [*args, "origin", *refspecs]
@@ -1065,7 +1299,7 @@ class GitRepository:
             destinations[ref] = destination
             refspecs.append(f"+{ref}:{destination}")
         if refspecs:
-            self._run_remote(["fetch", "--no-tags", snapshot.remote_url, *refspecs], snapshot.remote_url)
+            self._run_remote(["fetch", "--no-tags", "--refmap=", "--no-recurse-submodules", snapshot.remote_url, *refspecs], snapshot.remote_url)
         fetched = {}
         for source, destination in destinations.items():
             object_id = self.run(["rev-parse", "--verify", destination], check=False).strip()
@@ -1094,15 +1328,13 @@ class GitRepository:
     ) -> str:
         if not status.can_sync_local or not status.remote_refs:
             raise GitError("远程没有可用的当前分支，请刷新远程状态后重试。")
-        if self.sync_snapshot() != snapshot:
-            raise GitError("本地分支或版本标签已变化，请刷新后重新确认。")
+        self._validate_sync_confirmation(snapshot, status)
         remote_refs = dict(status.remote_refs)
         if snapshot.branch_ref not in remote_refs:
             raise GitError("远程不存在当前分支，不能同步本地。")
         namespace = self._recovery_namespace("pull")
         fetched = self._fetch_remote_refs(snapshot, remote_refs, namespace + "/incoming")
-        if self.sync_snapshot() != snapshot:
-            raise GitError("本地分支或版本标签在同步前发生变化，操作已取消；请刷新后重试。")
+        self._validate_sync_confirmation(snapshot, status)
         local_refs = dict(snapshot.refs)
         metadata_backup = self._save_metadata_recovery(namespace)
         backup_refs = self._save_recovery_refs(namespace, local_refs, "before")
@@ -1148,7 +1380,7 @@ class GitRepository:
             desired = incoming_tags.get(ref)
             previous = local_refs.get(ref)
             if desired and previous != desired:
-                self.run(["update-ref", ref, desired])
+                self.run(["update-ref", ref, desired, previous or "0" * len(desired)])
                 manifest = self.metadata_path / MANIFEST_DIRECTORY / (
                     ref[len("refs/tags/"):] + MANIFEST_SUFFIX
                 )
@@ -1182,16 +1414,17 @@ class GitRepository:
     ) -> str:
         if not status.can_sync_remote:
             raise GitError("远程覆盖预检查未通过，请刷新状态并检查权限或仓库规则。")
-        if self.sync_snapshot() != snapshot:
-            raise GitError("本地分支或版本标签已变化，请刷新后重新确认。")
+        self._validate_sync_confirmation(snapshot, status)
         remote_refs = dict(status.remote_refs)
         local_refs = dict(snapshot.refs)
         namespace = self._recovery_namespace("push")
         fetched = self._fetch_remote_refs(snapshot, remote_refs, namespace + "/incoming")
         backup_refs = self._save_recovery_refs(namespace, fetched, "before")
+        self._validate_sync_confirmation(snapshot, status)
         self._run_remote(
             self._push_ref_differences(snapshot, remote_refs), snapshot.remote_url
         )
+        self._set_upstream(snapshot.branch_ref[len("refs/heads/"):], local_refs[snapshot.branch_ref])
         self._delete_fetched_refs(snapshot, remote_refs, namespace + "/incoming")
         backup = backup_refs[0] if backup_refs else namespace
         return f"远程分支和版本标签已与本地一致。同步前远程引用已保存在本地恢复点 {backup}。"
@@ -1199,6 +1432,380 @@ class GitRepository:
     def current_branch(self) -> Optional[str]:
         branch = self.run(["symbolic-ref", "--quiet", "--short", "HEAD"], check=False).strip()
         return branch or None
+
+    def _git_path(self, name: str) -> Path:
+        return self.path / self.run(["rev-parse", "--git-path", name]).strip()
+
+    def _assert_no_operation(self) -> None:
+        if any(self._git_path(name).exists() for name in (
+            "MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer",
+        )):
+            raise GitError("Git 有未完成的合并、变基或提交操作，请先完成或取消。")
+
+    def _assert_clean(self, target: Optional[str] = None) -> None:
+        self._assert_no_operation()
+        if self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]):
+            raise GitError("工作区有尚未发布的修改（包括暂存内容和未跟踪文件），请先处理。")
+        if target:
+            conflicts = self._ignored_path_conflicts(target)
+            if conflicts:
+                raise GitError("目标提交会覆盖被忽略的文件，请先移走或备份：\n" + "\n".join(conflicts))
+
+    def _validate_branch_name(self, name: str) -> None:
+        if not name or name == "HEAD" or name.startswith("-"):
+            raise GitError("分支名称无效。")
+        self.run(["check-ref-format", "refs/heads/" + name])
+
+    def local_branches(self) -> List[BranchInfo]:
+        current = self.current_branch()
+        branches = [
+            BranchInfo(ref[len("refs/heads/"):], "local", oid, ref == f"refs/heads/{current}")
+            for ref, oid in self._local_refs().items() if ref.startswith("refs/heads/")
+        ]
+        if current and not any(branch.current for branch in branches):
+            branches.append(BranchInfo(current, "local", "", True))
+        return sorted(branches, key=lambda branch: branch.name)
+
+    def remote_branches(self) -> List[BranchInfo]:
+        remote_url = self._sync_target()
+        return sorted([
+            BranchInfo(ref[len("refs/heads/"):], "remote", oid)
+            for ref, oid in self._remote_refs(remote_url).items() if ref.startswith("refs/heads/")
+        ], key=lambda branch: branch.name)
+
+    def remember_working_branch(self) -> None:
+        branch = self.current_branch()
+        if branch and self.last_working_branch() != branch:
+            self.run(["config", "--local", "codeversionmanager.lastWorkingBranch", branch])
+
+    def last_working_branch(self) -> Optional[str]:
+        return self.run(["config", "--local", "--get", "codeversionmanager.lastWorkingBranch"], check=False).strip() or None
+
+    def create_branch(self, name: str) -> str:
+        self._validate_branch_name(name)
+        if any(branch.name == name for branch in self.local_branches()):
+            raise GitError(f"本地分支 {name} 已存在。")
+        head = self.run(["rev-parse", "--verify", "HEAD^{commit}"], check=False).strip()
+        if not head:
+            raise GitError("请先发布首个版本，再创建分支。")
+        self._assert_clean(head)
+        self.run(["switch", "--no-overwrite-ignore", "--no-track", "-c", name, head])
+        self.remember_working_branch()
+        return f"已创建并切换到 {name}；开发版本将使用独立的预发布标签。"
+
+    def switch_branch(self, name: str, source: str = "local", expected_oid: Optional[str] = None) -> str:
+        self._validate_branch_name(name)
+        existing = next((branch for branch in self.local_branches() if branch.name == name), None)
+        if existing and existing.current:
+            return f"当前已在 {name}。"
+        if existing:
+            self._assert_clean(existing.oid)
+            self.run(["switch", "--no-guess", "--no-overwrite-ignore", "--", name])
+        elif source == "remote":
+            self._assert_clean()
+            remote_url = self._sync_target()
+            incoming = f"refs/code-version-manager/branch-import/{uuid.uuid4().hex}"
+            try:
+                self._run_remote([
+                    "fetch", "--no-tags", "--refmap=", "--no-recurse-submodules", remote_url,
+                    f"refs/heads/{name}:{incoming}",
+                ], remote_url)
+                oid = self.run(["rev-parse", "--verify", incoming]).strip()
+                if expected_oid and oid != expected_oid:
+                    raise GitError("远程分支已变化，请刷新后重试。")
+                remote_refs = self._remote_refs(remote_url)
+                if remote_refs.get(f"refs/heads/{name}") != oid:
+                    raise GitError("远程分支在读取期间发生变化，请刷新后重试。")
+                baselines = {
+                    ref: tag_oid for ref, tag_oid in remote_refs.items()
+                    if ref.startswith("refs/tags/") and (parsed := parse_version_tag(ref)) and parsed[0] is None
+                }
+                self._ensure_objects(remote_url, baselines)
+                baselines = {
+                    ref: tag_oid for ref, tag_oid in baselines.items()
+                    if self._contains_commit(
+                        self.run(["rev-parse", "--verify", f"{tag_oid}^{{commit}}"]).strip(), oid,
+                    )
+                }
+                local_refs = self._local_refs()
+                for ref, tag_oid in baselines.items():
+                    if ref in local_refs and local_refs[ref] != tag_oid:
+                        label = ref[len("refs/tags/"):]
+                        raise GitError(f"正式基线 {label} 与远程不同，请先处理标签冲突。")
+                if self._sync_target() != remote_url or self._remote_refs(remote_url) != remote_refs:
+                    raise GitError("远程分支或正式标签在读取期间发生变化，请刷新后重试。")
+                self._assert_clean(oid)
+                for ref, tag_oid in baselines.items():
+                    if ref not in local_refs:
+                        self.run(["update-ref", ref, tag_oid, "0" * len(tag_oid)])
+                self.run(["switch", "--no-overwrite-ignore", "--no-track", "-c", name, oid])
+                self._set_upstream(name, oid)
+            finally:
+                self.run(["update-ref", "-d", incoming], check=False)
+        else:
+            raise GitError(f"本地分支 {name} 不存在。")
+        self.remember_working_branch()
+        return f"已切换到 {name}。"
+
+    def _set_upstream(self, branch: str, oid: str) -> None:
+        self.run(["update-ref", f"refs/remotes/origin/{branch}", oid])
+        self.run(["config", "--local", f"branch.{branch}.remote", "origin"])
+        self.run(["config", "--local", f"branch.{branch}.merge", f"refs/heads/{branch}"])
+
+    def merge_state(self) -> MergeState:
+        active = self._git_path("MERGE_HEAD").exists()
+        source = ""
+        try:
+            source = json.loads((self.metadata_path / "merge.json").read_text()).get("source", "")
+        except (OSError, ValueError, AttributeError):
+            pass
+        conflicts = tuple(sorted(set(filter(None, self.run([
+            "diff", "--name-only", "--diff-filter=U", "-z",
+        ]).split("\0"))))) if active else ()
+        return MergeState(active, source if active else "", conflicts)
+
+    def _assert_branch_not_in_other_worktree(self, name: str) -> None:
+        worktree = ""
+        for line in self.run(["worktree", "list", "--porcelain"]).splitlines():
+            if line.startswith("worktree "):
+                worktree = line[len("worktree "):]
+            elif line == f"branch refs/heads/{name}" and Path(worktree).resolve() != self.path:
+                raise GitError(f"分支 {name} 正在另一个工作区使用，请先在那里处理。")
+
+    def _prepare_merge_branches(self, source: str) -> None:
+        local = self._local_refs()
+        names = ("main", source)
+        if any(f"refs/heads/{name}" not in local for name in names):
+            raise GitError("main 和来源分支都必须先存在于本地。")
+        for name in names:
+            self._assert_branch_not_in_other_worktree(name)
+        if not self.remote_url():
+            return
+        remote_url = self._sync_target()
+        remote = self._remote_refs(remote_url)
+        wanted = {f"refs/heads/{name}": remote[f"refs/heads/{name}"] for name in names if f"refs/heads/{name}" in remote}
+        releases = {ref: oid for ref, oid in remote.items() if self._owned_ref(ref, "main")}
+        source_tags = {ref: oid for ref, oid in remote.items() if self._owned_ref(ref, source)}
+        self._ensure_objects(remote_url, {**wanted, **releases, **source_tags})
+        for ref, oid in {**releases, **source_tags}.items():
+            if ref in local and local[ref] != oid:
+                raise GitError(f"版本标签 {display_version(ref[len('refs/tags/'):])} 两端不同，请先处理标签冲突。")
+        if f"refs/heads/{source}" in wanted:
+            for ref, oid in source_tags.items():
+                commit = self.run(["rev-parse", "--verify", f"{oid}^{{commit}}"]).strip()
+                if not self._contains_commit(commit, wanted[f"refs/heads/{source}"]):
+                    raise GitError(f"origin 上的预发布标签 {display_version(ref[len('refs/tags/'):])} 不属于 {source} 历史。")
+        updates = {}
+        for ref, remote_oid in wanted.items():
+            local_oid = local[ref]
+            if local_oid != remote_oid:
+                if self._contains_commit(local_oid, remote_oid):
+                    updates[ref] = remote_oid
+                elif not self._contains_commit(remote_oid, local_oid):
+                    raise GitError(f"{ref[len('refs/heads/'):]} 与 origin 已分叉；请先处理，软件不会覆盖任何一端。")
+        # Validate both branches before applying either fast-forward.
+        if self._sync_target() != remote_url or self._local_refs() != local or self._remote_refs(remote_url) != remote:
+            raise GitError("分支在检查期间发生变化，请刷新后重试。")
+        for ref, oid in updates.items():
+            self._assert_clean(oid)
+            name = ref[len("refs/heads/"):]
+            if self.current_branch() == name:
+                self.run(["merge", "--ff-only", "--no-overwrite-ignore", oid])
+            else:
+                self.run(["update-ref", ref, oid, local[ref]])
+        for ref, oid in wanted.items():
+            self._set_upstream(ref[len("refs/heads/"):], oid)
+        for ref, oid in {**releases, **source_tags}.items():
+            if ref not in local:
+                self.run(["update-ref", ref, oid, "0" * len(oid)])
+
+    def merge_to_main(self, source: str) -> str:
+        self._validate_branch_name(source)
+        self._ensure_full_history()
+        if source == "main":
+            raise GitError("请选择需要合并的开发分支。")
+        self._assert_clean()
+        self._prepare_merge_branches(source)
+        self.switch_branch("main")
+        source_oid = self.run(["rev-parse", "--verify", f"refs/heads/{source}"]).strip()
+        self._assert_clean(source_oid)
+        head = self.run(["rev-parse", "HEAD"]).strip()
+        if self._contains_commit(source_oid, head):
+            return f"{source} 已合入 main，无需重复合并。"
+        ensure_git_identity(self)
+        self.metadata_path.mkdir(parents=True, exist_ok=True)
+        self._save_recovery_refs(self._recovery_namespace("merge"), {
+            "refs/heads/main": head, f"refs/heads/{source}": source_oid,
+        }, "before")
+        (self.metadata_path / "merge.json").write_text(json.dumps({"source": source}), encoding="utf-8")
+        result = subprocess.run([
+            "git", "-C", str(self.path), "merge", "--no-ff", "--no-commit", "--no-overwrite-ignore", source_oid,
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        state = self.merge_state()
+        if state.active and state.conflicts:
+            return f"正在将 {source} 合并到 main：有 {len(state.conflicts)} 个冲突，请解决后完成合并，或取消合并。"
+        if result.returncode != 0:
+            if not state.active:
+                (self.metadata_path / "merge.json").unlink(missing_ok=True)
+            raise GitError(result.stderr.strip() or result.stdout.strip())
+        return self.complete_merge()
+
+    def complete_merge(self) -> str:
+        state = self.merge_state()
+        if not state.active or self.current_branch() != "main":
+            raise GitError("没有正在 main 上进行的合并。")
+        if state.conflicts:
+            raise GitError("仍有未解决的合并冲突，请逐个解决并标记已解决。")
+        ensure_git_identity(self)
+        self.run(["commit", "-m", f"Merge {state.source or 'development branch'} into main"])
+        (self.metadata_path / "merge.json").unlink(missing_ok=True)
+        self.remember_working_branch()
+        return "合并已完成，main 保留双方提交历史；请检查结果，再发布新的正式版本并同步远程。"
+
+    def abort_merge(self) -> str:
+        if not self.merge_state().active:
+            raise GitError("没有正在进行的合并。")
+        self.run(["merge", "--abort"])
+        (self.metadata_path / "merge.json").unlink(missing_ok=True)
+        return "合并已取消，已恢复到开始合并时的 main。合并前安全快进取得的远程提交仍保留。"
+
+    def resolve_merge_file(self, path: str, delete: bool = False) -> str:
+        if path not in self.merge_state().conflicts:
+            raise GitError("所选文件已不在冲突列表，请刷新。")
+        if not delete:
+            target = self.path / path
+            if not target.is_file() or target.is_symlink():
+                raise GitError("请先保存合并结果，或明确选择删除此文件。")
+            if re.search(rb"^(?:<{7}|={7}|>{7})(?:\s|$)", target.read_bytes(), re.MULTILINE):
+                raise GitError("文件仍有冲突标记，请处理后再标记已解决。")
+            self.run(["--literal-pathspecs", "add", "--", path])
+        else:
+            self.run(["--literal-pathspecs", "rm", "-f", "--", path])
+        return f"已标记解决：{path}"
+
+    def launch_merge_tool(self, path: str) -> str:
+        if path not in self.merge_state().conflicts:
+            raise GitError("所选文件已不在冲突列表。")
+        target = self.path / path
+        if self.path not in target.resolve().parents or target.is_symlink():
+            raise GitError("符号链接或工作区外路径请手动解决。")
+        tool = self.compare_tool()
+        label, command = COMPARE_TOOLS[tool]
+        if not shutil.which(command):
+            raise GitError(f"没有找到 {label}，请安装后重试，或在设置中更换工具。")
+        entries = self.run(["--literal-pathspecs", "ls-files", "--unmerged", "-z", "--", path]).split("\0")
+        stages = {int(line.split("\t", 1)[0].split()[2]): line.split("\t", 1)[0].split() for line in entries if line}
+        if any(stage not in stages for stage in (1, 2, 3)) or any(value[0] not in ("100644", "100755") for value in stages.values()):
+            raise GitError("此冲突涉及新增、删除或特殊文件，请手动编辑后标记解决，或明确选择删除。")
+        with tempfile.TemporaryDirectory(prefix="cvm-merge-") as temporary:
+            files = []
+            for stage, name in ((1, "base"), (2, "main"), (3, "incoming")):
+                file = Path(temporary) / name
+                file.write_bytes(self.run_bytes(["cat-file", "blob", stages[stage][1]]))
+                files.append(str(file))
+            base, local, incoming = files
+            if tool == "bcompare":
+                args = [command, "-solo", local, incoming, base, f"-mergeoutput={target}"]
+            elif tool == "meld":
+                args = [command, f"--output={target}", local, base, incoming]
+            else:
+                args = [command, base, local, incoming, "-o", str(target)]
+            result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode != 0:
+                raise GitError(result.stderr.strip() or "合并工具已取消或执行失败，冲突状态保留。")
+        return "合并工具已关闭，请检查保存结果并点击“标记已解决”；软件不会自动将工具退出视为解决。"
+
+    def plan_branch_deletion(self, name: str, cleanup_tags: bool = False, delete_remote: bool = False) -> BranchDeletionPlan:
+        self._validate_branch_name(name)
+        self._ensure_full_history()
+        self._assert_clean()
+        refs = self._local_refs()
+        if name == "main" or self.current_branch() != "main":
+            raise GitError("请在 main 上删除已合并的开发分支。")
+        if f"refs/heads/{name}" not in refs or not self._contains_commit(refs[f"refs/heads/{name}"], refs["refs/heads/main"]):
+            raise GitError("来源分支尚未完全合入 main，不能删除。")
+        remote_url = self._sync_target() if delete_remote else ""
+        remote = self._remote_refs(remote_url) if delete_remote else {}
+        if delete_remote:
+            remote_main = remote.get("refs/heads/main")
+            remote_source = remote.get(f"refs/heads/{name}")
+            if not remote_main:
+                raise GitError("origin/main 不存在，无法确认远程删除安全性。")
+            targets = {f"refs/heads/{name}": remote_source} if remote_source else {}
+            if cleanup_tags:
+                targets.update({ref: oid for ref, oid in remote.items() if self._owned_ref(ref, name)})
+            self._ensure_objects(remote_url, {"refs/heads/main": remote_main, **targets})
+            if any(not self._contains_commit(
+                self.run(["rev-parse", "--verify", f"{oid}^{{commit}}"]).strip(), remote_main,
+            ) for oid in targets.values()):
+                raise GitError("origin/main 尚未包含待删除的远程分支或标签，请先同步合并后的 main。")
+        return BranchDeletionPlan(name, cleanup_tags, delete_remote, tuple(sorted(refs.items())), remote_url, tuple(sorted(remote.items())))
+
+    def delete_merged_branch(
+        self, name: str, cleanup_tags: bool = False, delete_remote: bool = False,
+        expected: Optional[BranchDeletionPlan] = None,
+    ) -> str:
+        self._validate_branch_name(name)
+        self._ensure_full_history()
+        self._assert_clean()
+        if name == "main" or self.current_branch() != "main":
+            raise GitError("请在 main 上删除已合并的开发分支，不能删除 main。")
+        self._assert_branch_not_in_other_worktree(name)
+        refs = self._local_refs()
+        if expected and (expected.name != name or expected.cleanup_tags != cleanup_tags
+                         or expected.delete_remote != delete_remote or expected.local_refs != tuple(sorted(refs.items()))):
+            raise GitError("删除确认后本地引用发生变化，请重新查看删除清单。")
+        branch_ref = f"refs/heads/{name}"
+        if branch_ref not in refs or not self._contains_commit(refs[branch_ref], refs["refs/heads/main"]):
+            raise GitError("来源分支尚未完全合入 main，不能删除。")
+        deletions = {branch_ref: refs[branch_ref]}
+        if cleanup_tags:
+            deletions.update({ref: oid for ref, oid in refs.items() if self._owned_ref(ref, name)})
+        namespace = self._recovery_namespace("delete-branch")
+        self._save_recovery_refs(namespace, deletions, "before")
+        self._save_metadata_recovery(namespace)
+        if delete_remote:
+            remote_url = self._sync_target()
+            remote = self._remote_refs(remote_url)
+            if expected and (remote_url != expected.remote_url or tuple(sorted(remote.items())) != expected.remote_refs):
+                raise GitError("删除确认后远程引用发生变化，请重新查看删除清单。")
+            target = {ref: oid for ref, oid in remote.items() if ref == branch_ref or (cleanup_tags and self._owned_ref(ref, name))}
+            self._ensure_objects(remote_url, target)
+            main = remote.get("refs/heads/main")
+            if main:
+                self._ensure_objects(remote_url, {"refs/heads/main": main})
+            if any(not main or not self._contains_commit(
+                self.run(["rev-parse", f"{oid}^{{commit}}"]).strip(), main,
+            ) for oid in target.values()):
+                raise GitError("origin/main 尚未包含待删除的远程分支或标签，请先上传合并后的 main。")
+            if target:
+                # Reuse the recovery fetcher by selecting the source branch explicitly.
+                selected = RemoteSyncSnapshot(remote_url, branch_ref, ())
+                fetched = self._fetch_remote_refs(selected, target, namespace + "/incoming")
+                self._save_recovery_refs(namespace, fetched, "remote-before")
+                if self._local_refs() != refs or self._remote_refs(remote_url) != remote:
+                    raise GitError("删除检查后引用发生变化，请刷新并重新确认。")
+                args = ["push", "--atomic", "--porcelain", "--no-follow-tags"]
+                args.extend(f"--force-with-lease={ref}:{oid}" for ref, oid in target.items())
+                if main:
+                    args.append(f"--force-with-lease=refs/heads/main:{main}")
+                refspecs = [":" + ref for ref in target]
+                if main:
+                    refspecs.append(f"{main}:refs/heads/main")
+                self._run_remote([*args, "origin", *refspecs], remote_url)
+        if self._local_refs() != refs:
+            raise GitError("本地引用已变化，已停止本地删除；请刷新检查，恢复点仍保留。")
+        self._assert_branch_not_in_other_worktree(name)
+        for ref, oid in deletions.items():
+            self.run(["update-ref", "-d", ref, oid])
+        self.run(["config", "--local", "--remove-section", f"branch.{name}"], check=False)
+        if delete_remote:
+            self.run(["update-ref", "-d", f"refs/remotes/origin/{name}"], check=False)
+        for ref in deletions:
+            if ref.startswith("refs/tags/"):
+                self._remove_version_metadata(ref[len("refs/tags/"):])
+        self._write_changelog(None)
+        return f"已删除已合并分支 {name}；{'已清理该分支的预发布标签' if cleanup_tags else '预发布标签保留归档'}。恢复引用保存在 {namespace}。"
 
     def head_label(self) -> str:
         exact = self.run(["describe", "--tags", "--exact-match", "HEAD"], check=False).strip()
@@ -1277,8 +1884,56 @@ class GitRepository:
         output = self.run(["tag", "--sort=version:refname"])
         return [line for line in output.splitlines() if line]
 
+    def version_tags(self, all_versions: bool = False) -> List[VersionTagInfo]:
+        branch = self.current_branch()
+        head = self.run(["rev-parse", "--verify", "HEAD^{commit}"], check=False).strip()
+        if not all_versions and branch and branch != "main" and self.run(["rev-parse", "--is-shallow-repository"]).strip() == "true":
+            raise GitError("当前为浅克隆，无法判断正式标签是否属于当前分支；请先获取完整历史，或改看“全部分支版本”。")
+        tags = []
+        for ref, oid in self._local_refs().items():
+            if not ref.startswith("refs/tags/"):
+                continue
+            owner, version = parse_version_tag(ref)
+            commit = self.run(["rev-parse", "--verify", f"{oid}^{{commit}}"]).strip()
+            baseline = owner is None and branch != "main"
+            visible = (branch == "main" and owner is None) or (branch is not None and owner == branch)
+            if not visible and baseline and head:
+                visible = self._contains_commit(commit, head)
+            if branch is None:
+                visible = bool(head) and self._contains_commit(commit, head)
+            if all_versions or visible:
+                tags.append(VersionTagInfo(
+                    ref, owner, "release" if owner is None else "prerelease", version, commit, oid,
+                    owner is None and branch != "main" or owner is not None and owner != branch,
+                ))
+        return sorted(tags, key=lambda tag: version_sort_key(tag.name), reverse=True)
+
+    def _assert_version_editable(self, version: str) -> str:
+        self._assert_no_operation()
+        version = canonical_version(version)
+        parsed = parse_version_tag(version)
+        if not parsed or version not in self.tags():
+            raise GitError(f"版本 {version} 不存在。")
+        branch = self.current_branch()
+        owner = parsed[0]
+        if not branch or (owner is None and branch != "main") or (owner is not None and owner != branch):
+            raise GitError("此版本属于其他分支或是继承的正式版本（只读），请切换到所属分支操作。")
+        if owner is None:
+            local = self._local_refs()
+            remote = {}
+            remote_url = self._sync_target() if self.remote_url() else ""
+            self._ensure_full_history()
+            if remote_url:
+                remote = self._remote_refs(remote_url)
+                self._ensure_objects(remote_url, remote)
+            shared = self._shared_release_branches(local[f"refs/tags/{version}"], local, remote)
+            if shared:
+                raise GitError("其他活动分支也包含此正式标签，不能改写或删除：" + "、".join(shared))
+        return version
+
     def version_message(self, version: str) -> str:
-        if not VERSION_PATTERN.match(version) or version not in self.tags():
+        version = canonical_version(version)
+        if not parse_version_tag(version) or version not in self.tags():
             raise GitError(f"版本 {version} 不存在。")
         return self._version_message_unchecked(version)
 
@@ -1295,45 +1950,19 @@ class GitRepository:
             mapping.setdefault(commit, []).append(tag)
         return mapping
 
-    def history(self, limit: int = 500) -> List[HistoryEntry]:
-        tags = self._tags_by_commit()
-        if not tags and not self.run(["rev-parse", "--verify", "HEAD"], check=False).strip():
-            return []
-        output = self.run(
-            [
-                "log",
-                "--all",
-                f"--max-count={limit}",
-                "--date=short",
-                "--pretty=format:%H%x1f%h%x1f%ad%x1f%s%x1e",
-            ]
-        )
+    def history(self, limit: int = 500, all_versions: bool = False) -> List[HistoryEntry]:
         entries: List[HistoryEntry] = []
-        for record in output.split("\x1e"):
-            record = record.strip()
-            if not record:
-                continue
-            fields = record.split("\x1f")
-            if len(fields) != 4:
-                continue
-            commit, short_commit, date, subject = fields
-            commit_tags = tuple(
-                tag for tag in tags.get(commit, []) if VERSION_PATTERN.match(tag)
-            )
-            if not commit_tags:
-                continue
-            primary_tag = max(commit_tags, key=version_key)
-            changes = normalize_changes(self._version_message_unchecked(primary_tag))
+        for tag in self.version_tags(all_versions=all_versions)[:limit]:
+            commit, short_commit, day, subject = self.run([
+                "show", "--no-patch", "--date=short", "--format=%H%x1f%h%x1f%ad%x1f%s", tag.commit,
+            ]).strip().split("\x1f", 3)
+            changes = normalize_changes(self._version_message_unchecked(tag.name))
             if changes:
                 subject = changes[0]
-            entries.append(
-                HistoryEntry(commit, short_commit, date, subject, commit_tags)
-            )
-        return sorted(
-            entries,
-            key=lambda entry: max(version_key(tag) for tag in entry.tags),
-            reverse=True,
-        )
+            if tag.read_only:
+                subject = ("[继承的正式版本 · 只读] " if tag.owner is None else "[其他分支 · 只读] ") + subject
+            entries.append(HistoryEntry(commit, short_commit, day, subject, (tag.name,), tag.read_only))
+        return entries
 
     def next_version(self) -> str:
         versions = []
@@ -1341,11 +1970,17 @@ class GitRepository:
             match = VERSION_PATTERN.match(tag)
             if match:
                 versions.append(tuple(int(value) for value in match.group(1).split(".")))
-        if not versions:
-            return "v0.0.1"
-        latest = max(versions)
-        next_version = (*latest[:-1], latest[-1] + 1)
-        return "v" + ".".join(str(value) for value in next_version)
+        latest = max(versions) if versions else (0, 0, 0)
+        base = "v" + ".".join(str(value) for value in (*latest[:-1], latest[-1] + 1))
+        branch = self.current_branch()
+        if not branch or branch == "main":
+            return base
+        numbers = [
+            int(parsed[1].split("-beta.")[1])
+            for tag in self.tags() for parsed in [parse_version_tag(tag)]
+            if parsed and parsed[0] == branch and parsed[1].startswith(base + "-beta.")
+        ]
+        return version_tag_name(branch, f"{base}-beta.{max(numbers, default=0) + 1}")
 
     def manifest(self, reference: str) -> Optional[List[str]]:
         tag = self._tag_for_reference(reference)
@@ -1363,10 +1998,11 @@ class GitRepository:
         return [line for line in content.splitlines() if line]
 
     def _tag_for_reference(self, reference: str) -> Optional[str]:
+        reference = canonical_version(reference)
         if reference in self.tags():
             return reference
         tags = self.run(["tag", "--points-at", reference], check=False).splitlines()
-        return sorted(tags, key=version_key)[-1] if tags else None
+        return sorted(tags, key=version_sort_key)[-1] if tags else None
 
     def default_package_files(self) -> List[str]:
         previous = self.manifest("HEAD")
@@ -1390,7 +2026,7 @@ class GitRepository:
         if pending:
             version, message, _file_count = pending
             sections.append((version, date.today().isoformat(), normalize_changes(message)))
-        for tag in sorted(self.tags(), key=version_key, reverse=True):
+        for tag in sorted((tag for tag in self.tags() if parse_version_tag(tag)), key=version_sort_key, reverse=True):
             commit = self.run(["rev-list", "-n", "1", tag]).strip()
             version_date = self.run(
                 ["show", "-s", "--date=short", "--format=%ad", commit]
@@ -1403,8 +2039,8 @@ class GitRepository:
         marker = "^" * max(39, len(title))
         lines = [marker, title, marker, ""]
         for version, version_date, changes in sections:
-            display_version = version[1:] if version.startswith("v") else version
-            heading = f"{display_version} ({version_date})"
+            label = version[1:] if version.startswith("v") else display_version(version)
+            heading = f"{label} ({version_date})"
             lines.extend(
                 [
                     heading,
@@ -1472,10 +2108,14 @@ class GitRepository:
         *,
         sync_version_file: Optional[bool] = None,
     ) -> None:
+        self._assert_no_operation()
         if self.current_branch() is None:
-            raise GitError("当前正在查看历史版本。请先返回 main，再发布新版本。")
-        if not VERSION_PATTERN.match(version):
-            raise GitError("版本号应以 v 开头并至少包含三段数字，例如 v1.7.8.9.7。")
+            raise GitError("当前正在查看历史版本。请先返回工作分支，再发布新版本。")
+        branch = self.current_branch()
+        version = canonical_version(version, branch)
+        parsed = parse_version_tag(version)
+        if not parsed or (branch == "main" and parsed[0] is not None) or (branch != "main" and parsed[0] != branch):
+            raise GitError("main 只能发布正式版本 v0.3.1；开发分支只能发布自己的预发布版本，如 test1/v0.3.1-beta.1。")
         if version in self.tags():
             raise GitError(f"版本 {version} 已存在。")
         ensure_git_identity(self)
@@ -1531,7 +2171,7 @@ class GitRepository:
             previous_version = version_path.read_bytes() if sync_version and version_path.exists() else None
             try:
                 if sync_version:
-                    version_path.write_text(version[1:] + "\n", encoding="utf-8")
+                    version_path.write_text(parsed[1][1:] + "\n", encoding="utf-8")
                 self._add_paths(added_paths, env=environment)
                 if ignored_removals:
                     # Remove ignored historical files from the version, never from disk.
@@ -1561,8 +2201,7 @@ class GitRepository:
         self.configure_version_file(sync_version)
 
     def update_version_message(self, version: str, message: str) -> None:
-        if not VERSION_PATTERN.match(version) or version not in self.tags():
-            raise GitError(f"版本 {version} 不存在。")
+        version = self._assert_version_editable(version)
         changes = normalize_changes(message)
         if not changes:
             raise GitError("至少填写一条改动内容。")
@@ -1575,21 +2214,16 @@ class GitRepository:
         self._write_changelog(None)
 
     def switch_main(self) -> None:
-        branches = self.run(["for-each-ref", "--format=%(refname:short)", "refs/heads/"]).splitlines()
-        if "main" not in branches:
-            raise GitError("该仓库没有 main 分支。")
-        self.run(["switch", "main"])
+        self.switch_branch("main")
 
     def delete_version(self, version: str) -> None:
-        if not VERSION_PATTERN.match(version):
-            raise GitError("只能删除以 v 开头且至少包含三段数字的版本标签。")
-        if version not in self.tags():
-            raise GitError(f"版本 {version} 不存在或已经删除。")
+        version = self._assert_version_editable(version)
         self.run(["tag", "--delete", version])
         self._remove_version_metadata(version)
 
     def delete_latest_version_commit(self, version: str) -> None:
-        if not VERSION_PATTERN.match(version) or version not in self.tags():
+        version = self._assert_version_editable(version)
+        if not parse_version_tag(version) or version not in self.tags():
             raise GitError(f"版本 {version} 不存在或已经删除。")
         if self.current_branch() != "main":
             raise GitError("只能在 main 分支上删除最新版本的 Git 提交。")
@@ -1739,7 +2373,9 @@ def normalize_changes(message: str) -> List[str]:
 
 def workspace_version_message(root: Path, version: str) -> Optional[str]:
     """Read only the requested RST release section, without changing the file."""
-    if not VERSION_PATTERN.fullmatch(version):
+    version = canonical_version(version)
+    parsed = parse_version_tag(version)
+    if not parsed:
         return None
     try:
         lines = (root / WORKSPACE_CHANGELOG).read_text(encoding="utf-8-sig").splitlines()
@@ -1756,8 +2392,11 @@ def workspace_version_message(root: Path, version: str) -> Optional[str]:
         )
 
     for index, line in enumerate(lines):
-        heading = re.fullmatch(r"v?(\d+(?:\.\d+){2,})\s+\(\d{4}-\d{2}-\d{2}\)", line.strip())
-        if not heading or heading.group(1) != version[1:] or not is_heading(index):
+        heading = re.fullmatch(r"(.+?)\s+\(\d{4}-\d{2}-\d{2}\)", line.strip())
+        expected = {display_version(version), version}
+        if parsed[0] is None:
+            expected.add(parsed[1][1:])
+        if not heading or heading.group(1) not in expected or not is_heading(index):
             continue
         changes: List[str] = []
         for body_index in range(index + 2, len(lines)):
@@ -2116,7 +2755,13 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.remote_status_snapshot: Optional[RemoteSyncSnapshot] = None
         self.remote_status = RemoteSyncStatus("unavailable", "尚未检查远程状态。")
         self.remote_sync_error: Optional[str] = None
-        self.connect("destroy", lambda _window: self._invalidate_remote_status())
+        self.branch_generation = 0
+        self.remote_branch_url = ""
+        self.remote_branch_choices: List[BranchInfo] = []
+        self.branch_choices: Dict[str, BranchChoice] = {}
+        self.updating_branch_choices = False
+        self.updating_history_scope = False
+        self.connect("destroy", lambda _window: self._invalidate_requests())
 
         self._build_header()
         self._build_content()
@@ -2238,7 +2883,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.info_label = Gtk.Label(xalign=0)
         self.info_label.set_use_markup(True)
         self.info_bar.get_content_area().add(self.info_label)
-        self.info_action_button = self.info_bar.add_button("返回 main", Gtk.ResponseType.OK)
+        self.info_action_button = self.info_bar.add_button("选择工作分支", Gtk.ResponseType.OK)
         self.info_bar.connect("response", self.on_return_main)
         root.pack_start(self.info_bar, False, False, 0)
 
@@ -2284,6 +2929,51 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             toolbar.pack_start(button, False, False, 0)
         root.pack_start(toolbar, False, False, 0)
 
+        self.branch_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                                  margin_start=16, margin_end=16, margin_top=8)
+        self.branch_bar.pack_start(Gtk.Label(label="分支"), False, False, 0)
+        self.branch_combo = Gtk.ComboBoxText()
+        for renderer in self.branch_combo.get_cells():
+            renderer.set_property("ellipsize", 3)
+            renderer.set_property("max-width-chars", 24)
+        self.branch_combo.connect("changed", self.on_branch_selected)
+        self.branch_bar.pack_start(self.branch_combo, False, False, 0)
+        self.new_branch_button = self._command_button("新建分支", "list-add-symbolic", self.on_create_branch)
+        self.refresh_branches_button = self._command_button("刷新远程分支", "view-refresh-symbolic", self.on_refresh_remote_branches)
+        self.merge_button = self._command_button("合并到 main", "emblem-shared-symbolic", self.on_merge_to_main)
+        self.delete_branch_button = self._command_button("删除已合并分支", "edit-delete-symbolic", self.on_delete_merged_branch)
+        for button in (self.new_branch_button, self.refresh_branches_button, self.merge_button, self.delete_branch_button):
+            self.branch_bar.pack_start(button, False, False, 0)
+        self.branch_status_label = Gtk.Label(xalign=0, ellipsize=3)
+        self.branch_status_label.set_hexpand(True)
+        self.branch_bar.pack_start(self.branch_status_label, True, True, 0)
+        root.pack_start(self.branch_bar, False, False, 0)
+
+        self.merge_bar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                                 margin_start=16, margin_end=16, margin_top=8)
+        self.merge_status_label = Gtk.Label(xalign=0)
+        self.merge_status_label.set_line_wrap(True)
+        self.merge_bar.pack_start(self.merge_status_label, False, False, 0)
+        merge_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.conflict_combo = Gtk.ComboBoxText()
+        self.conflict_combo.set_hexpand(True)
+        merge_actions.pack_start(self.conflict_combo, True, True, 0)
+        self.merge_tool_button = Gtk.Button(label="打开三方合并工具")
+        self.merge_tool_button.connect("clicked", self.on_merge_tool)
+        self.resolve_button = Gtk.Button(label="标记已解决")
+        self.resolve_button.connect("clicked", self.on_resolve_conflict)
+        self.resolve_delete_button = Gtk.Button(label="以删除解决")
+        self.resolve_delete_button.connect("clicked", self.on_resolve_conflict, True)
+        self.complete_merge_button = Gtk.Button(label="完成合并")
+        self.complete_merge_button.connect("clicked", self.on_complete_merge)
+        self.abort_merge_button = Gtk.Button(label="取消合并")
+        self.abort_merge_button.connect("clicked", self.on_abort_merge)
+        for button in (self.merge_tool_button, self.resolve_button, self.resolve_delete_button,
+                       self.complete_merge_button, self.abort_merge_button):
+            merge_actions.pack_start(button, False, False, 0)
+        self.merge_bar.pack_start(merge_actions, False, False, 0)
+        root.pack_start(self.merge_bar, False, False, 0)
+
         self.remote_summary_label = Gtk.Label(xalign=0, margin_start=16, margin_end=16, margin_top=8)
         self.remote_summary_label.set_line_wrap(True)
         self.remote_summary_label.set_max_width_chars(100)
@@ -2291,7 +2981,23 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         root.pack_start(self.remote_summary_label, False, False, 0)
 
         self.notebook = Gtk.Notebook()
-        self.notebook.append_page(self._build_history_view(), Gtk.Label(label="版本历史"))
+        history_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        filters = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                          margin_start=16, margin_end=16, margin_top=8)
+        self.history_scope_combo = Gtk.ComboBoxText()
+        self.history_scope_combo.append("current", "本分支相关版本")
+        self.history_scope_combo.append("all", "全部分支版本")
+        self.history_scope_combo.set_active_id("current")
+        self.history_scope_combo.connect("changed", self.on_history_scope_changed)
+        filters.pack_start(self.history_scope_combo, False, False, 0)
+        hint = Gtk.Label(
+            label="本分支相关版本包含当前分支版本和继承的正式版本；全部分支版本包含仓库内所有分支版本。",
+            xalign=0,
+        )
+        filters.pack_start(hint, False, False, 0)
+        history_panel.pack_start(filters, False, False, 0)
+        history_panel.pack_start(self._build_history_view(), True, True, 0)
+        self.notebook.append_page(history_panel, Gtk.Label(label="版本历史"))
         self.notebook.append_page(self._build_changes_view(), Gtk.Label(label="当前修改"))
         root.pack_start(self.notebook, True, True, 0)
 
@@ -2490,17 +3196,281 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             return
         self.workspace_path = resolved
         self.remote_sync_error = None
+        self.branch_generation += 1
+        self.remote_branch_choices = []
+        self.remote_branch_url = ""
         self._invalidate_remote_status()
         try:
             self.repository = GitRepository(resolved)
             self.workspace_path = self.repository.path
         except GitError:
             self.repository = None
+        self.updating_history_scope = True
+        self.history_scope_combo.set_active_id("current")
+        self.updating_history_scope = False
         self._save_repository_path(self.workspace_path)
         self.refresh()
+        if self.repository and self.repository.remote_url():
+            self.on_refresh_remote_branches(None)
 
-    def refresh(self, check_remote: bool = True) -> None:
+    def _invalidate_requests(self) -> None:
+        self.branch_generation += 1
+        self._invalidate_remote_status()
+
+    def _refresh_branch_choices(self) -> None:
+        self.updating_branch_choices = True
+        try:
+            self.branch_choices = {}
+            self.branch_combo.remove_all()
+            if not self.repository:
+                self.branch_combo.append("none", "未启用版本管理")
+                self.branch_combo.set_active_id("none")
+                self.branch_bar.set_sensitive(False)
+                self.branch_status_label.set_text("请先发布首个版本")
+                self.merge_bar.hide()
+                self.merge_bar.set_no_show_all(True)
+                return
+            repo = self.repository
+            try:
+                remote_url = repo._sync_target()
+            except GitError:
+                remote_url = ""
+            if self.remote_branch_url != remote_url:
+                self.remote_branch_choices = []
+                self.remote_branch_url = remote_url
+                self.branch_generation += 1
+            branches = repo.local_branches()
+            active = "detached"
+            if not repo.current_branch():
+                self.branch_combo.append(active, "历史提交（请选择分支）")
+            for choice in combine_branch_choices(branches, self.remote_branch_choices):
+                key = "branch:" + choice.name
+                self.branch_choices[key] = choice
+                self.branch_combo.append(key, choice.label)
+                if choice.current:
+                    active = key
+            self.branch_combo.set_active_id(active)
+            self.branch_combo.set_tooltip_text("当前分支：" + (repo.current_branch() or "历史提交"))
+            state = repo.merge_state()
+            self.branch_bar.set_sensitive(not self.busy and not state.active)
+            has_head = bool(repo.run(["rev-parse", "--verify", "HEAD"], check=False).strip())
+            self.new_branch_button.set_sensitive(has_head)
+            self.refresh_branches_button.set_sensitive(bool(remote_url))
+            self.merge_button.set_sensitive(any(branch.name == "main" for branch in branches) and len(branches) > 1)
+            self.delete_branch_button.set_sensitive(repo.current_branch() == "main" and len(branches) > 1)
+            self.branch_status_label.set_text("main 发正式版；开发分支发自己的预发布版")
+            self._refresh_merge_controls(state)
+        finally:
+            self.updating_branch_choices = False
+
+    def _refresh_merge_controls(self, state: MergeState) -> None:
+        self.merge_bar.set_no_show_all(not state.active)
+        if not state.active:
+            self.merge_bar.hide()
+            return
+        self.merge_status_label.set_text(
+            f"正在合并 {state.source or '开发分支'} → main：{len(state.conflicts)} 个未解决冲突。"
+            "解决后请标记并完成合并；也可取消。完成前禁止切换、发布和同步。"
+        )
+        self.conflict_combo.remove_all()
+        for path in state.conflicts:
+            self.conflict_combo.append(path, path)
+        self.conflict_combo.set_active(0)
+        self.complete_merge_button.set_sensitive(state.ready)
+        for button in (self.merge_tool_button, self.resolve_button, self.resolve_delete_button):
+            button.set_sensitive(bool(state.conflicts))
+        self.merge_bar.show_all()
+
+    def on_refresh_remote_branches(self, _button) -> None:
+        repo = self.repository
+        if not repo or self.busy:
+            return
+        try:
+            remote_url = repo._sync_target()
+        except GitError as error:
+            self.branch_status_label.set_text(str(error))
+            return
+        self.branch_generation += 1
+        generation = self.branch_generation
+        self.remote_branch_url = remote_url
+        self.refresh_branches_button.set_sensitive(False)
+        self.branch_status_label.set_text("正在读取远程分支…")
+
+        def worker():
+            try:
+                branches, error = repo.remote_branches(), ""
+            except Exception as exception:
+                branches, error = [], str(exception)
+            GLib.idle_add(self._remote_branches_complete, repo, generation, remote_url, branches, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _remote_branches_complete(self, repo, generation, remote_url, branches, error) -> bool:
+        if repo is not self.repository or generation != self.branch_generation or self.busy:
+            return False
+        try:
+            if repo._sync_target() != remote_url:
+                return False
+        except GitError:
+            return False
+        self.remote_branch_choices = branches
+        self._refresh_branch_choices()
+        message = "远程分支读取失败：" + error if error else f"origin 共 {len(branches)} 个分支；网站标签仍是仓库级列表。"
+        self.branch_status_label.set_text(message.splitlines()[0])
+        self.branch_status_label.set_tooltip_text(message)
+        return False
+
+    def on_branch_selected(self, combo) -> None:
+        if self.updating_branch_choices or self.busy or not self.repository:
+            return
+        branch = self.branch_choices.get(combo.get_active_id())
+        if not branch or branch.current:
+            return
+        repo = self.repository
+        self._refresh_branch_choices()
+        self.run_background(
+            f"正在切换到 {branch.name}…",
+            lambda: repo.switch_branch(branch.name, branch.source, branch.oid), "分支已切换。",
+        )
+
+    def on_create_branch(self, _button) -> None:
+        if not self.repository or self.busy:
+            return
+        repo = self.repository
+        dialog = Gtk.Dialog(title="新建并切换分支", transient_for=self, modal=True)
+        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "创建并切换", Gtk.ResponseType.OK)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=16)
+        content.pack_start(Gtk.Label(label="从当前提交创建；不会自动上传。分支名示例：test1、feature/camera。"), False, False, 0)
+        entry = Gtk.Entry(placeholder_text="新分支名称")
+        content.pack_start(entry, False, False, 0)
+        dialog.get_content_area().add(content)
+        dialog.show_all()
+        response = dialog.run()
+        name = entry.get_text().strip()
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            self.run_background("正在创建分支…", lambda: repo.create_branch(name), "分支已创建。")
+
+    def _choose_development_branch(self, title: str) -> Optional[str]:
+        dialog = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "继续", Gtk.ResponseType.OK)
+        combo = Gtk.ComboBoxText(margin=16)
+        for branch in self.repository.local_branches():
+            if branch.name != "main":
+                combo.append(branch.name, branch.name)
+        combo.set_active(0)
+        if self.repository.current_branch() != "main":
+            combo.set_active_id(self.repository.current_branch())
+        dialog.get_content_area().add(combo)
+        dialog.show_all()
+        response = dialog.run()
+        branch = combo.get_active_id()
+        dialog.destroy()
+        return branch if response == Gtk.ResponseType.OK else None
+
+    def on_merge_to_main(self, _button) -> None:
+        if not self.repository or self.busy:
+            return
+        source = self._choose_development_branch("选择合并到 main 的开发分支")
+        if source:
+            repo = self.repository
+            self.run_background("正在安全更新并合并到 main…", lambda: repo.merge_to_main(source), "合并已完成。")
+
+    def on_merge_tool(self, _button) -> None:
+        path = self.conflict_combo.get_active_id()
+        if path and self.repository:
+            repo = self.repository
+            self.run_background("三方合并工具已打开…", lambda: repo.launch_merge_tool(path), "请检查结果并标记已解决。")
+
+    def on_resolve_conflict(self, _button, delete: bool = False) -> None:
+        path = self.conflict_combo.get_active_id()
+        if not path or not self.repository:
+            return
+        if delete:
+            dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                       buttons=Gtk.ButtonsType.OK_CANCEL, text=f"确定以删除解决 {path} 的冲突？")
+            response = dialog.run()
+            dialog.destroy()
+            if response != Gtk.ResponseType.OK:
+                return
+        repo = self.repository
+        self.run_background("正在记录冲突解决结果…", lambda: repo.resolve_merge_file(path, delete), "冲突已处理。")
+
+    def on_complete_merge(self, _button) -> None:
+        if self.repository:
+            self.run_background("正在完成合并…", self.repository.complete_merge, "合并已完成。")
+
+    def on_abort_merge(self, _button) -> None:
         if not self.repository:
+            return
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                   buttons=Gtk.ButtonsType.OK_CANCEL, text="取消合并并丢弃本次冲突解决内容？")
+        response = dialog.run()
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            self.run_background("正在取消合并…", self.repository.abort_merge, "合并已取消。")
+
+    def on_delete_merged_branch(self, _button) -> None:
+        if not self.repository or self.busy:
+            return
+        name = self._choose_development_branch("删除已合入 main 的开发分支")
+        if not name:
+            return
+        repo = self.repository
+        dialog = Gtk.Dialog(title=f"删除已合并分支 {name}", transient_for=self, modal=True)
+        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "查看删除清单", Gtk.ResponseType.OK)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=16)
+        cleanup = Gtk.CheckButton(label="同时清理此分支前缀的预发布标签（默认保留归档）")
+        remote = Gtk.CheckButton(label="同时删除 origin 分支；勾选清理时也删除远程对应标签")
+        remote.set_sensitive(bool(repo.remote_url()))
+        content.pack_start(cleanup, False, False, 0)
+        content.pack_start(remote, False, False, 0)
+        content.pack_start(Gtk.Label(label="不会删除正式基线或 main。远程删除前必须先上传合并后的 main。"), False, False, 0)
+        dialog.get_content_area().add(content)
+        dialog.show_all()
+        response = dialog.run()
+        cleanup_tags, delete_remote = cleanup.get_active(), remote.get_active()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        # Build the exact deletion list in the worker; approval happens after it is available.
+        self.run_background(
+            "正在检查删除清单…", lambda: repo.plan_branch_deletion(name, cleanup_tags, delete_remote),
+            "删除清单已就绪。", deletion_preview=True,
+        )
+
+    def _confirm_branch_deletion(self, plan: BranchDeletionPlan) -> None:
+        if not self.repository:
+            return
+        rows = []
+        for side, refs in (("本地", plan.local_refs), ("origin", plan.remote_refs)):
+            for ref, _oid in refs:
+                if ref == f"refs/heads/{plan.name}" or (plan.cleanup_tags and self.repository._owned_ref(ref, plan.name)):
+                    rows.append(side + " · " + (ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else display_version(ref[len("refs/tags/"):])) )
+        dialog = Gtk.Dialog(title="确认删除以下分支和标签", transient_for=self, modal=True)
+        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "确认删除", Gtk.ResponseType.OK)
+        dialog.set_default_size(650, 400)
+        text = Gtk.TextView(editable=False, monospace=True)
+        text.get_buffer().set_text("\n".join(rows) + ("\n\n预发布标签保留归档。" if not plan.cleanup_tags else ""))
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(text)
+        dialog.get_content_area().pack_start(scroll, True, True, 12)
+        dialog.show_all()
+        response = dialog.run()
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            repo = self.repository
+            self.run_background("正在删除已合并分支…", lambda: repo.delete_merged_branch(
+                plan.name, plan.cleanup_tags, plan.delete_remote, expected=plan,
+            ), "分支已删除。")
+
+    def on_history_scope_changed(self, _combo) -> None:
+        if not self.updating_history_scope and not self.busy:
+            self.refresh(update_remote=False)
+
+    def refresh(self, check_remote: bool = True, update_remote: bool = True) -> None:
+        if not self.repository:
+            self._refresh_branch_choices()
             self.history_entries = []
             self.history_store.clear()
             self.change_store.clear()
@@ -2525,11 +3495,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.status_label.set_text("尚无版本")
             return
         try:
+            self._refresh_branch_choices()
             changes = self.repository.status()
-            self.history_entries = self.repository.history()
+            self.history_entries = self.repository.history(all_versions=self.history_scope_combo.get_active_id() == "all")
             self.history_store.clear()
             for entry in self.history_entries:
-                version = ", ".join(entry.tags)
+                version = ", ".join(display_version(tag) for tag in entry.tags)
                 self.history_store.append(
                     [version, entry.date, entry.subject, entry.short_commit, entry.commit]
                 )
@@ -2539,17 +3510,24 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
             branch = self.repository.current_branch()
             if branch:
+                self.repository.remember_working_branch()
                 self.info_mode = ""
                 self.info_bar.hide()
-                self.save_button.set_sensitive(True)
+                self.save_button.set_sensitive(not self.repository.merge_state().active)
+                self.save_button.set_label("发布正式版本" if branch == "main" else "发布预发布版本")
+                self.save_button.set_tooltip_text(
+                    "创建全仓库正式标签，例如 v0.3.1"
+                    if branch == "main" else f"创建仅属于 {branch} 的预发布标签，例如 {branch}/v0.3.1-beta.1"
+                )
                 branch_label = branch
             else:
                 self.info_mode = "detached"
                 label = html.escape(self.repository.head_label())
                 self.info_label.set_markup(
-                    f"<b>当前正在查看历史版本 {label}</b>  发布版本已禁用，返回 main 不会强制覆盖文件。"
+                    f"<b>当前正在查看历史版本 {label}</b>  发布版本已禁用，请返回工作分支或新建分支。"
                 )
-                self.info_action_button.set_label("返回 main")
+                previous = self.repository.last_working_branch()
+                self.info_action_button.set_label(f"返回 {previous}" if previous else "选择工作分支")
                 self.info_bar.show_all()
                 self.save_button.set_sensitive(False)
                 branch_label = f"历史版本 {self.repository.head_label()}"
@@ -2567,6 +3545,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.delete_button.set_sensitive(has_versions)
             self.changelog_button.set_sensitive(True)
             self.download_changelog_button.set_sensitive(True)
+            if not update_remote:
+                return
             if check_remote:
                 self._refresh_remote_status()
             else:
@@ -2778,6 +3758,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def on_refresh(self, _button) -> None:
         self.remote_sync_error = None
         self.refresh()
+        self.on_refresh_remote_branches(None)
 
     def on_about(self, _button) -> None:
         dialog = Gtk.AboutDialog(transient_for=self, modal=True)
@@ -3210,19 +4191,21 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         return label
 
     def _confirm_sync_direction(self, direction: str, status: RemoteSyncStatus) -> bool:
+        branch_name = self.repository.current_branch() if self.repository else "当前"
+        release_kind = "main 的正式标签" if branch_name == "main" else f"{branch_name} 的预发布标签"
         if direction == "local":
-            title = "确认以远程覆盖本地分支和版本标签？"
+            title = f"确认以远程更新 {branch_name} 和所属标签？"
             description = (
-                "当前分支和软件管理的版本标签将变为远程状态。"
+                f"当前分支和{release_kind}将变为 origin/{branch_name} 的状态。"
                 "本地独有提交和标签会保存在恢复点；未提交修改和未跟踪文件会先保存，"
                 "完成后可恢复。会把可能被远程目标覆盖的被忽略文件移到恢复点。其他分支及非版本标签不变。"
             )
             action = "以远程为准，更新本地"
             differences = status.local_changes
         else:
-            title = "确认以本地覆盖远程分支和版本标签？"
+            title = f"确认以本地更新 origin/{branch_name} 和所属标签？"
             description = (
-                "远程当前分支及软件管理的版本标签将变为本地状态。"
+                f"origin/{branch_name} 及其所属标签将变为本地状态。"
                 "远程旧引用会先下载并保存在本机恢复点；远程协作者可能需要重新同步。"
                 "其他分支及非版本标签不变。"
             )
@@ -3343,17 +4326,19 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             return
         if not self.repository:
             return
-        try:
-            self.repository.switch_main()
-            self.refresh()
-        except GitError as error:
-            self.show_error("Git 为保护当前文件而停止切换：\n\n" + str(error))
+        repo = self.repository
+        previous = repo.last_working_branch()
+        if not previous or not any(branch.name == previous for branch in repo.local_branches()):
+            self.branch_combo.grab_focus()
+            self.branch_combo.popup()
+            return
+        self.run_background("正在返回工作分支…", lambda: repo.switch_branch(previous), "已返回工作分支。")
 
     def on_save_version(self, _button) -> None:
         if not self.repository:
             return
         repository = self.repository
-        metadata = self.prompt_version_metadata(self.repository.next_version())
+        metadata = self.prompt_version_metadata(display_version(self.repository.next_version()))
         if not metadata:
             return
         version, message, sync_version = metadata
@@ -3459,7 +4444,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         return selected
 
     def prompt_version_metadata(self, default_version: str):
-        dialog = Gtk.Dialog(title="发布版本", transient_for=self, modal=True)
+        title = "发布正式版本" if self.repository and self.repository.current_branch() == "main" else "发布预发布版本"
+        dialog = Gtk.Dialog(title=title, transient_for=self, modal=True)
         dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "继续", Gtk.ResponseType.OK)
         dialog.set_default_size(720, 500)
         dialog.set_size_request(560, 360)
@@ -3483,6 +4469,10 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         version_entry.connect("changed", load_changes)
         load_changes(version_entry)
         content.pack_start(version_row, False, False, 0)
+        content.pack_start(Gtk.Label(
+            label="main 发布正式版；开发分支发布带分支名的 beta 版本。Git 网站的标签页仍展示全仓库标签。",
+            xalign=0, wrap=True,
+        ), False, False, 0)
         content.pack_start(
             Gtk.Label(label="改动内容（每行一条）", xalign=0), False, False, 0
         )
@@ -3566,23 +4556,27 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if len(selected) != 1:
             self.show_error("请在版本历史中选择一个需要修改说明的版本。")
             return
-        versions = [tag for tag in selected[0].tags if VERSION_PATTERN.match(tag)]
+        if selected[0].read_only:
+            self.show_error("所选版本是继承的正式版本或属于其他分支，只能比较和导出。")
+            return
+        versions = [tag for tag in selected[0].tags if parse_version_tag(tag)]
         if len(versions) != 1:
             self.show_error("所选记录没有唯一的版本标签，无法修改说明。")
             return
         version = versions[0]
+        label = display_version(version)
         try:
             current_message = self.repository.version_message(version)
         except GitError as error:
             self.show_error(str(error))
             return
-        message = self.prompt_version_message(version, current_message)
+        message = self.prompt_version_message(label, current_message)
         if message is None:
             return
         self.run_background(
             "正在更新修改说明...",
             lambda: self.repository.update_version_message(version, message),
-            f"版本 {version} 的修改说明已更新。",
+            f"版本 {label} 的修改说明已更新。",
         )
 
     def on_compare_versions(self, _button) -> None:
@@ -3619,7 +4613,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.show_error("请在版本历史中选择一个需要下载的版本。")
             return
         entry = selected[0]
-        version_name = entry.tags[0] if entry.tags else entry.short_commit
+        version_name = reference_folder_name(display_version(entry.tags[0]), "version") if entry.tags else entry.short_commit
         default_name = f"{self.workspace_path.name}_{version_name}.zip"
         dialog = Gtk.FileChooserDialog(
             title="下载版本",
@@ -3647,18 +4641,22 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.show_error("请在版本历史中选择一个需要删除的版本。")
             return
         entry = selected[0]
-        versions = [tag for tag in entry.tags if VERSION_PATTERN.match(tag)]
+        if entry.read_only:
+            self.show_error("所选版本是继承的正式版本或属于其他分支，不能在当前分支删除。")
+            return
+        versions = [tag for tag in entry.tags if parse_version_tag(tag)]
         if len(versions) != 1:
             self.show_error("所选记录没有唯一的版本标签，无法删除。")
             return
         version = versions[0]
+        label = display_version(version)
 
         dialog = Gtk.MessageDialog(
             transient_for=self,
             modal=True,
             message_type=Gtk.MessageType.WARNING,
             buttons=Gtk.ButtonsType.NONE,
-            text=f"确定删除版本 {version}？",
+            text=f"确定删除版本 {label}？",
         )
         dialog.format_secondary_text(
             "“仅删除版本”保留 Git 提交。\n"
@@ -3673,16 +4671,17 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             "删除版本及提交", DELETE_COMMIT_RESPONSE
         )
         delete_commit_button.get_style_context().add_class("destructive-action")
+        delete_commit_button.set_sensitive(self.repository.current_branch() == "main" and VERSION_PATTERN.fullmatch(version) is not None)
         response = dialog.run()
         dialog.destroy()
         if response == DELETE_TAG_RESPONSE:
             operation = lambda: self.repository.delete_version(version)
             busy = "正在删除版本..."
-            success = f"版本 {version} 已删除，Git 提交已保留。"
+            success = f"版本 {label} 已删除，Git 提交已保留。"
         elif response == DELETE_COMMIT_RESPONSE:
             operation = lambda: self.repository.delete_latest_version_commit(version)
             busy = "正在删除版本及提交..."
-            success = f"版本 {version} 及其 Git 提交已删除，当前文件和原有暂存内容已保留。"
+            success = f"版本 {label} 及其 Git 提交已删除，当前文件和原有暂存内容已保留。"
         else:
             return
         self.run_background(busy, operation, success)
@@ -3760,15 +4759,18 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def run_background(
         self, busy: str, operation, success: str, reload_workspace: bool = False,
-        show_result: bool = False, remote_sync: bool = False,
+        show_result: bool = False, remote_sync: bool = False, deletion_preview: bool = False,
     ) -> None:
         if self.busy:
             return
         self.busy = True
+        self.branch_generation += 1
         self._invalidate_remote_status()
         self._set_remote_status(RemoteSyncStatus("checking", "操作进行中，完成后重新检查远程状态。"))
         self.header.set_sensitive(False)
         self.toolbar.set_sensitive(False)
+        self.branch_bar.set_sensitive(False)
+        self.merge_bar.set_sensitive(False)
         self.notebook.set_sensitive(False)
         self.info_action_button.set_sensitive(False)
         self.status_label.set_text(busy)
@@ -3787,7 +4789,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             try:
                 result = operation()
                 message = result if isinstance(result, str) and result else success
-                if show_result:
+                if deletion_preview:
+                    GLib.idle_add(self._background_deletion_ready, result)
+                elif show_result:
                     GLib.idle_add(self._background_complete, message, reload_workspace, True)
                 else:
                     GLib.idle_add(self._background_complete, message, reload_workspace)
@@ -3798,6 +4802,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                     GLib.idle_add(self._background_failed, str(error))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _background_deletion_ready(self, plan: BranchDeletionPlan) -> bool:
+        self._end_background()
+        self.refresh()
+        self._confirm_branch_deletion(plan)
+        return False
 
     def _background_complete(
         self, message: str, reload_workspace: bool = False, show_result: bool = False
@@ -3860,6 +4870,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.background_timer = None
         self.header.set_sensitive(True)
         self.toolbar.set_sensitive(True)
+        self.branch_bar.set_sensitive(True)
+        self.merge_bar.set_sensitive(True)
         self.notebook.set_sensitive(True)
         self.info_action_button.set_sensitive(True)
 
