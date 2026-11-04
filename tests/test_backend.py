@@ -740,6 +740,18 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.GitError, "beta.0.0.序号"):
             self.repository.save_version("test1/v0.2.0-beta.1", "legacy format", ["robot.txt"])
 
+    def test_development_branch_can_only_be_created_from_main(self):
+        self.repository.create_branch("feature")
+        with self.assertRaisesRegex(MODULE.GitError, "只能在当前检出的 main"):
+            self.repository.create_branch("nested-feature")
+        self.assertNotIn("refs/heads/nested-feature", self.repository._local_refs())
+
+        self.repository.switch_branch("main")
+        self.git(self.path, "checkout", "-q", "v0.2.0")
+        with self.assertRaisesRegex(MODULE.GitError, "只能在当前检出的 main"):
+            self.repository.create_branch("detached-feature")
+        self.assertNotIn("refs/heads/detached-feature", self.repository._local_refs())
+
     def test_preview_sequence_sorts_numerically_and_reads_legacy_labels(self):
         self.repository.create_branch("test1")
         self.repository.save_version(
@@ -779,6 +791,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.save_version("v0.3.0", "new formal", ["robot.txt"])
         self.repository.switch_branch("test1")
         self.assertEqual("branches/test1/v0.2.0-beta.0.0.11", self.repository.next_version())
+        self.repository.switch_branch("main")
         self.repository.create_branch("test2")
         self.assertEqual("branches/test2/v0.3.0-beta.0.0.1", self.repository.next_version())
 
@@ -844,12 +857,55 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.GitError, "main 分支不能删除"):
             repo.plan_branch_deletion("main")
 
-    def test_delete_branch_rejects_dirty_worktree_and_other_worktree_use(self):
+    def test_delete_noncurrent_branch_preserves_dirty_worktree_and_switch_stays_blocked(self):
         repo = self.repository
         repo.create_branch("test1")
+        (self.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+        beta_name = "test1/v0.2.0-beta.0.0.1"
+        repo.save_version(beta_name, "feature", ["feature.txt"])
+        beta = MODULE.canonical_version(beta_name)
+        manifest = repo.metadata_path / MODULE.MANIFEST_DIRECTORY / f"{beta}{MODULE.MANIFEST_SUFFIX}"
+        self.assertTrue(manifest.is_file())
+        repo.switch_branch("main")
+
+        repo.create_branch("switch-target")
+        repo.switch_branch("main")
+        (self.path / "robot.txt").write_text("staged\n", encoding="utf-8")
+        repo.run(["add", "robot.txt"])
+        (self.path / "robot.txt").write_text("unstaged\n", encoding="utf-8")
+        (self.path / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+        status_before = repo.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        with self.assertRaisesRegex(MODULE.GitError, "工作区有尚未发布的修改"):
+            repo.switch_branch("switch-target")
+        self.assertEqual("main", repo.current_branch())
+
+        plan = repo.plan_branch_deletion("test1")
+        self.assertEqual("test1", plan.name)
+        result = repo.delete_branch("test1", expected=plan)
+        self.assertIn("恢复点", result)
+        self.assertEqual("main", repo.current_branch())
+        self.assertEqual("staged\n", repo.run(["show", ":robot.txt"]))
+        self.assertEqual("unstaged\n", (self.path / "robot.txt").read_text(encoding="utf-8"))
+        self.assertEqual("untracked\n", (self.path / "untracked.txt").read_text(encoding="utf-8"))
+        self.assertEqual(status_before, repo.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]))
+        self.assertNotIn("refs/heads/test1", repo._local_refs())
+        self.assertNotIn(beta, repo.tags())
+        self.assertFalse(manifest.exists())
+        self.assertTrue(any(path.name == manifest.name for path in (repo.metadata_path / "recovery").rglob("*.manifest")))
+        self.assertTrue(repo.run(["for-each-ref", "--format=%(refname)", "refs/code-version-manager/recovery/"]).strip())
+
+    def test_delete_current_branch_requires_clean_worktree_and_other_worktree_use_is_blocked(self):
+        repo = self.repository
+        repo.create_branch("test1")
+        repo.switch_branch("test1")
         (self.path / "robot.txt").write_text("dirty\n", encoding="utf-8")
         with self.assertRaisesRegex(MODULE.GitError, "工作区有尚未发布的修改"):
             repo.plan_branch_deletion("test1")
+        with self.assertRaisesRegex(MODULE.GitError, "工作区有尚未发布的修改"):
+            repo.delete_branch("test1")
+        self.assertEqual("test1", repo.current_branch())
+        self.assertIn("refs/heads/test1", repo._local_refs())
+
         (self.path / "robot.txt").write_text("base\n", encoding="utf-8")
         repo.switch_branch("main")
         worktree = self.root / "other-worktree"
@@ -2255,6 +2311,7 @@ class BranchPresentationTest(unittest.TestCase):
         window.remote_branch_url = "local-origin"
         window.remote_branch_choices = [MODULE.BranchInfo("main", "remote", "origin-oid")]
         window._refresh_branch_choices()
+        self.assertTrue(window.new_branch_button.get_sensitive())
         rows = {row[0]: list(row) for row in window.branch_model}
         self.assertEqual(2, len(rows))
         self.assertEqual("branch:main", window.branch_combo.get_active_id())
@@ -2276,10 +2333,25 @@ class BranchPresentationTest(unittest.TestCase):
             MODULE.BranchInfo("feature", "local", "feature-oid", True),
         ]
         window._refresh_branch_choices()
+        self.assertFalse(window.new_branch_button.get_sensitive())
         rows = {row[0]: list(row) for row in window.branch_model}
         self.assertEqual("branch:feature", window.branch_combo.get_active_id())
         self.assertTrue(rows["branch:feature"][3])
         self.assertFalse(rows["branch:main"][3])
+
+    def test_delete_branch_selection_starts_backend_delete_without_confirmation(self):
+        window = mock.Mock()
+        window.repository = mock.Mock()
+        window.busy = False
+        window._choose_development_branch.return_value = "retreat_teb"
+
+        MODULE.VersionManagerWindow.on_delete_branch(window, None)
+
+        busy, operation, success = window.run_background.call_args.args
+        self.assertEqual("正在删除分支…", busy)
+        self.assertEqual("分支已删除。", success)
+        operation()
+        window.repository.delete_branch.assert_called_once_with("retreat_teb")
 
     def test_inherited_formal_release_is_marked_read_only(self):
         temp = tempfile.TemporaryDirectory()

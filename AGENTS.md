@@ -6,7 +6,7 @@
 
 | 路径 | 职责 |
 | --- | --- |
-| `src/code_version_manager.py` | Git 数据模型、GitRepository、GTK 界面和应用入口 |
+| `src/code_version_manager.py` | 版本标签解析、数据类型、GitRepository 后端、GTK 界面和应用入口；Git 操作与界面有意集中于单文件 |
 | `tests/test_backend.py` | Git 后端、发布、同步、恢复和 GTK 回归测试 |
 | `tests/test_workflow.py` | 临时工作仓库与 bare origin 的完整流程测试 |
 | `tests/test_merge_comparison.py` | 手动合并隔离副本、忽略规则、提交及取消测试 |
@@ -23,7 +23,7 @@
 ## 分支、标签与发布
 
 1. main 发布正式版本，例如 `v0.0.3`。
-2. 新建开发分支时选择 main 的正式标签，基线固定不随 main 后续发布改变。
+2. 只能从当前检出的 main 新建开发分支，并选择 main 历史中的正式标签；基线固定不随 main 后续发布改变。切换与新建要求工作区干净。
 3. 开发分支发布自己的 beta，例如 `branch1/v0.0.3-beta.0.0.1`。合并只采用最新已发布 beta；来源分支有未发布提交时必须先发 beta。
 4. 手动合并完成后由用户另行发布 main 正式版本。合并本身不发布、不打标签、不更新 VERSION。
 
@@ -54,9 +54,10 @@
 
 ## 分支删除
 
-- “删除分支”列出所有本地非 main 分支，不要求已合入或已正式发布。确认会删除所选分支及所属 beta 标签，不删除 main、正式标签或远程引用。
-- 删除前要求工作区干净、检查引用快照并建立本地恢复点。当前分支可删除：先检查 main 可安全检出，再切换到 main 后删除。其他 worktree 正在使用的分支不能删除。
-- 失败时保留恢复点；远程删除由后续整仓同步传播。使用 `plan_branch_deletion()` 生成确认快照，`delete_branch()` 重新校验后执行。
+- “删除分支”只列出本地非 main 分支。选择目标后直接在后台删除，不再弹出清单确认框；不要求已合入或已发布，并删除该分支及所属 beta 标签，不删除 main、正式标签或远程引用。
+- 删除非当前分支不要求工作区干净，不切换分支，也不改动当前工作区、index 或未跟踪文件。main 有本地修改时仍可删除未检出的开发分支。
+- 删除当前检出的分支时，必须先检查工作区干净、main 可安全切换，再切到 main 后删除。其他 worktree 正在使用目标分支时仍拒绝删除。
+- `plan_branch_deletion()` 校验分支和引用快照；`delete_branch()` 保留旧引用与元数据恢复点，并用旧 OID 校验批量删除。失败保留恢复资料；远程删除由后续整仓同步传播。
 
 ## 整仓同步
 
@@ -79,7 +80,7 @@
 
 - `code-version-manager/versions/` 存放按完整标签名分层的 manifest；内部 CHANGELOG 从标签说明生成；`recovery/` 保存配置、版本清单、引用恢复点和同步资料。
 - `run()` / `run_bytes()` 使用 `git -C <目录>` 和参数列表。业务错误用具体中文 `GitError`，不把 traceback 展示为用户提示，不拼接不可信 shell 命令。
-- 远程读取、发布、切换、合并、同步及删除预检都在后台线程运行；工作线程不得操作 GTK，通过 `GLib.idle_add` 回主线程。
+- 远程读取、发布、切换、合并、同步及分支删除都在后台线程运行；工作线程不得操作 GTK，通过 `GLib.idle_add` 回主线程。新建分支按钮只在当前分支为 main 时启用，后端 `create_branch()` 也独立校验。
 - branch generation、remote status generation、仓库实例和操作快照共同防止旧后台结果覆盖当前状态。刷新优先通过统一状态机重建 UI。
 - 本地与 origin 同名分支合成一行；当前分支以绿色标识，不在标签文字添加“当前”。
 

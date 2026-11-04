@@ -1563,6 +1563,8 @@ class GitRepository:
         return base
 
     def create_branch(self, name: str, base_version: Optional[str] = None) -> str:
+        if self.current_branch() != "main":
+            raise GitError("只能在当前检出的 main 分支上新建开发分支。")
         self._validate_branch_name(name)
         if name == "main" or any(branch.name == name for branch in self.local_branches()):
             raise GitError(f"本地分支 {name} 已存在或是保留名称。")
@@ -2247,7 +2249,7 @@ class GitRepository:
         self._validate_branch_name(name)
         if name == "main":
             raise GitError("main 分支不能删除。")
-        self._assert_clean()
+        self._assert_no_operation()
         self._assert_branch_not_in_other_worktree(name)
         refs = self._local_refs()
         if f"refs/heads/{name}" not in refs:
@@ -2281,7 +2283,7 @@ class GitRepository:
         if switched:
             self.run(["switch", "--no-guess", "--no-overwrite-ignore", "--", "main"])
         try:
-            self._assert_clean()
+            self._assert_no_operation()
             self._assert_branch_not_in_other_worktree(name)
             if self.current_branch() == name:
                 raise GitError("删除前当前分支发生变化，请重新确认。")
@@ -3753,7 +3755,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             state = repo.merge_state()
             self.branch_bar.set_sensitive(not self.busy and not state.active)
             has_head = bool(repo.run(["rev-parse", "--verify", "HEAD"], check=False).strip())
-            self.new_branch_button.set_sensitive(has_head)
+            self.new_branch_button.set_sensitive(has_head and repo.current_branch() == "main")
             self.merge_button.set_sensitive(any(branch.name == "main" for branch in branches) and len(branches) > 1)
             self.delete_branch_button.set_sensitive(any(branch.name != "main" for branch in branches))
             self.branch_status_label.set_text("main 发正式版；开发分支发自己的预发布版")
@@ -3953,33 +3955,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         name = self._choose_development_branch("删除分支")
         if name:
             repo = self.repository
-            self.run_background("正在检查分支与 beta 标签清理清单…",
-                                lambda: repo.plan_branch_deletion(name), "删除清单已就绪。", deletion_preview=True)
-
-    def _confirm_branch_deletion(self, plan: BranchDeletionPlan) -> None:
-        if not self.repository:
-            return
-        rows = []
-        for ref, _oid in plan.local_refs:
-            if ref == f"refs/heads/{plan.name}" or self.repository._owned_ref(ref, plan.name):
-                label = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else display_version(ref[len("refs/tags/"):])
-                rows.append("本地 · " + label)
-        dialog = Gtk.Dialog(title="删除分支", transient_for=self, modal=True)
-        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "确认删除", Gtk.ResponseType.OK)
-        dialog.set_default_size(650, 400)
-        text = Gtk.TextView(editable=False, monospace=True)
-        text.get_buffer().set_text("\n".join(rows) + "\n\n删除上述本地分支及其全部 beta 标签，包括尚未合入 main 的提交。main 不会被删除；下次整仓同步远程时传播删除。")
-        scroll = Gtk.ScrolledWindow()
-        scroll.add(text)
-        dialog.get_content_area().pack_start(scroll, True, True, 12)
-        dialog.show_all()
-        response = dialog.run()
-        dialog.destroy()
-        if response == Gtk.ResponseType.OK:
-            repo = self.repository
-            self.run_background("正在删除分支…", lambda: repo.delete_branch(
-                plan.name, expected=plan,
-            ), "分支已删除。")
+            self.run_background("正在删除分支…", lambda: repo.delete_branch(name), "分支已删除。")
 
     def on_history_scope_changed(self, _combo) -> None:
         if not self.updating_history_scope and not self.busy:
@@ -5279,7 +5255,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def run_background(
         self, busy: str, operation, success: str, reload_workspace: bool = False,
-        show_result: bool = False, remote_sync: bool = False, deletion_preview: bool = False,
+        show_result: bool = False, remote_sync: bool = False,
         merge_preview: bool = False, result_callback=None,
     ) -> None:
         if self.busy:
@@ -5314,8 +5290,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                     GLib.idle_add(result_callback, result)
                 elif merge_preview:
                     GLib.idle_add(self._background_merge_ready, result)
-                elif deletion_preview:
-                    GLib.idle_add(self._background_deletion_ready, result)
                 elif show_result:
                     GLib.idle_add(self._background_complete, message, reload_workspace, True)
                 else:
@@ -5327,12 +5301,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                     GLib.idle_add(self._background_failed, str(error))
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def _background_deletion_ready(self, plan: BranchDeletionPlan) -> bool:
-        self._end_background()
-        self.refresh()
-        self._confirm_branch_deletion(plan)
-        return False
 
     def _background_complete(
         self, message: str, reload_workspace: bool = False, show_result: bool = False
