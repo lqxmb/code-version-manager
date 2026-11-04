@@ -64,6 +64,8 @@ DELETE_COMMIT_RESPONSE = 2
 REMOTE_TIMEOUT = 120
 PUSH_TIMEOUT = 900
 MAX_PUSH_TIMEOUT = 3600
+GIT_DEFAULTS_SECTION = "git_defaults"
+GITHUB_ACCOUNT_PLACEHOLDER = "<你的GitHub账号>"
 DEFAULT_EXCLUDED_DIRECTORIES = {
     ".git",
     ".cache",
@@ -409,6 +411,94 @@ def _read_settings(config_file: Path) -> configparser.ConfigParser:
     except (OSError, configparser.Error):
         pass
     return parser
+
+
+def validate_github_account(value: str) -> str:
+    """Validate a GitHub user or organization name used in SSH examples."""
+    value = value.strip()
+    if not value:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", value):
+        raise GitError("GitHub 账号或组织名只能包含字母、数字和连字符，且长度不超过 39 个字符。")
+    return value
+
+
+def git_default_settings(
+    config_file: Optional[Path] = None,
+) -> Tuple[str, str, str]:
+    """Return the saved GitHub account, default name, and default email."""
+    parser = _read_settings(config_file or settings_file_path())
+    account = parser.get(GIT_DEFAULTS_SECTION, "github_account", fallback="").strip()
+    try:
+        account = validate_github_account(account)
+    except GitError:
+        account = ""
+    name = parser.get(GIT_DEFAULTS_SECTION, "user_name", fallback="").strip()
+    email = parser.get(GIT_DEFAULTS_SECTION, "user_email", fallback="").strip()
+    if any(ord(char) < 32 for char in name + email):
+        name = ""
+        email = ""
+    return account, name, email
+
+
+def save_git_default_settings(
+    account: str,
+    name: str,
+    email: str,
+    config_file: Optional[Path] = None,
+) -> Tuple[str, str, str]:
+    """Persist application-level Git defaults while preserving other settings."""
+    config_file = config_file or settings_file_path()
+    account = validate_github_account(account)
+    name = name.strip()
+    email = email.strip()
+    if any(ord(char) < 32 for char in name + email):
+        raise GitError("默认提交姓名和邮箱不能包含换行或控制字符。")
+    parser = _read_settings(config_file)
+    parser[GIT_DEFAULTS_SECTION] = {
+        "github_account": account,
+        "user_name": name,
+        "user_email": email,
+    }
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    with config_file.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    return account, name, email
+
+
+def _effective_git_config_value(
+    key: str, repository: Optional["GitRepository"] = None,
+) -> str:
+    if repository is not None:
+        return repository.run(["config", key], check=False).strip()
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", key],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def effective_git_identity(
+    repository: Optional["GitRepository"] = None,
+    config_file: Optional[Path] = None,
+) -> Tuple[str, str]:
+    """Resolve defaults first, then Git's effective identity and local fallback."""
+    _account, configured_name, configured_email = git_default_settings(config_file)
+    name = configured_name or _effective_git_config_value("user.name", repository)
+    email = configured_email or _effective_git_config_value("user.email", repository)
+    user = os.environ.get("USER", "user")
+    return name or os.environ.get("USER", "Local User"), email or f"{user}@localhost"
+
+
+def github_ssh_example(account: str, repository_name: str) -> str:
+    account = validate_github_account(account) or GITHUB_ACCOUNT_PLACEHOLDER
+    return f"git@github.com:{account}/{repository_name}.git"
 
 
 def recent_workspaces(config_file: Optional[Path] = None) -> List[Path]:
@@ -3089,12 +3179,12 @@ def prepare_bcompare_config(temporary_root: Path, *, merge_review: bool = False)
     return config_home
 
 
-def ensure_git_identity(repository: GitRepository) -> None:
-    if not repository.run(["config", "user.name"], check=False).strip():
-        repository.run(["config", "user.name", os.environ.get("USER", "Local User")])
-    if not repository.run(["config", "user.email"], check=False).strip():
-        user = os.environ.get("USER", "user")
-        repository.run(["config", "user.email", f"{user}@localhost"])
+def ensure_git_identity(
+    repository: GitRepository, config_file: Optional[Path] = None,
+) -> None:
+    name, email = effective_git_identity(repository, config_file)
+    repository.run(["config", "user.name", name])
+    repository.run(["config", "user.email", email])
 
 
 def create_repository(path: Path) -> GitRepository:
@@ -3114,12 +3204,13 @@ def create_repository(path: Path) -> GitRepository:
 
 def initialize_repository(
     path: Path, version: str, message: str, selected_files: Sequence[str],
+    config_file: Optional[Path] = None,
 ) -> GitRepository:
     selected = validate_selected_files(path.expanduser().resolve(), selected_files)
     if not selected:
         raise GitError("至少选择一个需要封装的文件。")
     repository = create_repository(path)
-    ensure_git_identity(repository)
+    ensure_git_identity(repository, config_file)
     repository.save_version(
         version, message, selected,
     )
@@ -4272,43 +4363,68 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.destroy()
 
     def on_settings(self, _button) -> None:
-        if not self.repository:
-            self.show_error("请先启用版本管理，再修改工作空间设置。")
-            return
         try:
-            configured_tool = self.repository.compare_tool()
+            configured_tool = self.repository.compare_tool() if self.repository else DEFAULT_COMPARE_TOOL
         except GitError:
             configured_tool = DEFAULT_COMPARE_TOOL
+        account, configured_name, configured_email = git_default_settings()
+        current_name, current_email = effective_git_identity(self.repository)
         dialog = Gtk.Dialog(title="设置", transient_for=self, modal=True)
         dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "保存", Gtk.ResponseType.OK)
-        dialog.set_default_size(560, 360)
+        dialog.set_default_size(620, 520)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin=20)
-        title = Gtk.Label(label="工作空间设置", xalign=0)
+        title = Gtk.Label(label="应用与工作空间设置", xalign=0)
         title.get_style_context().add_class("dialog-title")
         content.pack_start(title, False, False, 0)
         description = Gtk.Label(
-            label="设置当前工作空间的对比工具。VERSION 只在 main 发布正式版时自动更新，开发分支保留继承的正式号。",
+            label=(
+                "GitHub 账号、提交姓名和邮箱作为新工作空间启用版本管理时的默认值；"
+                "已有仓库的 origin 和提交身份不会被修改。\n"
+                "留空的身份字段沿用当前有效 Git 配置，仍未配置时使用本机默认身份。"
+            ),
             xalign=0,
         )
         description.set_line_wrap(True)
-        description.set_max_width_chars(60)
+        description.set_max_width_chars(72)
         content.pack_start(description, False, False, 0)
         grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        account_entry = Gtk.Entry(text=account)
+        account_entry.set_placeholder_text("GitHub 用户名或组织名")
+        account_entry.set_hexpand(True)
+        grid.attach(Gtk.Label(label="GitHub 账号", xalign=0), 0, 0, 1, 1)
+        grid.attach(account_entry, 1, 0, 1, 1)
+        account_note = Gtk.Label(
+            label="仅用于未设置 origin 的工作空间显示 SSH 地址示例。",
+            xalign=0,
+        )
+        account_note.set_line_wrap(True)
+        account_note.set_max_width_chars(60)
+        grid.attach(account_note, 0, 1, 2, 1)
+        name_entry = Gtk.Entry(text=configured_name)
+        name_entry.set_placeholder_text(f"未设置时使用当前 Git：{current_name}")
+        name_entry.set_hexpand(True)
+        grid.attach(Gtk.Label(label="默认提交姓名", xalign=0), 0, 2, 1, 1)
+        grid.attach(name_entry, 1, 2, 1, 1)
+        email_entry = Gtk.Entry(text=configured_email)
+        email_entry.set_placeholder_text(f"未设置时使用当前 Git：{current_email}")
+        email_entry.set_hexpand(True)
+        grid.attach(Gtk.Label(label="默认提交邮箱", xalign=0), 0, 3, 1, 1)
+        grid.attach(email_entry, 1, 3, 1, 1)
         combo = Gtk.ComboBoxText()
         for tool_id, (tool_label, _command) in COMPARE_TOOLS.items():
             combo.append(tool_id, tool_label)
         combo.set_active_id(configured_tool)
         combo.set_hexpand(True)
         combo.set_tooltip_text("选择发布版本比较时使用的图形对比工具")
-        grid.attach(Gtk.Label(label="对比工具", xalign=0), 0, 0, 1, 1)
-        grid.attach(combo, 1, 0, 1, 1)
+        grid.attach(Gtk.Label(label="对比工具", xalign=0), 0, 4, 1, 1)
+        grid.attach(combo, 1, 4, 1, 1)
         note = Gtk.Label(
             label="支持 Beyond Compare、Meld 和 KDiff3。所选工具需要先安装；默认使用 Beyond Compare。",
             xalign=0,
         )
         note.set_line_wrap(True)
         note.set_max_width_chars(60)
-        grid.attach(note, 0, 1, 2, 1)
+        grid.attach(note, 0, 5, 2, 1)
         content.pack_start(grid, False, False, 0)
         content.pack_start(
             Gtk.Label(label=f"当前工作空间：{self.workspace_path}", xalign=0),
@@ -4319,8 +4435,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
             try:
-                self.repository.configure_compare_tool(combo.get_active_id())
-                self.status_label.set_text("工作空间设置已保存")
+                save_git_default_settings(
+                    account_entry.get_text(), name_entry.get_text(), email_entry.get_text(),
+                )
+                if self.repository:
+                    self.repository.configure_compare_tool(combo.get_active_id())
+                    self.status_label.set_text("应用和工作空间设置已保存")
+                else:
+                    self.status_label.set_text("Git 默认设置已保存")
             except (GitError, OSError, ValueError) as error:
                 dialog.destroy()
                 self.show_error(str(error))
@@ -4346,19 +4468,23 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         grid = Gtk.Grid(column_spacing=14, row_spacing=12)
         configured_remote = repository.remote_url() if repository else ""
         suggested_remote = suggested_ssh_remote(configured_remote)
-        remote_placeholder = f"git@github.com:<你的GitHub账号>/{workspace_repository_name(self.workspace_path.name)}.git"
+        configured_account, _configured_name, _configured_email = git_default_settings()
+        remote_placeholder = github_ssh_example(
+            configured_account, workspace_repository_name(self.workspace_path.name),
+        )
+        default_name, default_email = effective_git_identity(repository)
         values = [
             ("SSH 仓库地址", suggested_remote or configured_remote, remote_placeholder),
             (
                 "提交姓名",
                 repository.run(["config", "user.name"], check=False).strip()
-                if repository else os.environ.get("USER", ""),
+                if repository else default_name,
                 "Git 提交作者姓名",
             ),
             (
                 "提交邮箱",
                 repository.run(["config", "user.email"], check=False).strip()
-                if repository else "",
+                if repository else default_email,
                 "name@example.com",
             ),
         ]
@@ -4383,11 +4509,17 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             if suggested_remote != configured_remote.strip():
                 source = "已根据当前工作空间的 GitHub origin 地址转换为 SSH；保存后生效。"
         else:
-            source = (
-                f"SSH 地址示例：{remote_placeholder}\n"
-                "请用仓库所属的账号或组织替换 <你的GitHub账号>，并确认仓库已创建；"
-                "账号无法从本地目录或提交邮箱确定。"
-            )
+            if configured_account:
+                source = (
+                    f"SSH 地址示例：{remote_placeholder}\n"
+                    "示例中的 GitHub 账号来自“设置”，可在那里修改；请确认仓库已创建。"
+                )
+            else:
+                source = (
+                    f"SSH 地址示例：{remote_placeholder}\n"
+                    "请在“设置”中填写仓库所属的 GitHub 账号或组织名，或直接在上方填写完整地址；"
+                    "并确认仓库已创建。"
+                )
         address_hint = Gtk.Label(label=f"当前工作空间：{self.workspace_path}\n{source}", xalign=0)
         address_hint.set_selectable(True)
         address_hint.set_line_wrap(True)

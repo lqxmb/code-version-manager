@@ -670,6 +670,80 @@ class GitRepositoryTest(unittest.TestCase):
             self.assertNotIn("src/obsolete.txt", bundle.namelist())
 
 
+class GitDefaultsTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config_file = self.root / "config" / "settings.ini"
+
+    def test_git_defaults_preserve_other_settings_and_validate_account(self):
+        self.config_file.parent.mkdir(parents=True)
+        self.config_file.write_text("[display]\ncompact = true\n", encoding="utf-8")
+
+        MODULE.save_git_default_settings(
+            "example-org", "Release User", "release@example.com", self.config_file,
+        )
+
+        self.assertEqual(
+            ("example-org", "Release User", "release@example.com"),
+            MODULE.git_default_settings(self.config_file),
+        )
+        parser = MODULE._read_settings(self.config_file)
+        self.assertTrue(parser.getboolean("display", "compact"))
+        with self.assertRaisesRegex(MODULE.GitError, "GitHub 账号"):
+            MODULE.save_git_default_settings("bad/account", "", "", self.config_file)
+
+    def test_ssh_example_uses_configured_account_or_placeholder(self):
+        self.assertEqual(
+            "git@github.com:example-org/m9_ws.git",
+            MODULE.github_ssh_example("example-org", "m9_ws"),
+        )
+        self.assertEqual(
+            "git@github.com:<你的GitHub账号>/m9_ws.git",
+            MODULE.github_ssh_example("", "m9_ws"),
+        )
+
+    def test_new_repository_uses_defaults_and_blank_fields_fall_back(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        (workspace / "file.txt").write_text("content\n", encoding="utf-8")
+        MODULE.save_git_default_settings(
+            "example-org", "Configured User", "configured@example.com", self.config_file,
+        )
+        repository = MODULE.initialize_repository(
+            workspace, "v1.0.0", "initial", ["file.txt"], self.config_file,
+        )
+        self.assertEqual(
+            "Configured User", repository.run(["config", "--local", "user.name"]).strip(),
+        )
+        self.assertEqual(
+            "configured@example.com", repository.run(["config", "--local", "user.email"]).strip(),
+        )
+
+        fallback_workspace = self.root / "fallback-workspace"
+        fallback_workspace.mkdir()
+        fallback_repository = MODULE.create_repository(fallback_workspace)
+        fallback_repository.run(["config", "--local", "user.name", "Existing User"])
+        fallback_repository.run(["config", "--local", "user.email", "existing@example.com"])
+        MODULE.save_git_default_settings("", "Configured Name", "", self.config_file)
+        MODULE.ensure_git_identity(fallback_repository, self.config_file)
+        self.assertEqual(
+            "Configured Name", fallback_repository.run(["config", "--local", "user.name"]).strip(),
+        )
+        self.assertEqual(
+            "existing@example.com", fallback_repository.run(["config", "--local", "user.email"]).strip(),
+        )
+
+    def test_identity_falls_back_to_local_user_when_git_has_no_identity(self):
+        with mock.patch.object(MODULE, "_effective_git_config_value", return_value=""):
+            with mock.patch.dict(MODULE.os.environ, {"USER": "fallback-user"}, clear=False):
+                self.assertEqual(
+                    ("fallback-user", "fallback-user@localhost"),
+                    MODULE.effective_git_identity(config_file=self.config_file),
+                )
+
+
 class BranchReleaseWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
