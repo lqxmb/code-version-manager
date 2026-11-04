@@ -1,7 +1,5 @@
-"""Controlled two-directory merge review, using disposable Git repositories."""
+"""Manual two-directory merge sessions use disposable Git repositories."""
 import json
-import os
-import stat
 import subprocess
 import tempfile
 import unittest
@@ -16,361 +14,208 @@ class MergeComparisonTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.path = self.root / 'workspace'
+        self.path = self.root / "workspace"
         self.path.mkdir()
-        for name, text in (('conflict.txt', 'base\n'), ('same.txt', 'same\n'),
-                           ('main-only.txt', 'base main\n'), ('extra.txt', 'base extra\n'),
-                           ('binary.dat', b'\x00base'), ('hidden.zip', b'zip-bytes')):
-            file = self.path / name
-            file.write_bytes(text if isinstance(text, bytes) else text.encode())
-        self.repo = MODULE.initialize_repository(self.path, 'v0.0.3', 'base',
-                                                ['conflict.txt', 'same.txt', 'main-only.txt', 'extra.txt',
-                                                 'binary.dat', 'hidden.zip'])
-        ignore = self.path / '.gitignore'
-        ignore.write_text(ignore.read_text().replace('*.zip\n', ''))
-        (self.path / '.gitattributes').write_text('same.txt export-ignore\n')
-        self.repo.run(['add', '.gitignore', 'hidden.zip', '.gitattributes'])
-        self.repo.run(['commit', '--amend', '--no-edit'])
-        self.repo.run(['tag', '-f', '-a', 'v0.0.3', '-m', 'base with tracked archive'])
-        self.repo.create_branch('branch1', 'v0.0.3')
-        (self.path / 'conflict.txt').write_text('branch\n')
-        (self.path / 'added.txt').write_text('auto added\n')
-        (self.path / 'binary.dat').write_bytes(b'\x00next')
-        self.repo.save_version('branch1/v0.0.3-beta.0.0.1', 'branch',
-                               ['conflict.txt', 'same.txt', 'added.txt', 'binary.dat'])
-        self.repo.switch_branch('main')
-        (self.path / 'conflict.txt').write_text('main-1\n')  # Same length as branch content.
-        (self.path / 'main-only.txt').write_text('main later\n')
-        self.repo.save_version('v0.0.6', 'main', ['conflict.txt', 'main-only.txt'])
+        (self.path / "shared.txt").write_text("base\n")
+        (self.path / "main-only.txt").write_text("main base\n")
+        self.repo = MODULE.initialize_repository(
+            self.path, "v0.0.3", "base", ["shared.txt", "main-only.txt"],
+        )
+        self.repo.create_branch("branch1", "v0.0.3")
+        (self.path / "shared.txt").write_text("branch\n")
+        (self.path / "branch-only.txt").write_text("branch file\n")
+        self.repo.save_version(
+            "branch1/v0.0.3-beta.0.0.1", "branch", ["shared.txt", "branch-only.txt"],
+        )
+        self.repo.switch_branch("main")
+        (self.path / "shared.txt").write_text("main\n")
+        (self.path / "main-only.txt").write_text("main release\n")
+        self.repo.save_version("v0.0.6", "main", ["shared.txt", "main-only.txt"])
         self.tags_before = self.repo.tags()
-        self.repo.merge_to_main('branch1')
-        self.assertTrue(self.repo.merge_state().active)
+        self.refs_before = dict(self.repo._local_refs())
+        self.main_head = self.repo.run(["rev-parse", "HEAD"]).strip()
 
-    def prepare(self, **options):
-        session = self.repo.prepare_merge_comparison(**options)
-        self.assertFalse(session.choice_paths)
+    def begin(self, branch="main"):
+        if self.repo.current_branch() != branch:
+            self.repo.switch_branch(branch)
+        session = self.repo.merge_to_main("branch1")
         directory, data = self.repo._review_session_data(session)
         return session, directory, data
 
-    def test_complete_trees_clean_main_and_no_manifest_filter(self):
-        session, directory, data = self.prepare()
-        left, right = directory / 'branch', directory / 'main'
-        self.assertEqual('branch\n', (left / 'conflict.txt').read_text())
-        self.assertEqual('main-1\n', (right / 'conflict.txt').read_text())
-        self.assertIn('<<<<<<<', (self.path / 'conflict.txt').read_text())
-        self.assertEqual('auto added\n', (right / 'added.txt').read_text())
-        self.assertEqual('main later\n', (right / 'main-only.txt').read_text())
-        self.assertTrue((left / 'same.txt').exists())
-        self.assertTrue((left / 'hidden.zip').exists())
-        self.assertTrue((right / 'hidden.zip').exists())
-        self.assertEqual(b'\x00next', (left / 'binary.dat').read_bytes())
-        self.assertNotIn('.git', data['paths'])
-        self.assertIn('conflict.txt', data['editable'])
-        self.assertNotIn('same.txt', data['editable'])
-        self.assertNotIn('VERSION', data['editable'])
-        for path in (left / 'conflict.txt', right / 'same.txt', right / 'VERSION'):
-            self.assertFalse(path.stat().st_mode & 0o222)
-        self.assertTrue((right / 'conflict.txt').stat().st_mode & 0o200)
-        self.assertEqual(self.tags_before, self.repo.tags())
-
-    def test_two_directory_tools_do_not_apply_or_resolve_automatically(self):
-        session, directory, data = self.prepare()
+    def launch(self, session, edit=None, tools=("meld",)):
         original = MODULE.subprocess.run
-        commands = []
-        def tool(command, **kwargs):
-            if command[0] == 'git':
-                return original(command, **kwargs)
-            commands.append(command)
-            self.assertIn(str(directory / 'branch'), command)
-            self.assertIn(str(directory / 'main'), command)
-            self.assertFalse(any('mergeoutput' in arg or arg.startswith('--output') for arg in command))
-            (directory / 'main' / 'conflict.txt').write_text('main and branch\n')
-            return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
-        before = (self.path / 'conflict.txt').read_bytes()
-        for name in ('bcompare', 'meld', 'kdiff3'):
-            self.repo.configure_compare_tool(name)
-            with mock.patch.object(MODULE.shutil, 'which', return_value='/tool'), \
-                    mock.patch.object(MODULE.subprocess, 'run', side_effect=tool):
-                result = self.repo.launch_merge_comparison(session)
-            self.assertIn(('conflict.txt', '更新'), result.changes)
-            self.assertEqual(before, (self.path / 'conflict.txt').read_bytes())
-            self.assertIn('conflict.txt', self.repo.merge_state().conflicts)
-        self.assertIn('-leftreadonly', commands[0])
-        self.assertTrue(any(arg.startswith('-lefttitle=') for arg in commands[0]))
-
-    def test_apply_then_mark_solved_and_complete_does_not_publish(self):
-        session, directory, _data = self.prepare()
-        (directory / 'main' / 'conflict.txt').write_text('main-1\nbranch\n')
-        (directory / 'main' / 'main-only.txt').write_text('main amended\n')
-        result = self.repo.merge_comparison_result(session)
-        self.repo.apply_merge_comparison(result)
-        self.assertEqual('main-1\nbranch\n', (self.path / 'conflict.txt').read_text())
-        self.assertIn('main-only.txt', self.repo.merge_state().conflicts)
-        self.assertIn('conflict.txt', self.repo.merge_state().conflicts)
-        self.assertEqual('0.0.6\n', (self.path / 'VERSION').read_text())
-        self.assertEqual(self.tags_before, self.repo.tags())
-        self.repo.resolve_merge_file('conflict.txt')
-        self.repo.resolve_merge_file('main-only.txt')
-        self.repo.complete_merge()
-        self.assertEqual(self.tags_before, self.repo.tags())
-        self.assertEqual('0.0.6\n', (self.path / 'VERSION').read_text())
-        self.assertEqual('main amended\n', self.repo.run(['show', 'HEAD:main-only.txt']))
-
-    def test_accept_unchanged_clean_main_still_requires_explicit_resolution(self):
-        session, directory, _data = self.prepare()
-        result = self.repo.merge_comparison_result(session)
-        self.assertIn(('conflict.txt', '更新'), result.changes)
-        self.repo.apply_merge_comparison(result)
-        self.assertEqual('main-1\n', (self.path / 'conflict.txt').read_text())
-        self.assertIn('conflict.txt', self.repo.merge_state().conflicts)
-        self.repo.resolve_merge_file('conflict.txt')
-        self.repo.complete_merge()
-        self.assertEqual(self.tags_before, self.repo.tags())
-
-    def test_reopen_and_recreate_repository_preserves_unapplied_and_applied_edits(self):
-        session, directory, _data = self.prepare()
-        (directory / 'main' / 'conflict.txt').write_text('edited\n')
-        self.repo = MODULE.GitRepository(self.path)
-        reopened, repeated, _data = self.prepare()
-        self.assertEqual(session, reopened)
-        self.assertEqual(directory, repeated)
-        self.assertEqual('edited\n', (repeated / 'main' / 'conflict.txt').read_text())
-        self.repo.apply_merge_comparison(self.repo.merge_comparison_result(session))
-        self.repo.resolve_merge_file('conflict.txt')
-        reopened, repeated, _data = self.prepare()
-        self.assertEqual(session, reopened)
-        self.assertEqual('edited\n', (repeated / 'main' / 'conflict.txt').read_text())
-
-    def test_editing_allowed_file_to_match_branch_is_still_writable(self):
-        session, directory, _data = self.prepare()
-        target = directory / 'main' / 'conflict.txt'
-        target.write_bytes((directory / 'branch' / 'conflict.txt').read_bytes())
-        target.chmod(0o444)  # A copy operation may inherit the source's readonly mode.
-        self.prepare()
-        self.assertTrue(target.stat().st_mode & 0o200)
-        result = self.repo.merge_comparison_result(session)
-        self.assertIn(('conflict.txt', '更新'), result.changes)
-
-    def test_protected_or_left_changes_reject_entire_writeback(self):
-        for side, name in (('main', 'same.txt'), ('main', 'VERSION'), ('branch', 'conflict.txt')):
-            with self.subTest(side=side, path=name):
-                session, directory, _data = self.prepare()
-                target = directory / side / name
-                before = target.read_bytes()
-                mode = stat.S_IMODE(target.stat().st_mode)
-                actual = (self.path / 'conflict.txt').read_bytes()
-                target.chmod(0o644)
-                target.write_text('not allowed\n')
-                with self.assertRaises(MODULE.GitError):
-                    self.repo.merge_comparison_result(session)
-                self.assertEqual(actual, (self.path / 'conflict.txt').read_bytes())
-                target.write_bytes(before)
-                target.chmod(mode)
-
-    def test_unknown_file_empty_directory_or_symlink_is_rejected(self):
-        session, directory, _data = self.prepare()
-        for name, create in (
-            ('unknown', lambda p: p.write_text('extra')),
-            ('empty-dir', lambda p: p.mkdir()),
-            ('alias', lambda p: p.symlink_to(self.path / 'conflict.txt')),
-        ):
-            target = directory / 'main' / name
-            create(target)
-            with self.assertRaises(MODULE.GitError):
-                self.repo.merge_comparison_result(session)
-            target.rmdir() if target.is_dir() and not target.is_symlink() else target.unlink()
-        target = directory / 'main' / 'conflict.txt'
-        target.unlink()
-        target.symlink_to(self.path / 'same.txt')
-        with self.assertRaisesRegex(MODULE.GitError, '符号链接'):
-            self.repo.merge_comparison_result(session)
-
-    def test_binary_edit_and_permitted_file_deletion_are_written_and_confirmed(self):
-        session, directory, data = self.prepare()
-        # branch equals auto-merged binary, so it is protected despite binary content.
-        self.assertNotIn('binary.dat', data['editable'])
-        (directory / 'main' / 'main-only.txt').unlink()
-        self.repo.apply_merge_comparison(self.repo.merge_comparison_result(session))
-        self.assertFalse((self.path / 'main-only.txt').exists())
-        self.assertIn('main-only.txt', self.repo.merge_state().conflicts)
-        self.repo.resolve_merge_file('main-only.txt', delete=True)
-
-    def test_external_worktree_index_or_ref_change_stops_apply(self):
-        session, directory, _data = self.prepare()
-        result = self.repo.merge_comparison_result(session)
-        (self.path / 'main-only.txt').write_text('external editor\n')
-        before = (self.path / 'conflict.txt').read_bytes()
-        with self.assertRaisesRegex(MODULE.GitError, '已变化'):
-            self.repo.apply_merge_comparison(result)
-        self.assertEqual(before, (self.path / 'conflict.txt').read_bytes())
-        self.assertTrue(directory.exists())
-
-    def test_output_changes_after_confirmation_stop_apply(self):
-        session, directory, _data = self.prepare()
-        result = self.repo.merge_comparison_result(session)
-        (directory / 'main' / 'conflict.txt').write_text('late edit\n')
-        with self.assertRaisesRegex(MODULE.GitError, '确认后'):
-            self.repo.apply_merge_comparison(result)
-
-    def test_ambiguous_existing_edit_requires_choice_and_is_backed_up(self):
-        (self.path / 'conflict.txt').write_text('existing user resolution\n')
-        question = self.repo.prepare_merge_comparison()
-        self.assertEqual(('conflict.txt',), question.choice_paths)
-        session, directory, _data = self.prepare(use_main=False)
-        self.assertEqual('existing user resolution\n', (directory / 'main' / 'conflict.txt').read_text())
-        self.assertEqual('existing user resolution\n', (directory / 'original' / 'conflict.txt').read_text())
-        self.assertEqual('existing user resolution\n', (self.path / 'conflict.txt').read_text())
-
-    def test_legacy_merge_without_initial_snapshot_can_choose_clean_main(self):
-        record = json.loads((self.repo.metadata_path / 'merge.json').read_text())
-        record.pop('initial_conflicts')
-        (self.repo.metadata_path / 'merge.json').write_text(json.dumps(record))
-        question = self.repo.prepare_merge_comparison()
-        self.assertTrue(question.choice_paths)
-        session, directory, _data = self.prepare(use_main=True)
-        self.assertEqual('main-1\n', (directory / 'main' / 'conflict.txt').read_text())
-        self.assertIn('<<<<<<<', (directory / 'original' / 'conflict.txt').read_text())
-
-    def test_failed_tool_preserves_edit_and_actual_conflict(self):
-        session, directory, _data = self.prepare()
-        before = (self.path / 'conflict.txt').read_bytes()
-        original = MODULE.subprocess.run
-        def fail(command, **options):
-            if command[0] == 'git':
-                return original(command, **options)
-            (directory / 'main' / 'conflict.txt').write_text('saved before failure\n')
-            return subprocess.CompletedProcess(command, 2, stdout='', stderr='failed')
-        with mock.patch.object(MODULE.shutil, 'which', return_value='/tool'), \
-                mock.patch.object(MODULE.subprocess, 'run', side_effect=fail):
-            with self.assertRaisesRegex(MODULE.GitError, '副本'):
-                self.repo.launch_merge_comparison(session)
-        self.assertEqual(before, (self.path / 'conflict.txt').read_bytes())
-        self.assertEqual('saved before failure\n', (directory / 'main' / 'conflict.txt').read_text())
-
-    def test_mid_write_failure_restores_already_written_files(self):
-        session, directory, _data = self.prepare()
-        (directory / 'main' / 'main-only.txt').write_text('change main\n')
-        result = self.repo.merge_comparison_result(session)
-        originals = {path: (self.path / path).read_bytes() for path, _action in result.changes}
-        copy = self.repo._atomic_review_copy
         calls = []
-        def fail_second(source, target, mode):
-            calls.append(target)
-            if len(calls) == 2:
-                raise OSError('simulated disk failure')
-            return copy(source, target, mode)
-        with mock.patch.object(self.repo, '_atomic_review_copy', side_effect=fail_second):
-            with self.assertRaisesRegex(MODULE.GitError, '恢复'):
-                self.repo.apply_merge_comparison(result)
-        for path, content in originals.items():
-            self.assertEqual(content, (self.path / path).read_bytes())
-        self.assertTrue(list((directory / 'writeback').glob('*/state.json')))
 
-    def test_index_and_source_tag_changes_are_rejected(self):
-        session, directory, _data = self.prepare()
-        result = self.repo.merge_comparison_result(session)
-        self.repo.run(['add', 'main-only.txt'])
-        # Change an actual staged blob without touching any working file.
-        oid = self.repo.run(['hash-object', '-w', '--stdin'], input='different staged data\n').strip()
-        self.repo.run(['update-index', '--cacheinfo', '100644', oid, 'main-only.txt'])
-        with self.assertRaisesRegex(MODULE.GitError, '已变化'):
-            self.repo.apply_merge_comparison(result)
+        def run_tool(command, **options):
+            if command[0] == "git":
+                return original(command, **options)
+            calls.append(command)
+            root, _data = self.repo._review_session_data(session)
+            self.assertIn(str(root / "branch"), command)
+            self.assertIn(str(root / "main"), command)
+            if edit:
+                edit(root)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-    def test_source_tag_change_rejects_reopening(self):
-        session, directory, _data = self.prepare()
-        self.repo.run(['tag', '-f', '-a', 'branches/branch1/v0.0.3-beta.0.0.1', '-m', 'moved', 'main'])
-        with self.assertRaisesRegex(MODULE.GitError, '标签已经变化'):
-            self.repo.prepare_merge_comparison()
+        results = []
+        for tool in tools:
+            self.repo.configure_compare_tool(tool)
+            with mock.patch.object(MODULE.shutil, "which", return_value="/tool"), \
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=run_tool):
+                results.append(self.repo.launch_merge_comparison(session))
+        return results[-1], calls
 
-    def test_abort_preserves_review_files_and_removes_merge_state(self):
-        session, directory, _data = self.prepare()
-        (directory / 'main' / 'conflict.txt').write_text('saved work\n')
+    def test_start_isolated_and_cancel_changes_no_repository_state(self):
+        session, directory, _data = self.begin("branch1")
+        original_head = self.repo.run(["rev-parse", "HEAD"]).strip()
+        original_content = (self.path / "shared.txt").read_text()
+        recovery_refs = self.repo.run([
+            "for-each-ref", "--format=%(refname) %(objectname)", "refs/code-version-manager/recovery/",
+        ])
+        self.assertEqual("branch1", self.repo.current_branch())
+        self.assertEqual(self.refs_before, self.repo._local_refs())
+        self.assertEqual(recovery_refs, self.repo.run([
+            "for-each-ref", "--format=%(refname) %(objectname)", "refs/code-version-manager/recovery/",
+        ]))
+        self.assertEqual(original_head, self.repo.run(["rev-parse", "HEAD"]).strip())
+        self.assertFalse(self.repo._git_path("MERGE_HEAD").exists())
+        self.assertEqual("branch\n", (self.path / "shared.txt").read_text())
+        self.assertEqual("branch\n", (directory / "branch" / "shared.txt").read_text())
+        self.assertEqual(0, directory.joinpath("branch").stat().st_mode & 0o222)
+        self.assertEqual(0, (directory / "branch" / "shared.txt").stat().st_mode & 0o222)
+        (directory / "main" / "shared.txt").write_text("manual choice\n")
         self.repo.abort_merge()
+        self.assertEqual("branch1", self.repo.current_branch())
+        self.assertEqual(self.refs_before, self.repo._local_refs())
+        self.assertEqual(recovery_refs, self.repo.run([
+            "for-each-ref", "--format=%(refname) %(objectname)", "refs/code-version-manager/recovery/",
+        ]))
+        self.assertEqual(original_head, self.repo.run(["rev-parse", "HEAD"]).strip())
+        self.assertEqual(original_content, (self.path / "shared.txt").read_text())
+        self.assertFalse(directory.exists())
         self.assertFalse(self.repo.merge_state().active)
-        self.assertEqual('saved work\n', (directory / 'main' / 'conflict.txt').read_text())
-        self.assertEqual('main-1\n', (self.path / 'conflict.txt').read_text())
+
+    def test_complete_creates_single_parent_commit_and_can_keep_source(self):
+        session, directory, _data = self.begin()
+        (directory / "main" / "shared.txt").write_text("manual choice\n")
+        (directory / "main" / "branch-only.txt").write_text("copy from branch\n")
+        (directory / "main" / "main-only.txt").unlink()
+        result, _calls = self.launch(session)
+        self.assertEqual({"shared.txt", "branch-only.txt", "main-only.txt"},
+                         {path for path, _ in result.changes})
+        message = self.repo.complete_merge(delete_source=False)
+        self.assertIn("普通提交", message)
+        self.assertEqual("main", self.repo.current_branch())
+        self.assertEqual("manual choice\n", (self.path / "shared.txt").read_text())
+        self.assertEqual("copy from branch\n", (self.path / "branch-only.txt").read_text())
+        self.assertFalse((self.path / "main-only.txt").exists())
+        self.assertEqual("0.0.6\n", (self.path / "VERSION").read_text())
+        parents = self.repo.run(["rev-list", "--parents", "-n", "1", "HEAD"]).split()
+        self.assertEqual(2, len(parents))
         self.assertEqual(self.tags_before, self.repo.tags())
+        self.assertIn("branch1", [branch.name for branch in self.repo.local_branches()])
+        self.assertFalse(self.repo.merge_state().active)
 
-    def test_special_files_are_readonly_placeholders_and_are_not_followed(self):
-        path = self.root / 'with-link'
-        path.mkdir()
-        outside = self.root / 'outside-private.txt'
-        outside.write_text('outside must never be read or overwritten\n')
-        (path / 'alias').symlink_to(outside)
-        (path / 'conflict.txt').write_text('base\n')
-        repo = MODULE.initialize_repository(path, 'v0.0.3', 'base', ['alias', 'conflict.txt'])
-        repo.create_branch('branch1')
-        (path / 'conflict.txt').write_text('branch\n')
-        repo.save_version('branch1/v0.0.3-beta.0.0.1', 'branch', ['conflict.txt'])
-        repo.switch_branch('main')
-        (path / 'conflict.txt').write_text('main\n')
-        repo.save_version('v0.0.6', 'main', ['conflict.txt'])
-        repo.merge_to_main('branch1')
-        session = repo.prepare_merge_comparison()
-        directory, data = repo._review_session_data(session)
-        self.assertNotIn('alias', data['editable'])
-        for side in ('main', 'branch'):
-            display = directory / side / 'alias'
-            self.assertFalse(display.is_symlink())
-            self.assertFalse(display.stat().st_mode & 0o222)
-            self.assertNotIn(outside.read_text(), display.read_text())
-        repo.apply_merge_comparison(repo.merge_comparison_result(session))
-        self.assertEqual('outside must never be read or overwritten\n', outside.read_text())
-        self.assertTrue((path / 'alias').is_symlink())
+    def test_complete_defaults_to_deleting_source_and_all_beta_tags(self):
+        session, directory, _data = self.begin("branch1")
+        (directory / "main" / "shared.txt").write_text("selected\n")
+        self.launch(session)
+        self.repo.complete_merge()
+        refs = self.repo._local_refs()
+        self.assertNotIn("refs/heads/branch1", refs)
+        self.assertFalse(any("/branches/branch1/" in ref for ref in refs))
+        self.assertIn("refs/tags/v0.0.3", refs)
+        self.assertIn("refs/tags/v0.0.6", refs)
+        self.assertEqual("selected\n", (self.path / "shared.txt").read_text())
 
-    def test_binary_conflict_supports_exact_byte_results(self):
-        path = self.root / 'binary-conflict'
-        path.mkdir()
-        (path / 'blob').write_bytes(b'\x00base')
-        repo = MODULE.initialize_repository(path, 'v0.0.3', 'base', ['blob'])
-        repo.create_branch('branch1')
-        (path / 'blob').write_bytes(b'\x00feature')
-        repo.save_version('branch1/v0.0.3-beta.0.0.1', 'branch', ['blob'])
-        repo.switch_branch('main')
-        (path / 'blob').write_bytes(b'\x00main')
-        repo.save_version('v0.0.6', 'main', ['blob'])
-        repo.merge_to_main('branch1')
-        session = repo.prepare_merge_comparison()
-        directory, data = repo._review_session_data(session)
-        self.assertIn('blob', data['editable'])
-        self.assertEqual(b'\x00main', (directory / 'main' / 'blob').read_bytes())
-        (directory / 'main' / 'blob').write_bytes(b'\x00user choice')
-        repo.apply_merge_comparison(repo.merge_comparison_result(session))
-        self.assertEqual(b'\x00user choice', (path / 'blob').read_bytes())
-        self.assertIn('blob', repo.merge_state().conflicts)
+    def test_all_tools_receive_isolated_directories_and_never_write_main(self):
+        session, directory, _data = self.begin()
+        actual = (self.path / "shared.txt").read_bytes()
 
-    def test_merge_comparison_config_compares_contents_but_regular_compare_is_unchanged(self):
-        import xml.etree.ElementTree as ET
-        for review in (False, True):
-            directory = self.root / str(review)
-            config = MODULE.prepare_bcompare_config(directory, merge_review=review)
-            xml = ET.parse(config / 'bcompare' / 'BCSessions.xml')
-            rules = xml.find('.//TDirCompareSession/Rules')
-            self.assertEqual('True' if review else 'False', rules.find('UseContentComparison').get('Value'))
-            if review:
-                self.assertEqual('ccBinary', rules.find('ContentCompareKind').get('Value'))
-                self.assertEqual('*;*', xml.find('.//NameFilter').get('Value'))
+        def edit(root):
+            (root / "main" / "shared.txt").write_text("tool edit\n")
+
+        _result, calls = self.launch(session, edit, tools=("bcompare", "meld", "kdiff3"))
+        self.assertEqual(["bcompare", "meld", "kdiff3"], [call[0] for call in calls])
+        self.assertIn("-leftreadonly", calls[0])
+        self.assertEqual(actual, (self.path / "shared.txt").read_bytes())
+        self.assertTrue(self.repo.merge_state().ready)
+        self.repo.abort_merge()
+
+    def test_source_and_main_gitignore_union_hides_nested_paths_and_blocks_writeback(self):
+        for name in ("main-hidden.txt", "branch-hidden.txt", "nested/main-cache/cache.txt",
+                     "nested/branch-cache/cache.txt"):
+            target = self.path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("tracked base\n")
+        self.repo.run(["add", "-f", "main-hidden.txt", "branch-hidden.txt",
+                       "nested/main-cache/cache.txt", "nested/branch-cache/cache.txt"])
+        self.repo.run(["commit", "-m", "track ignore fixtures"])
+        self.repo.run(["tag", "-f", "-a", "v0.0.3", "-m", "base"])
+        self.repo.run(["branch", "-f", "branch1", "v0.0.3"])
+        self.repo.switch_branch("branch1")
+        with (self.path / ".gitignore").open("a") as stream:
+            stream.write("/branch-hidden.txt\n")
+        (self.path / "nested" / ".gitignore").write_text("branch-cache/\n")
+        (self.path / "branch-hidden.txt").write_text("branch hidden\n")
+        (self.path / "nested" / "branch-cache" / "cache.txt").write_text("branch cache\n")
+        self.repo.run(["add", ".gitignore", "nested/.gitignore"])
+        self.repo.run(["add", "-f", "branch-hidden.txt", "nested/branch-cache/cache.txt"])
+        self.repo.run(["commit", "-m", "branch ignore rules"])
+        self.repo.run(["tag", "-f", "-a", "branches/branch1/v0.0.3-beta.0.0.1", "-m", "beta"])
+        self.repo.switch_branch("main")
+        with (self.path / ".gitignore").open("a") as stream:
+            stream.write("/main-hidden.txt\n")
+        (self.path / "nested" / ".gitignore").write_text("main-cache/\n")
+        (self.path / "main-hidden.txt").write_text("main hidden\n")
+        (self.path / "nested" / "main-cache" / "cache.txt").write_text("main cache\n")
+        self.repo.run(["add", ".gitignore", "nested/.gitignore"])
+        self.repo.run(["add", "-f", "main-hidden.txt", "nested/main-cache/cache.txt"])
+        self.repo.run(["commit", "-m", "main ignore rules"])
+        self.repo.run(["tag", "-f", "-a", "v0.0.6", "-m", "main"])
+        self.repo.run(["config", "--local", "branch.branch1.codeVersionManagerBase", "v0.0.3"])
+        self.repo.run(["config", "--local", "--unset-all", "branch.branch1.codeVersionManagerBase"], check=False)
+        self.repo.switch_branch("branch1")
+        self.repo.run(["config", "--local", "branch.branch1.codeVersionManagerBase", "v0.0.3"])
+        self.repo.switch_branch("main")
+
+        session = self.repo.merge_to_main("branch1")
+        root, data = self.repo._review_session_data(session)
+        expected = {"main-hidden.txt", "branch-hidden.txt",
+                    "nested/main-cache/cache.txt", "nested/branch-cache/cache.txt"}
+        self.assertTrue(expected.issubset(set(data["ignored_paths"])))
+        for side in ("branch", "main"):
+            for path in expected:
+                self.assertFalse((root / side / path).exists())
+        for path in expected:
+            (root / "main" / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / "main" / path).write_text("attempted bypass\n")
+        with self.assertRaisesRegex(MODULE.GitError, "gitignore|.gitignore"):
+            self.repo.merge_comparison_result(session)
+        self.repo.abort_merge()
+
+    def test_tag_or_worktree_change_invalidates_session(self):
+        session, _directory, _data = self.begin()
+        tag = "refs/tags/branches/branch1/v0.0.3-beta.0.0.1"
+        self.repo.run(["update-ref", tag, "refs/heads/main"])
+        with self.assertRaisesRegex(MODULE.GitError, "引用已变化"):
+            self.repo.launch_merge_comparison(session)
+        self.repo.abort_merge()
 
 
 class MergeComparisonUITest(unittest.TestCase):
-    def test_complete_directory_button_does_not_require_file_selection(self):
+    def test_merge_preview_describes_manual_workflow(self):
         window = mock.Mock()
-        window.busy = False
-        MODULE.VersionManagerWindow.on_merge_tool(window, None)
-        window.run_background.assert_called_once()
-        self.assertIs(window.repository.prepare_merge_comparison, window.run_background.call_args.args[1])
-        window.conflict_combo.get_active_id.assert_not_called()
-
-    def test_keep_copy_does_not_write_or_resolve(self):
-        window = mock.Mock()
-        result = MODULE.MergeComparisonResult(MODULE.MergeComparisonSession('a' * 32, 'branch1/beta'),
-                                             (('conflict.txt', '更新'),), 'hash')
-        with mock.patch.object(MODULE.Gtk, 'Dialog') as factory, \
-                mock.patch.object(MODULE.Gtk, 'TextView'), \
-                mock.patch.object(MODULE.Gtk, 'ScrolledWindow'), \
-                mock.patch.object(MODULE.Gtk, 'Label'):
-            factory.return_value.run.return_value = MODULE.Gtk.ResponseType.CANCEL
-            MODULE.VersionManagerWindow._background_comparison_ready(window, result)
-        window.run_background.assert_not_called()
-        window.repository.apply_merge_comparison.assert_not_called()
-        window.repository.resolve_merge_file.assert_not_called()
+        plan = MODULE.BranchMergePlan(
+            "branch1", "branches/branch1/v0.0.3-beta.0.0.3", "a" * 40,
+            "v0.0.6", "b" * 40, (),
+        )
+        with mock.patch.object(MODULE.Gtk, "MessageDialog") as factory:
+            factory.return_value.run.return_value = MODULE.Gtk.ResponseType.OK
+            MODULE.VersionManagerWindow._background_merge_ready(window, plan)
+        description = factory.return_value.format_secondary_text.call_args.args[0]
+        self.assertIn("普通提交", description)
+        self.assertIn(".gitignore", description)
+        operation = window.run_background.call_args.args[1]
+        operation()
+        window.repository.merge_to_main.assert_called_once_with("branch1", expected=plan)

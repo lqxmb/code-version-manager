@@ -47,52 +47,57 @@ class UnifiedWorkflowTest(unittest.TestCase):
 
     def test_full_example_merges_without_publication_then_cleans_and_mirrors(self):
         self.repo.create_branch('branch1', 'v0.0.3')
-        for n in range(1, 4):
-            version = f'branch1/v0.0.3-beta.0.0.{n}'
-            self.publish(self.repo, version, f'branch content {n}\n')
-            (self.path / f'feature{n}.txt').write_text(f'feature {n}\n', encoding='utf-8')
-            # Extra tracked changes must also be part of the published beta.
-            self.repo.run(['add', f'feature{n}.txt'])
-            self.repo.run(['commit', '--amend', '--no-edit', '-q'])
-            self.repo.run(['tag', '-f', '-a', MODULE.canonical_version(version), '-m', version])
+        self.publish(self.repo, 'branch1/v0.0.3-beta.0.0.1', 'branch content\n')
+        (self.path / 'feature.txt').write_text('feature file\n', encoding='utf-8')
+        self.repo.run(['add', 'feature.txt'])
+        self.repo.run(['commit', '--amend', '--no-edit', '-q'])
+        self.repo.run(['tag', '-f', '-a', MODULE.canonical_version(
+            'branch1/v0.0.3-beta.0.0.1'), '-m', 'branch beta'])
         self.assertEqual('0.0.3\n', (self.path / 'VERSION').read_text())
         self.repo.switch_branch('main')
-        for n in range(4, 7):
-            self.publish(self.repo, f'v0.0.{n}', f'main content {n}\n')
+        self.publish(self.repo, 'v0.0.6', 'main content\n')
         (self.path / 'main-only.txt').write_text('keep main work\n', encoding='utf-8')
         self.repo.run(['add', 'main-only.txt'])
         self.repo.run(['commit', '--amend', '--no-edit', '-q'])
         self.repo.run(['tag', '-f', '-a', 'v0.0.6', '-m', 'six'])
         self.repo.sync_remote()
         self.repo.switch_branch('branch1')
-        self.assertEqual('branches/branch1/v0.0.3-beta.0.0.4', self.repo.next_version())
+        self.assertEqual('branches/branch1/v0.0.3-beta.0.0.2', self.repo.next_version())
         self.repo.switch_branch('main')
         plan = self.repo.plan_merge('branch1')
-        self.assertEqual('branches/branch1/v0.0.3-beta.0.0.3', plan.source_tag)
+        self.assertEqual('branches/branch1/v0.0.3-beta.0.0.1', plan.source_tag)
         self.assertEqual('v0.0.6', plan.target_version)
         before_tags = {r: o for r, o in self.refs(self.path).items() if r.startswith('refs/tags/')}
         before_remote = self.refs(self.remote)
+        main_head = self.repo.run(['rev-parse', 'HEAD']).strip()
         with mock.patch.object(self.repo, '_run_remote', side_effect=AssertionError('merge must be local')):
-            self.repo.merge_to_main('branch1', expected=plan)
-            self.assertTrue(self.repo.merge_state().active)
-            self.assertIn('shared.txt', self.repo.merge_state().conflicts)
-            (self.path / 'shared.txt').write_text('main content 6\nbranch content 3\n', encoding='utf-8')
-            self.repo.resolve_merge_file('shared.txt')
-            message = self.repo.complete_merge()
-        self.assertIn('尚未发布', message)
-        self.assertEqual(before_tags, {r: o for r, o in self.refs(self.path).items() if r.startswith('refs/tags/')})
+            session = self.repo.merge_to_main('branch1', expected=plan)
+        directory, _data = self.repo._review_session_data(session)
+        self.assertEqual(main_head, self.repo.run(['rev-parse', 'HEAD']).strip())
+        self.assertEqual('main content\n', (self.path / 'shared.txt').read_text())
+        (directory / 'main' / 'shared.txt').write_text('manual branch choice\n')
+        (directory / 'main' / 'feature.txt').write_bytes(
+            (directory / 'branch' / 'feature.txt').read_bytes(),
+        )
+        original = MODULE.subprocess.run
+        def close_tool(command, **options):
+            if command[0] == 'git':
+                return original(command, **options)
+            return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
+        with mock.patch.object(MODULE.shutil, 'which', return_value='/tool'), \
+                mock.patch.object(MODULE.subprocess, 'run', side_effect=close_tool):
+            self.repo.launch_merge_comparison(session)
+        message = self.repo.complete_merge()
+        self.assertIn('普通提交', message)
+        remaining_tags = {ref: oid for ref, oid in before_tags.items()
+                          if '/branches/branch1/' not in ref}
+        self.assertEqual(remaining_tags, {r: o for r, o in self.refs(self.path).items() if r.startswith('refs/tags/')})
         self.assertEqual(before_remote, self.refs(self.remote))
         self.assertEqual('0.0.6\n', (self.path / 'VERSION').read_text())
-        self.assertEqual(2, len(self.repo.run(['rev-list', '--parents', '-n', '1', 'HEAD']).split()) - 1)
+        self.assertEqual(1, len(self.repo.run(['rev-list', '--parents', '-n', '1', 'HEAD']).split()) - 1)
+        self.assertEqual([], self.repo.status())
         self.assertTrue((self.path / 'main-only.txt').exists())
-        for n in range(1, 4):
-            self.assertTrue((self.path / f'feature{n}.txt').exists())
-        with self.assertRaisesRegex(MODULE.GitError, '发布'):
-            self.repo.delete_merged_branch('branch1')
-        self.repo.save_version('v0.0.7', 'merged release', ['shared.txt', 'main-only.txt', 'feature1.txt', 'feature2.txt', 'feature3.txt'])
-        self.assertEqual('0.0.7\n', (self.path / 'VERSION').read_text())
-        deletion = self.repo.plan_branch_deletion('branch1')
-        self.repo.delete_merged_branch('branch1', expected=deletion)
+        self.assertTrue((self.path / 'feature.txt').exists())
         self.assertNotIn('refs/heads/branch1', self.refs(self.path))
         self.assertFalse(any('/branches/branch1/' in ref for ref in self.refs(self.path)))
         self.assertIn('refs/heads/branch1', self.refs(self.remote))
@@ -389,26 +394,26 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertEqual('four\n', (exported / 'shared.txt').read_text())
         self.assertTrue(list((self.repo.metadata_path / 'recovery').rglob('v0.0.4.manifest')))
 
-    def test_conflict_completion_cannot_stage_beta_version_or_create_formal_tag(self):
+    def test_manual_merge_is_blocked_from_switch_publish_and_sync_until_decision(self):
         self.repo.create_branch('branch1')
         self.publish(self.repo, 'branch1/v0.0.3-beta.0.0.1', 'feature conflict\n')
         self.repo.switch_branch('main')
         self.publish(self.repo, 'v0.0.4', 'main conflict\n')
         main = self.repo.run(['rev-parse', 'HEAD']).strip()
         tags = self.repo.tags()
-        self.repo.merge_to_main('branch1')
-        (self.path / 'shared.txt').write_text('resolved by user\n')
-        self.repo.resolve_merge_file('shared.txt')
-        (self.path / 'VERSION').write_text('0.0.3-beta.0.0.1\n')
-        self.repo.run(['add', 'VERSION'])
-        with self.assertRaisesRegex(MODULE.GitError, 'VERSION 必须保留'):
+        session = self.repo.merge_to_main('branch1')
+        self.assertEqual(main, self.repo.run(['rev-parse', 'HEAD']).strip())
+        self.assertFalse(self.repo._git_path('MERGE_HEAD').exists())
+        with self.assertRaisesRegex(MODULE.GitError, '手动合并'):
+            self.repo.switch_branch('branch1')
+        with self.assertRaisesRegex(MODULE.GitError, '手动合并'):
+            self.repo.sync_snapshot()
+        with self.assertRaisesRegex(MODULE.GitError, '关闭对比工具'):
             self.repo.complete_merge()
+        self.assertEqual(tags, self.repo.tags())
+        self.repo.abort_merge()
         self.assertEqual(main, self.repo.run(['rev-parse', 'HEAD']).strip())
         self.assertEqual(tags, self.repo.tags())
-        self.repo.run(['restore', '--source=HEAD', '--staged', '--worktree', 'VERSION'])
-        self.repo.complete_merge()
-        self.assertEqual(tags, self.repo.tags())
-        self.assertEqual('0.0.4\n', (self.path / 'VERSION').read_text())
 
 
 class RepositoryStatusUITest(unittest.TestCase):
@@ -434,14 +439,54 @@ class RepositoryStatusUITest(unittest.TestCase):
         window._invalidate_remote_status.assert_called_once()
         window._refresh_remote_status.assert_called_once()
 
-    def test_merge_preview_says_no_publication_and_uses_confirmed_plan(self):
+    def test_remote_status_refreshes_origin_branches_from_its_snapshot(self):
+        window = mock.Mock()
+        snapshot = MODULE.RemoteSyncSnapshot("origin-url", "refs/heads/main", ())
+        status = MODULE.RemoteSyncStatus(
+            "synced", "一致", snapshot=snapshot,
+            remote_refs=(("refs/heads/main", "a" * 40),
+                         ("refs/heads/feature/camera", "b" * 40)),
+        )
+        MODULE.VersionManagerWindow._set_remote_status(window, status)
+        self.assertEqual("origin-url", window.remote_branch_url)
+        self.assertEqual(
+            [MODULE.BranchInfo("feature/camera", "remote", "b" * 40),
+             MODULE.BranchInfo("main", "remote", "a" * 40)],
+            window.remote_branch_choices,
+        )
+        window._refresh_branch_choices.assert_called_once()
+        window._set_sync_button.assert_any_call(
+            window.sync_local_button, status.can_sync_local, False,
+            mock.ANY, mock.ANY,
+        )
+
+    def test_unavailable_remote_status_clears_cached_origin_branches(self):
+        window = mock.Mock()
+        repo = mock.Mock()
+        snapshot = MODULE.RemoteSyncSnapshot("origin-url", "refs/heads/main", ())
+        status = MODULE.RemoteSyncStatus("unavailable", "offline", snapshot=snapshot)
+        window.repository = repo
+        window.remote_status_generation = 7
+        window.busy = False
+        window.remote_branch_choices = [MODULE.BranchInfo("stale", "remote", "a" * 40)]
+        repo.sync_snapshot.return_value = snapshot
+        MODULE.VersionManagerWindow._set_remote_status(window, status)
+        self.assertEqual([], window.remote_branch_choices)
+        window._refresh_branch_choices.assert_called_once()
+
+    def test_removed_remote_branch_refresh_button_has_no_handler(self):
+        self.assertFalse(hasattr(MODULE.VersionManagerWindow, "on_refresh_remote_branches"))
+
+    def test_merge_preview_says_manual_commit_and_uses_confirmed_plan(self):
         window = mock.Mock()
         plan = MODULE.BranchMergePlan('branch1', 'branches/branch1/v0.0.3-beta.0.0.3', 'a' * 40, 'v0.0.6', 'b' * 40, ())
         with mock.patch.object(MODULE.Gtk, 'MessageDialog') as factory:
             dialog = factory.return_value
             dialog.run.return_value = MODULE.Gtk.ResponseType.OK
             MODULE.VersionManagerWindow._background_merge_ready(window, plan)
-        self.assertIn('不发布、不创建标签', dialog.format_secondary_text.call_args.args[0])
+        description = dialog.format_secondary_text.call_args.args[0]
+        self.assertIn('普通提交', description)
+        self.assertIn('.gitignore', description)
         operation = window.run_background.call_args.args[1]
         operation()
         window.repository.merge_to_main.assert_called_once_with('branch1', expected=plan)

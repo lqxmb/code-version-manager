@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[1] / 'src' / 'code_version_manager.py'
 SPEC = importlib.util.spec_from_file_location('cvm_isolated_verification', SOURCE)
@@ -81,32 +82,29 @@ def verify(workspace):
         assert repo._sync_target() == str(remote)
         assert repo._local_refs() == original_refs
         if source.merge_state().active:
-            # Reproduce the in-progress merge only inside the independent copy.
-            for name in ("index", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "ORIG_HEAD"):
-                original = source._git_path(name)
-                if original.is_file() and not original.is_symlink():
-                    shutil.copy2(original, copy / ".git" / name)
             tags = repo.tags()
-            session = repo.prepare_merge_comparison(use_main=True)
+            merge = json.loads((repo.metadata_path / "merge.json").read_text(encoding="utf-8"))
+            session = MODULE.MergeComparisonSession(
+                merge["comparison_session"], MODULE.display_version(merge["source_tag"]),
+            )
             directory, data = repo._review_session_data(session)
-            for path in repo.merge_state().conflicts:
-                if path in data["editable"]:
-                    right = directory / "main" / path
-                    left = directory / "branch" / path
-                    if right.exists() and left.exists():
-                        right.write_bytes(right.read_bytes() + b"\n" + left.read_bytes())
-                    elif left.exists():
-                        right.parent.mkdir(parents=True, exist_ok=True)
-                        right.write_bytes(left.read_bytes())
-            result = repo.merge_comparison_result(session)
-            assert repo.merge_state().active
-            repo.apply_merge_comparison(result)
-            for path in repo.merge_state().conflicts:
-                repo.resolve_merge_file(path, delete=not (copy / path).exists())
-            repo.complete_merge()
+            for path in data["editable"]:
+                right = directory / "main" / path
+                if right.is_file():
+                    right.write_bytes(right.read_bytes() + b"\nmanual review\n")
+                    break
+            original_run = MODULE.subprocess.run
+            def close_tool(command, **options):
+                if command[0] == "git":
+                    return original_run(command, **options)
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            with mock.patch.object(MODULE.shutil, "which", return_value="/isolated-tool"), \
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=close_tool):
+                repo.launch_merge_comparison(session)
+            repo.complete_merge(delete_source=False)
             assert repo.tags() == tags
-            report["active_merge_two_directory_writeback_without_publication"] = "passed"
-            assert list((directory / "writeback").glob("*/state.json"))
+            assert len(git(copy, "rev-list", "--parents", "-n", "1", "HEAD").split()) == 2
+            report["manual_two_directory_merge_without_publication"] = "passed"
             # Continue the existing mirror checks from the copied original refs.
             git(copy, "reset", "--hard", original_refs["refs/heads/main"])
             assert repo._local_refs() == original_refs

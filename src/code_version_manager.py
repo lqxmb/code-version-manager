@@ -255,10 +255,12 @@ class MergeState:
     source: str = ""
     conflicts: Tuple[str, ...] = ()
     notice: str = ""
+    tool_closed: bool = False
+    comparison_ready: bool = False
 
     @property
     def ready(self) -> bool:
-        return self.active and not self.conflicts
+        return self.active and self.tool_closed and self.comparison_ready
 
 
 @dataclass(frozen=True)
@@ -1464,6 +1466,8 @@ class GitRepository:
             "MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer",
         )):
             raise GitError("Git 有未完成的合并、变基或提交操作，请先完成或取消。")
+        if (self.metadata_path / "merge.json").is_file():
+            raise GitError("正在进行手动合并，请先完成或取消合并。")
 
     def _assert_clean(self, target: Optional[str] = None) -> None:
         self._assert_no_operation()
@@ -1635,81 +1639,19 @@ class GitRepository:
         self.run(["config", "--local", f"branch.{branch}.merge", f"refs/heads/{branch}"])
 
     def merge_state(self) -> MergeState:
-        active = self._git_path("MERGE_HEAD").exists()
-        source = ""
-        manual_resolution: List[str] = []
-        notice = ""
+        path = self.metadata_path / "merge.json"
         try:
-            merge = json.loads((self.metadata_path / "merge.json").read_text())
-            source = merge.get("source", "")
-            manual_resolution = merge.get("manual_resolution", [])
-            notice = merge.get("notice", "")
+            record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, AttributeError):
-            pass
-        conflicts = set()
-        if active:
-            conflicts.update(filter(None, self.run([
-                "diff", "--name-only", "--diff-filter=U", "-z",
-            ]).split("\0")))
-            conflicts.update(path for path in manual_resolution if isinstance(path, str))
-        return MergeState(active, source if active else "", tuple(sorted(conflicts)), notice if active else "")
-
-    def _file_entry_at(self, reference: str, path: str) -> Optional[Tuple[str, str]]:
-        entries = self.run([
-            "--literal-pathspecs", "ls-tree", "-z", reference, "--", path,
-        ]).split("\0")
-        for entry in filter(None, entries):
-            metadata, name = entry.split("\t", 1)
-            if name == path:
-                mode, _kind, oid = metadata.split()
-                return mode, oid
-        return None
-
-    def _version_file_at(self, reference: str) -> Optional[Tuple[str, bytes]]:
-        entry = self._file_entry_at(reference, WORKSPACE_VERSION)
-        if entry is None:
-            return None
-        mode, oid = entry
-        data = self.run_bytes(["cat-file", "blob", oid]) if mode in ("100644", "100755") else b""
-        return mode, data
-
-    @staticmethod
-    def _version_merge_policy(
-        main_file: Optional[Tuple[str, bytes]], source_file: Optional[Tuple[str, bytes]],
-    ) -> Tuple[str, str]:
-        if any(entry and entry[0] not in ("100644", "100755") for entry in (main_file, source_file)):
-            return "manual", "VERSION 涉及符号链接或特殊文件，请手动检查并标记解决。"
-        if main_file == source_file:
-            return "same", ""
-        if main_file is None:
-            return "remove_prerelease", "main 原来没有 VERSION，合并保持缺失；发布正式版时自动创建。"
-        text = main_file[1].decode("utf-8", errors="replace").strip()
-        return "keep_main", f"VERSION 保留 main 的 {text}；只有用户发布正式版时才更新版本号和创建标签。"
-
-    def _apply_version_merge_policy(self, policy: str, notice: str) -> None:
-        merge_path = self.metadata_path / "merge.json"
-        try:
-            merge = json.loads(merge_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            merge = {}
-        if policy == "keep_main":
-            target = self.path / WORKSPACE_VERSION
-            if target.is_symlink() or (target.exists() and not target.is_file()):
-                policy = "manual"
-                notice = "VERSION 不是普通文件，未自动覆盖；请手动检查并标记解决。"
-            else:
-                self.run(["--literal-pathspecs", "checkout", "HEAD", "--", WORKSPACE_VERSION])
-        elif policy == "remove_prerelease":
-            self.run([
-                "--literal-pathspecs", "rm", "-f", "--ignore-unmatch", "--", WORKSPACE_VERSION,
-            ])
-        if policy == "manual":
-            pending = set(merge.get("manual_resolution", []))
-            pending.add(WORKSPACE_VERSION)
-            merge["manual_resolution"] = sorted(pending)
-        if notice:
-            merge["notice"] = notice
-        merge_path.write_text(json.dumps(merge, ensure_ascii=False), encoding="utf-8")
+            record = {}
+        active = path.is_file()
+        # A legacy in-progress Git merge can only be cancelled after upgrading.
+        tool_closed = bool(active and (record.get("tool_closed") or record.get("schema") != 1))
+        return MergeState(
+            active, record.get("source", "") if active else "", (),
+            record.get("notice", "") if active else "",
+            tool_closed, bool(tool_closed and record.get("output_signature")),
+        )
 
     def _assert_branch_not_in_other_worktree(self, name: str) -> None:
         worktree = ""
@@ -1723,6 +1665,8 @@ class GitRepository:
         self._validate_branch_name(source)
         self._assert_clean()
         self._ensure_full_history()
+        if not self.current_branch():
+            raise GitError("请先返回工作分支，再开始手动合并。")
         if source == "main":
             raise GitError("请选择需要合并的开发分支。")
         refs = self._local_refs()
@@ -1743,133 +1687,211 @@ class GitRepository:
         if target is None or target.commit != refs["refs/heads/main"]:
             raise GitError("main 有尚未发布的提交或缺少正式版本；请先发布正式版本，再开始下一次合并。")
         if not self.run(["merge-base", latest.commit, target.commit], check=False).strip():
-            raise GitError("所选 beta 与 main 没有共同历史，请先检查或整仓同步，不能直接三方合并。")
+            raise GitError("所选 beta 与 main 没有共同历史，请先检查或整仓同步，不能开始手动合并。")
         return BranchMergePlan(source, latest.name, latest.commit, target.name, target.commit, tuple(sorted(refs.items())))
 
-    def merge_to_main(self, source: str, expected: Optional[BranchMergePlan] = None) -> str:
+    def merge_to_main(
+        self, source: str, expected: Optional[BranchMergePlan] = None,
+    ) -> MergeComparisonSession:
         plan = self.plan_merge(source)
         if expected is not None and plan != expected:
             raise GitError("合并确认后分支或版本标签已变化，请重新查看合并清单。")
-        self.switch_branch("main")
+        before = dict(plan.local_refs)
         if tuple(sorted(self._local_refs().items())) != plan.local_refs:
-            raise GitError("合并前引用已变化，请刷新后重新确认。")
-        source_oid = plan.source_oid
-        self._assert_clean(source_oid)
-        head = self.run(["rev-parse", "HEAD"]).strip()
-        if self._contains_commit(source_oid, head):
-            return f"{source} 已合入 main，无需重复合并。"
-        version_policy, version_notice = self._version_merge_policy(
-            self._version_file_at(head), self._version_file_at(source_oid),
-        )
-        ensure_git_identity(self)
+            raise GitError("合并确认后分支或版本标签已变化，请重新查看合并清单。")
+        current_branch = self.current_branch()
+        current_head = self.run(["rev-parse", "--verify", "HEAD"], check=False).strip()
+        session = MergeComparisonSession(uuid.uuid4().hex, display_version(plan.source_tag))
         self.metadata_path.mkdir(parents=True, exist_ok=True)
-        self._save_recovery_refs(self._recovery_namespace("merge"), {
-            "refs/heads/main": head, f"refs/heads/{source}": source_oid,
-        }, "before")
-        (self.metadata_path / "merge.json").write_text(
-            json.dumps({"source": source, "source_tag": plan.source_tag,
-                        "source_oid": plan.source_oid, "target_oid": plan.target_oid}, ensure_ascii=False), encoding="utf-8",
-        )
-        result = subprocess.run([
-            "git", "-C", str(self.path), "merge", "--no-ff", "--no-commit", "--no-overwrite-ignore", source_oid,
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if not self._git_path("MERGE_HEAD").exists():
-            (self.metadata_path / "merge.json").unlink(missing_ok=True)
-            raise GitError(result.stderr.strip() or result.stdout.strip() or "Git 未保留待完成的合并状态。")
-        if result.returncode != 0 and not self.merge_state().conflicts:
-            raise GitError(result.stderr.strip() or result.stdout.strip() or "Git 合并未成功，请取消后重试。")
-        self._apply_version_merge_policy(version_policy, version_notice)
-        state = self.merge_state()
-        record_path = self.metadata_path / "merge.json"
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        record["initial_conflicts"] = {path: self._review_file_state(self.path, path) for path in state.conflicts}
-        self._write_review_json(record_path, record)
-        if state.active and state.conflicts:
-            details = f"正在将 {source} 合并到 main：有 {len(state.conflicts)} 个冲突或待人工确认文件，请逐个处理后完成合并，或取消合并。"
-            return details + ("\n" + state.notice if state.notice else "")
-        return self.complete_merge()
-
-    def complete_merge(self) -> str:
-        state = self.merge_state()
-        if not state.active or self.current_branch() != "main":
-            raise GitError("没有正在 main 上进行的合并。")
-        if state.conflicts:
-            raise GitError("仍有未解决的合并冲突，请逐个解决并标记已解决。")
+        record = {
+            "schema": 1, "source": plan.source, "source_tag": plan.source_tag,
+            "source_oid": plan.source_oid, "target_oid": plan.target_oid,
+            "target_version": plan.target_version, "local_refs": list(plan.local_refs),
+            "original_branch": current_branch, "original_head": current_head,
+            "comparison_session": session.session_id, "tool_closed": False,
+        }
+        self._write_review_json(self.metadata_path / "merge.json", record)
         try:
-            record = json.loads((self.metadata_path / "merge.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raise GitError("缺少有效合并快照；请先备份已解决文件，再取消合并并重新确认。") from None
-        refs = self._local_refs()
-        if (record.get("target_oid") != refs.get("refs/heads/main") or
-                record.get("source_oid") != refs.get(f"refs/heads/{state.source}")):
-            raise GitError("合并期间分支引用已变化；请先备份已解决文件，再取消合并并重新确认。")
-        original_version = self._file_entry_at("HEAD", WORKSPACE_VERSION)
-        index = self.run(["ls-files", "--stage", "-z", "--", WORKSPACE_VERSION])
-        staged_version = None
-        if index:
-            mode, oid, stage = index.split("\t", 1)[0].split()
-            if stage != "0":
-                raise GitError("VERSION 仍有未解决的合并冲突。")
-            staged_version = mode, oid
-        if staged_version != original_version:
-            raise GitError("VERSION 必须保留合并前 main 的内容；请还原并标记解决。只有另行发布正式版才更新 VERSION。")
+            self.prepare_merge_comparison()
+        except Exception:
+            (self.metadata_path / "merge.json").unlink(missing_ok=True)
+            self._remove_review_session(self.metadata_path / "merge-review" / session.session_id)
+            try:
+                (self.metadata_path / "merge-review").rmdir()
+                self.metadata_path.rmdir()
+            except OSError:
+                pass
+            raise
+        return session
+
+    def complete_merge(self, delete_source: bool = True) -> str:
+        if not self.merge_state().ready:
+            raise GitError("请先关闭对比工具，确认对比结果后完成合并。")
+        record = self._merge_review_record()
+        session = MergeComparisonSession(record["comparison_session"], display_version(record["source_tag"]))
+        result = self.merge_comparison_result(session)
+        if result.output_signature != record.get("output_signature"):
+            raise GitError("对比工具关闭后编辑副本又发生变化，请重新打开并确认。")
+        root, data = self._review_session_data(session)
+        before_refs = dict(record["local_refs"])
+        paths = [path for path, _action in result.changes]
+        for name in ("main", record["source"]):
+            self._assert_branch_not_in_other_worktree(name)
+        collisions = self._ignored_path_conflicts(record["target_oid"])
+        if collisions:
+            raise GitError("切换 main 会覆盖被忽略的文件，请先移走或备份：\n" + "\n".join(collisions))
         ensure_git_identity(self)
-        self.run(["commit", "-m", f"Merge {state.source or 'development branch'} into main"])
+        recovery = self._recovery_namespace("manual-merge")
+        self._save_recovery_refs(recovery, before_refs, "before")
+        backup_root = self._save_metadata_recovery(recovery)
+        record["delete_recovery"] = recovery
+        backup = backup_root / "writeback" / uuid.uuid4().hex
+        backup.mkdir(parents=True)
+        self._write_review_json(backup / "merge.json", record)
+        # Prepare the ordinary single-parent commit without changing HEAD or the
+        # real index.  Publish main and optional deletions in one checked batch.
+        with tempfile.TemporaryDirectory(prefix="manual-commit-", dir=self.metadata_path) as temporary:
+            environment = os.environ.copy()
+            environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
+            self.run(["read-tree", record["target_oid"]], env=environment)
+            entries = []
+            for path, action in result.changes:
+                if action == "删除":
+                    entries.append("0 " + "0" * 40 + "\t" + path)
+                else:
+                    contents = self._review_path(root / "main", path).read_bytes()
+                    oid = self.run_bytes(["hash-object", "-w", "--stdin"], input=contents).decode("ascii").strip()
+                    mode = "100755" if data["write_modes"][path] & 0o111 else "100644"
+                    entries.append(f"{mode} {oid}\t{path}")
+            if entries:
+                self.run(["update-index", "-z", "--index-info"], input="\0".join(entries) + "\0", env=environment)
+            tree = self.run(["write-tree"], env=environment).strip()
+            commit = self.run(["commit-tree", tree, "-p", record["target_oid"], "-m",
+                               f"Manually integrate {record['source']} into main"], env=environment).strip()
+        if self.merge_comparison_result(session) != result:
+            raise GitError("准备提交期间对比结果发生变化，未写回 main。")
+        desired = dict(before_refs)
+        desired["refs/heads/main"] = commit
+        deleted = {}
+        if delete_source:
+            deleted = {ref: oid for ref, oid in before_refs.items()
+                       if ref == f"refs/heads/{record['source']}" or self._owned_ref(ref, record["source"])}
+            desired = {ref: oid for ref, oid in desired.items() if ref not in deleted}
+        original_branch = record["original_branch"]
+        before_files, written = {}, {}
+        applied = False
+        try:
+            if self.current_branch() != "main":
+                self.run(["switch", "--no-guess", "--no-overwrite-ignore", "--", "main"])
+            if (self._local_refs() != before_refs or self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])):
+                raise GitError("写回前分支引用或 main 工作区发生变化。")
+            for path in paths:
+                actual = self._review_file_state(self.path, path)
+                if not self._review_same_content(actual, data["right"].get(path)):
+                    raise GitError(f"main 文件在写回前发生变化：{path}")
+                before_files[path] = actual
+                if actual:
+                    destination = self._review_path(backup, path)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(self._review_path(self.path, path), destination)
+            self._write_review_json(backup / "state.json", before_files)
+            for path, action in result.changes:
+                if self._review_file_state(self.path, path) != before_files[path]:
+                    raise GitError(f"写回期间 main 文件被其他程序修改：{path}")
+                target = self._review_path(self.path, path)
+                if action == "删除":
+                    target.unlink(missing_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    self._atomic_review_copy(self._review_path(root / "main", path), target, data["write_modes"][path])
+                written[path] = self._review_file_state(self.path, path)
+            left, right = self._validate_review_output(root, data)
+            signature = hashlib.sha256(json.dumps([data, left, right], sort_keys=True,
+                                                  ensure_ascii=False).encode("utf-8")).hexdigest()
+            if signature != result.output_signature:
+                raise GitError("写回期间编辑副本发生变化。")
+            if any(self._review_file_state(self.path, path) != state for path, state in written.items()):
+                raise GitError("写回期间 main 文件发生变化。")
+            for name in ("main", record["source"]):
+                self._assert_branch_not_in_other_worktree(name)
+            self._replace_managed_refs(before_refs, desired)
+            applied = True
+            self.run(["read-tree", commit])
+        except (GitError, OSError) as error:
+            if not applied:
+                for path, state in reversed(list(written.items())):
+                    try:
+                        if self._review_file_state(self.path, path) == state:
+                            target = self._review_path(self.path, path)
+                            if before_files[path] is None:
+                                target.unlink(missing_ok=True)
+                            else:
+                                self._atomic_review_copy(self._review_path(backup, path), target, before_files[path]["mode"])
+                    except (GitError, OSError):
+                        pass
+                if original_branch != "main" and self.current_branch() == "main":
+                    self.run(["switch", "--no-guess", "--no-overwrite-ignore", "--", original_branch], check=False)
+            else:
+                # Refs already contain the completed result; retain its recovery
+                # record rather than claiming cancellation can undo the commit.
+                record["completed_commit"] = commit
+                self._write_review_json(backup / "merge.json", record)
+                (self.metadata_path / "merge.json").unlink(missing_ok=True)
+            raise GitError(f"手动合并未全部完成，已尝试恢复；对比副本：{root}；恢复资料：{backup}\n{error}") from error
         (self.metadata_path / "merge.json").unlink(missing_ok=True)
-        self.remember_working_branch()
-        message = "合并已完成到 main，保留双方历史；尚未发布，也未创建标签。请检查结果，再由用户点击“发布正式版本”。"
-        return message + ("\n" + state.notice if state.notice else "")
+        message = "合并结果已保存为 main 的普通提交；尚未发布，也未创建标签。"
+        try:
+            if delete_source:
+                self._remove_branch_metadata(record["source"], deleted)
+                message += f"已删除本地 {record['source']} 及其全部 beta 标签；下次“同步远程”时传播删除。"
+            self.remember_working_branch()
+        except (GitError, OSError) as error:
+            message += f"\n提交已完成，元数据清理未完成：{error}；恢复资料：{backup}"
+        self._remove_review_session(root)
+        return message
 
     def abort_merge(self) -> str:
-        if not self.merge_state().active:
+        if not self.merge_state().active and not self._git_path("MERGE_HEAD").exists():
             raise GitError("没有正在进行的合并。")
-        self.run(["merge", "--abort"])
-        (self.metadata_path / "merge.json").unlink(missing_ok=True)
-        return "合并已取消，已恢复到开始合并时的 main，未创建正式标签。"
-
-    def resolve_merge_file(self, path: str, delete: bool = False) -> str:
-        state = self.merge_state()
-        if path not in state.conflicts:
-            raise GitError("所选文件已不在冲突列表，请刷新。")
-        if not delete:
-            target = self.path / path
-            if not target.is_file() or target.is_symlink():
-                raise GitError("请先保存合并结果，或明确选择删除此文件。")
-            if re.search(
-                rb"^(?:<{7}|={7}|>{7})(?:\s|$)", target.read_bytes(), re.MULTILINE,
-            ):
-                raise GitError("文件仍有冲突标记，请处理后再标记已解决。")
-            self.run(["--literal-pathspecs", "add", "--", path])
-        else:
-            self.run(["--literal-pathspecs", "rm", "-f", "--ignore-unmatch", "--", path])
-        merge_path = self.metadata_path / "merge.json"
+        if self._git_path("MERGE_HEAD").exists():
+            self.run(["merge", "--abort"])
         try:
-            merge = json.loads(merge_path.read_text(encoding="utf-8"))
+            record = json.loads((self.metadata_path / "merge.json").read_text(encoding="utf-8"))
+            session_id = record.get("comparison_session", "")
         except (OSError, ValueError):
-            merge = {}
-        merge["manual_resolution"] = [
-            item for item in merge.get("manual_resolution", []) if item != path
-        ]
-        merge_path.write_text(json.dumps(merge, ensure_ascii=False), encoding="utf-8")
-        return f"已标记解决：{path}"
+            session_id = ""
+        if re.fullmatch(r"[0-9a-f]{32}", session_id):
+            self._remove_review_session(self.metadata_path / "merge-review" / session_id)
+        (self.metadata_path / "merge.json").unlink(missing_ok=True)
+        try:
+            (self.metadata_path / "merge-review").rmdir()
+            self.metadata_path.rmdir()
+        except OSError:
+            pass
+        return "合并已取消；工作区、分支和标签未更改。"
 
     def _merge_review_record(self) -> dict:
-        state = self.merge_state()
-        if not state.active or self.current_branch() != "main":
-            raise GitError("当前没有 main 上的合并，请先开始合并。")
         try:
             record = json.loads((self.metadata_path / "merge.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            raise GitError("合并记录不可用，请先备份当前结果，再取消并重新合并。") from None
-        refs = self._local_refs()
+            raise GitError("手动合并记录不可用；请备份对比副本后取消并重新开始。") from None
         source = record.get("source", "")
-        tag = record.get("source_tag")
-        if tag and self.run(["rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"], check=False).strip() != record.get("source_oid"):
-            raise GitError("本次合并的 beta 标签已经变化，请先备份结果，再取消并重新确认。")
-        if (not source or refs.get("refs/heads/main") != record.get("target_oid")
+        refs = self._local_refs()
+        expected_refs = {ref: oid for ref, oid in record.get("local_refs", [])}
+        tag_oid = self.run([
+            "rev-parse", "--verify", f"refs/tags/{record.get('source_tag', '')}^{{commit}}",
+        ], check=False).strip()
+        if (not source or not expected_refs or refs != expected_refs
+                or refs.get("refs/heads/main") != record.get("target_oid")
                 or refs.get(f"refs/heads/{source}") != record.get("source_oid")
-                or self.run(["rev-parse", "--verify", "MERGE_HEAD"]).strip() != record.get("source_oid")):
-            raise GitError("合并引用已经变化，请先备份当前结果，再取消并重新确认合并。")
+                or tag_oid != record.get("source_oid")):
+            raise GitError("手动合并期间分支或标签引用已变化；请备份对比副本后取消并重新确认。")
+        if (self.current_branch() != record.get("original_branch")
+                or self.run(["rev-parse", "--verify", "HEAD"], check=False).strip() != record.get("original_head")
+                or self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])):
+            raise GitError("手动合并期间工作区或检出分支已变化；请保存修改后取消并重新开始。")
+        if self._git_path("MERGE_HEAD").exists():
+            raise GitError("检测到其他 Git 合并操作；请先处理该操作。")
         return record
 
     @staticmethod
@@ -1959,14 +1981,13 @@ class GitRepository:
         return {name: (mode, blobs[oid] if kind == "blob" else oid.encode("ascii"))
                 for name, mode, kind, oid in entries}
 
-    def _review_snapshot(self, paths: Sequence[str]) -> dict:
-        record = self._merge_review_record()
+    def _review_snapshot(self, paths: Sequence[str] = ()) -> dict:
         return {
             "refs": [list(item) for item in sorted(self._local_refs().items())],
-            "merge_head": self.run(["rev-parse", "MERGE_HEAD"]).strip(),
+            "branch": self.current_branch(),
+            "head": self.run(["rev-parse", "--verify", "HEAD"], check=False).strip(),
             "index": self.run(["ls-files", "--stage", "-z"]),
-            "manual": sorted(record.get("manual_resolution", [])),
-            "worktree": {path: self._review_file_state(self.path, path) for path in paths},
+            "status": self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
         }
 
     def _review_session_data(self, session: MergeComparisonSession) -> Tuple[Path, dict]:
@@ -1983,110 +2004,141 @@ class GitRepository:
             raise GitError("合并对比会话记录不匹配。")
         return root, data
 
+    @staticmethod
+    def _remove_review_session(root: Path) -> None:
+        if root.is_symlink() or root.parent.is_symlink() or not root.exists():
+            return
+        for directory, _directories, _filenames in os.walk(root, followlinks=False):
+            path = Path(directory)
+            if not path.is_symlink():
+                path.chmod(0o755)
+        shutil.rmtree(root, ignore_errors=True)
+
+    def _gitignored_paths(self, root: Path, paths: Sequence[str]) -> set:
+        git_directory = root / ".git"
+        environment = os.environ.copy()
+        environment["GIT_CONFIG_GLOBAL"] = os.devnull
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        initialized = subprocess.run(
+            ["git", "-C", str(root), "init", "-q"], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=environment,
+        )
+        if initialized.returncode != 0:
+            raise GitError(initialized.stderr.strip() or "无法读取版本中的 .gitignore 规则。")
+        try:
+            (git_directory / "info" / "exclude").write_text("", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(root), "config", "--local", "core.excludesFile", os.devnull],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
+            )
+            result = subprocess.run(
+                ["git", "-C", str(root), "check-ignore", "--no-index", "--stdin", "-z"],
+                input=("\0".join(paths) + ("\0" if paths else "")).encode("utf-8", "surrogateescape"),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+            )
+            if result.returncode not in (0, 1):
+                message = result.stderr.decode("utf-8", errors="replace").strip()
+                raise GitError(message or "无法读取版本中的 .gitignore 规则。")
+            return {
+                value.decode("utf-8", errors="surrogateescape")
+                for value in result.stdout.split(b"\0") if value
+            }
+        finally:
+            shutil.rmtree(git_directory, ignore_errors=True)
+
+    def _filter_review_ignored(self, roots: Sequence[Path], paths: Sequence[str]) -> List[str]:
+        ignored = set()
+        for root in roots:
+            ignored.update(self._gitignored_paths(root, paths))
+        for path in ignored:
+            for root in roots:
+                target = self._review_path(root, path)
+                if target.is_symlink() or target.is_file():
+                    target.unlink(missing_ok=True)
+                elif target.is_dir():
+                    shutil.rmtree(target)
+        for root in roots:
+            for directory, _directories, _filenames in os.walk(root, topdown=False):
+                current = Path(directory)
+                if current != root:
+                    try:
+                        current.rmdir()
+                    except OSError:
+                        pass
+        return sorted(ignored)
+
     def prepare_merge_comparison(self, use_main: Optional[bool] = None) -> MergeComparisonSession:
         record = self._merge_review_record()
-        source_label = display_version(record.get("source_tag", record["source"]))
-        existing = record.get("comparison_session")
-        if existing:
-            session = MergeComparisonSession(existing, source_label)
+        source_label = display_version(record["source_tag"])
+        session = MergeComparisonSession(record["comparison_session"], source_label)
+        root = self.metadata_path / "merge-review" / session.session_id
+        if root.is_symlink() or root.parent.is_symlink():
+            raise GitError("合并对比会话目录不可用。")
+        if (root / "session.json").is_file():
             root, data = self._review_session_data(session)
-            now = self._review_snapshot(data["paths"])
-            before = data["snapshot"]
-            # Marking a file resolved changes only the index/manual list.
-            # Reopening is allowed to take a fresh snapshot of that decision.
-            if any(now[key] != before[key] for key in ("refs", "merge_head", "worktree")):
-                raise GitError(f"实际 main 或合并引用已变化，不能覆盖已有编辑副本。请先备份副本 {root / 'main'}，再完成或取消本次合并。")
-            data["snapshot"] = now
-            self._write_review_json(root / "session.json", data)
+            if self._review_snapshot() != data["snapshot"]:
+                raise GitError(f"工作区、分支或引用已变化，不能继续本次对比；副本保存在 {root}。")
             self._validate_review_output(root, data)
             for path in data["editable"]:
                 output = self._review_file_state(root / "main", path)
                 if output is not None:
                     self._review_path(root / "main", path).chmod(0o644)
             return session
+
         incoming = self._review_git_files(record["source_oid"])
         main = self._review_git_files(record["target_oid"])
-        index_paths = [entry.split("\t", 1)[1] for entry in self.run(["ls-files", "--stage", "-z"]).split("\0") if entry]
-        paths = sorted(set(main) | set(incoming) | set(index_paths))
-        snapshot = self._review_snapshot(paths)
-        conflicts = set(self.merge_state().conflicts)
-        initial = record.get("initial_conflicts", {})
-        ambiguous = []
-        for path in sorted(conflicts):
-            actual = snapshot["worktree"].get(path)
-            if actual and actual["kind"] == "file":
-                main_data = main.get(path)
-                main_hash = hashlib.sha256(main_data[1]).hexdigest() if main_data and main_data[0] in ("100644", "100755") else None
-                if actual.get("sha256") != main_hash and initial.get(path) != actual:
-                    ambiguous.append(path)
-        if ambiguous and use_main is None:
-            return MergeComparisonSession("", source_label, tuple(ambiguous))
-        session = MergeComparisonSession(uuid.uuid4().hex, source_label)
-        root = self.metadata_path / "merge-review" / session.session_id
-        for directory in ("branch", "main", "original"):
+        paths = sorted(set(main) | set(incoming))
+        for directory in ("branch", "main"):
             (root / directory).mkdir(parents=True, exist_ok=False)
-        editable, defaults, special = [], [], set()
-        write_modes = {}
+
+        special = set()
         for path in paths:
-            entries = [tree.get(path) for tree in (main, incoming)]
-            actual = snapshot["worktree"][path]
+            entries = [tree.get(path) for tree in (incoming, main)]
             if (any(entry and entry[0] not in ("100644", "100755") for entry in entries)
-                    or actual and actual["kind"] != "file"
                     or any(other.startswith(path + "/") for other in paths)):
                 special.add(path)
         special.update(path for path in paths if any(path.startswith(parent + "/") for parent in special.copy()))
         for path in paths:
-            actual = snapshot["worktree"][path]
-            if actual and actual["kind"] == "file":
-                destination = self._review_path(root / "original", path)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(self._review_path(self.path, path), destination)
-            entry = incoming.get(path)
-            if entry:
-                self._write_review_entry(root / "branch", path, entry)
-            # Preserve existing edits; untouched conflict markers start from
-            # pre-merge main, and an explicit choice covers ambiguous old merges.
-            reset = (path in conflicts and path not in special and path != WORKSPACE_VERSION
-                     and (use_main is True or path not in ambiguous))
-            if reset:
-                entry = main.get(path)
-                if entry:
-                    self._write_review_entry(root / "main", path, entry)
-                defaults.append(path)
-            elif actual:
-                if actual["kind"] == "file":
-                    self._write_review_entry(root / "main", path, (
-                        "100755" if actual["mode"] & 0o111 else "100644",
-                        self._review_path(self.path, path).read_bytes(),
-                    ))
-                elif actual["kind"] != "directory":
-                    text = "[只读特殊文件] " + json.dumps(actual, ensure_ascii=False) + "\n"
-                    self._write_review_entry(root / "main", path, ("readonly", text.encode("utf-8")))
+            if path in incoming:
+                self._write_review_entry(root / "branch", path, incoming[path])
+            if path in main:
+                self._write_review_entry(root / "main", path, main[path])
+
+        ignored_paths = self._filter_review_ignored((root / "branch", root / "main"), paths)
+        ignored = set(ignored_paths)
+        paths = [path for path in paths if path not in ignored]
+        special.difference_update(ignored)
+        editable, write_modes = [], {}
+        for path in paths:
             left = self._review_file_state(root / "branch", path)
             right = self._review_file_state(root / "main", path)
             if (path not in special and path != WORKSPACE_VERSION
                     and not self._review_same_content(left, right)):
                 editable.append(path)
-                write_modes[path] = (actual["mode"] if actual else
-                                     0o755 if incoming.get(path, ("", b""))[0] == "100755" else 0o644)
-        defaults = [path for path in defaults if path in editable]
-        # Known empty parent directories permit source-only files to be copied.
+                entry = main.get(path) or incoming.get(path)
+                write_modes[path] = 0o755 if entry[0] == "100755" else 0o644
+
         for path in editable:
             self._review_path(root / "main", path).parent.mkdir(parents=True, exist_ok=True)
         for side in ("branch", "main"):
             for path, info in self._review_tree_state(root / side).items():
                 if info["kind"] == "file":
-                    mode = 0o644 if side == "main" and path in editable else 0o444
-                    self._review_path(root / side, path).chmod(mode)
-        data = {"id": session.session_id, "source_label": source_label, "paths": paths,
-                "editable": editable, "write_modes": write_modes, "defaults": defaults, "snapshot": snapshot,
-                "left": self._review_tree_state(root / "branch"),
-                "right": self._review_tree_state(root / "main")}
+                    self._review_path(root / side, path).chmod(
+                        0o644 if side == "main" and path in editable else 0o444
+                    )
+            if side == "branch":
+                for directory, _directories, _filenames in os.walk(root / side, topdown=False):
+                    Path(directory).chmod(0o555)
+        snapshot = self._review_snapshot()
+        data = {
+            "id": session.session_id, "source_label": source_label, "paths": paths,
+            "ignored_paths": ignored_paths, "editable": editable, "write_modes": write_modes,
+            "snapshot": snapshot, "left": self._review_tree_state(root / "branch"),
+            "right": self._review_tree_state(root / "main"),
+        }
         self._write_review_json(root / "session.json", data)
-        if self._review_snapshot(paths) != snapshot:
-            raise GitError(f"准备对比时 main 已变化，未修改实际文件；已保留副本：{root}")
-        record["comparison_session"] = session.session_id
-        self._write_review_json(self.metadata_path / "merge.json", record)
+        if self._review_snapshot() != snapshot:
+            raise GitError(f"准备对比时工作区或引用已变化；副本保存在 {root}。")
         return session
 
     def _write_review_entry(self, root: Path, path: str, entry: Tuple[str, bytes]) -> None:
@@ -2109,116 +2161,71 @@ class GitRepository:
             before, after = data["right"].get(path), right.get(path)
             if path not in editable:
                 if before != after:
+                    if path in data.get("ignored_paths", []):
+                        raise GitError(f"此路径匹配 .gitignore，不能写回：{path}。编辑副本已保留，实际 main 未写回。")
                     raise GitError(f"相同文件、VERSION、特殊文件或未知路径不可修改：{path}。编辑副本已保留，实际 main 未写回。")
             elif after and after["kind"] != "file":
                 raise GitError(f"差异文件不能改为符号链接、目录或特殊文件：{path}。")
         return left, right
 
     def launch_merge_comparison(self, session: MergeComparisonSession) -> MergeComparisonResult:
+        record = self._merge_review_record()
         root, data = self._review_session_data(session)
-        if self._review_snapshot(data["paths"]) != data["snapshot"]:
-            raise GitError(f"实际 main 或暂存区已经变化，已停止启动；编辑副本保存在 {root}。")
+        if self._review_snapshot() != data["snapshot"]:
+            raise GitError(f"工作区或引用已变化，不能启动对比；副本保存在 {root}。")
         self._validate_review_output(root, data)
         tool = self.compare_tool()
         label, command = COMPARE_TOOLS[tool]
-        if not shutil.which(command):
-            raise GitError(f"没有找到 {label}，请安装或在设置中更换工具。编辑副本已保留：{root}")
-        environment = os.environ.copy()
-        if tool == "bcompare":
-            environment["XDG_CONFIG_HOME"] = str(prepare_bcompare_config(root, merge_review=True))
-            args = [command, "-solo", "-leftreadonly", f"-lefttitle={session.source_label}（只读）",
-                    "-righttitle=main（编辑副本）", str(root / "branch"), str(root / "main")]
-        elif tool == "meld":
-            args = [command, "--label", session.source_label + "（只读）", "--label", "main（编辑副本）",
-                    str(root / "branch"), str(root / "main")]
-        else:
-            args = [command, str(root / "branch"), str(root / "main"),
-                    "--L1", session.source_label + "（只读）", "--L2", "main（编辑副本）"]
+        record["tool_closed"] = False
+        record.pop("output_signature", None)
+        self._write_review_json(self.metadata_path / "merge.json", record)
         try:
+            if not shutil.which(command):
+                raise GitError(f"没有找到 {label}，请安装或在设置中更换工具。")
+            environment = os.environ.copy()
+            # Ignored paths have already been removed from both isolated trees,
+            # so every tool receives exactly the same Git-filtered inputs.
+            if tool == "bcompare":
+                environment["XDG_CONFIG_HOME"] = str(prepare_bcompare_config(root, merge_review=True))
+                args = [command, "-solo", "-leftreadonly", f"-lefttitle={session.source_label}（只读）",
+                        "-righttitle=main（编辑副本）", str(root / "branch"), str(root / "main")]
+            elif tool == "meld":
+                args = [command, "--label", session.source_label + "（只读）",
+                        "--label", "main（编辑副本）", str(root / "branch"), str(root / "main")]
+            else:
+                args = [command, str(root / "branch"), str(root / "main"),
+                        "--L1", session.source_label + "（只读）", "--L2", "main（编辑副本）"]
             result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
-        except OSError as error:
-            raise GitError(f"无法启动 {label}，实际 main 未写回；编辑副本保存在 {root}。\n{error}") from error
-        if result.returncode not in (0, 1):
-            raise GitError(f"{label} 已取消或执行失败，实际 main 未写回；副本保存在 {root}。\n{result.stderr.strip()}")
-        return self.merge_comparison_result(session)
+            if result.returncode not in (0, 1):
+                raise GitError(result.stderr.strip() or f"{label} 已取消或执行失败。")
+            comparison = self.merge_comparison_result(session)
+            record["output_signature"] = comparison.output_signature
+            record.pop("tool_error", None)
+            return comparison
+        except (OSError, GitError) as error:
+            record["tool_error"] = str(error)
+            raise GitError(f"对比未完成，实际工作区未写回；副本保存在 {root}。\n{error}") from error
+        finally:
+            record["tool_closed"] = True
+            self._write_review_json(self.metadata_path / "merge.json", record)
 
     def merge_comparison_result(self, session: MergeComparisonSession) -> MergeComparisonResult:
+        record = self._merge_review_record()
+        if session.session_id != record["comparison_session"]:
+            raise GitError("对比会话与本次手动合并不匹配。")
         root, data = self._review_session_data(session)
-        if self._review_snapshot(data["paths"]) != data["snapshot"]:
-            raise GitError(f"实际 main、暂存区或合并引用已变化，未写回；编辑副本：{root / 'main'}")
+        if self._review_snapshot() != data["snapshot"]:
+            raise GitError(f"工作区、暂存区或引用已变化，未写回；编辑副本：{root / 'main'}")
         left, right = self._validate_review_output(root, data)
         changes = []
         for path in data["editable"]:
-            actual = data["snapshot"]["worktree"][path]
+            original = data["right"].get(path)
             output = right.get(path)
-            modified = not self._review_same_content(data["right"].get(path), output)
-            if (modified or path in data["defaults"]) and not self._review_same_content(actual, output):
-                changes.append((path, "删除" if output is None else "新增" if actual is None else "更新"))
+            if not self._review_same_content(original, output):
+                changes.append((path, "删除" if output is None else "新增" if original is None else "更新"))
         signature = hashlib.sha256(json.dumps(
             [data, left, right], sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         return MergeComparisonResult(session, tuple(changes), signature)
-
-    def apply_merge_comparison(self, result: MergeComparisonResult) -> str:
-        session = result.session
-        if self.merge_comparison_result(session) != result:
-            raise GitError("对比副本在确认后又发生变化，请重新查看写回清单。")
-        root, data = self._review_session_data(session)
-        if not result.changes:
-            return "没有需要写回的差异；合并状态未改变。"
-        record = self._merge_review_record()
-        backup = root / "writeback" / uuid.uuid4().hex
-        backup.mkdir(parents=True)
-        before = {path: self._review_file_state(self.path, path) for path, _action in result.changes}
-        for path, _action in result.changes:
-            if before[path] is not None:
-                destination = self._review_path(backup, path)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(self._review_path(self.path, path), destination)
-        self._write_review_json(backup / "state.json", before)
-        self._write_review_json(backup / "merge.json", record)
-        if self.merge_comparison_result(session) != result:
-            raise GitError(f"写回前状态已变化，操作取消；备份：{backup}")
-        written = {}
-        try:
-            for path, _action in result.changes:
-                if self._review_file_state(self.path, path) != before[path]:
-                    raise GitError(f"写回期间文件被其他程序修改：{path}")
-                source = self._review_path(root / "main", path)
-                target = self._review_path(self.path, path)
-                if source.exists():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    self._atomic_review_copy(source, target, data["write_modes"][path])
-                else:
-                    target.unlink(missing_ok=True)
-                written[path] = self._review_file_state(self.path, path)
-            expected_snapshot = dict(data["snapshot"])
-            expected_snapshot["worktree"] = dict(data["snapshot"]["worktree"], **written)
-            if self._review_snapshot(data["paths"]) != expected_snapshot:
-                raise GitError("写回期间合并引用、暂存区或工作区发生变化。")
-            left, right = self._validate_review_output(root, data)
-            signature = hashlib.sha256(json.dumps(
-                [data, left, right], sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-            if signature != result.output_signature:
-                raise GitError("写回期间编辑副本发生变化。")
-            record["manual_resolution"] = sorted(set(record.get("manual_resolution", []))
-                                                   | {path for path, _action in result.changes})
-            self._write_review_json(self.metadata_path / "merge.json", record)
-        except (OSError, GitError) as error:
-            for path, applied in reversed(list(written.items())):
-                try:
-                    if self._review_file_state(self.path, path) == applied:
-                        target = self._review_path(self.path, path)
-                        if before[path] is None:
-                            target.unlink(missing_ok=True)
-                        else:
-                            self._atomic_review_copy(self._review_path(backup, path), target, before[path]["mode"])
-                except (OSError, GitError):
-                    pass  # Keep the independent backup; never force concurrent edits away.
-            raise GitError(f"写回未完成，已尝试恢复本次文件修改；备份和编辑副本保留在 {root}。\n{error}") from error
-        data["snapshot"] = self._review_snapshot(data["paths"])
-        data["defaults"] = []
-        self._write_review_json(root / "session.json", data)
-        return f"已将 {len(result.changes)} 个文件结果应用到 main，请检查并逐项标记解决；尚未完成合并或发布。写回前备份：{backup}"
 
     @staticmethod
     def _atomic_review_copy(source: Path, target: Path, mode: int) -> None:
@@ -2238,23 +2245,28 @@ class GitRepository:
 
     def plan_branch_deletion(self, name: str) -> BranchDeletionPlan:
         self._validate_branch_name(name)
-        self._ensure_full_history()
+        if name == "main":
+            raise GitError("main 分支不能删除。")
         self._assert_clean()
         self._assert_branch_not_in_other_worktree(name)
         refs = self._local_refs()
-        if name == "main" or self.current_branch() != "main":
-            raise GitError("请在 main 上清理已合并的开发分支，不能删除 main。")
-        source = refs.get(f"refs/heads/{name}")
-        if not source:
-            raise GitError("开发分支不存在，请刷新分支列表。")
-        if not self._contains_commit(source, refs["refs/heads/main"]):
-            raise GitError("开发分支尚未完全合入 main，不能清理。")
-        releases = self.formal_releases()
-        if not releases or releases[0].commit != refs["refs/heads/main"]:
-            raise GitError("请先在 main 发布包含合并结果的正式版本，再清理开发分支。")
+        if f"refs/heads/{name}" not in refs:
+            raise GitError("本地分支不存在，请刷新分支列表。")
+        if self.current_branch() == name:
+            if "refs/heads/main" not in refs:
+                raise GitError("缺少 main，不能删除当前分支；请先建立 main。")
+            self._assert_branch_not_in_other_worktree("main")
+            self._assert_clean(refs["refs/heads/main"])
         return BranchDeletionPlan(name, tuple(sorted(refs.items())))
 
-    def delete_merged_branch(self, name: str, expected: Optional[BranchDeletionPlan] = None) -> str:
+    def _remove_branch_metadata(self, name: str, deleted: Dict[str, str]) -> None:
+        self.run(["config", "--local", "--remove-section", f"branch.{name}"], check=False)
+        for ref in deleted:
+            if ref.startswith("refs/tags/"):
+                (self.metadata_path / MANIFEST_DIRECTORY / (ref[len("refs/tags/"):] + MANIFEST_SUFFIX)).unlink(missing_ok=True)
+        self._write_changelog(None)
+
+    def delete_branch(self, name: str, expected: Optional[BranchDeletionPlan] = None) -> str:
         plan = self.plan_branch_deletion(name)
         if expected is not None and expected != plan:
             raise GitError("删除确认后本地引用已变化，请重新查看删除清单。")
@@ -2264,14 +2276,26 @@ class GitRepository:
         namespace = self._recovery_namespace("delete-branch")
         self._save_recovery_refs(namespace, deleted, "before")
         self._save_metadata_recovery(namespace)
-        self._assert_branch_not_in_other_worktree(name)
-        self._replace_managed_refs(before, {ref: oid for ref, oid in before.items() if ref not in deleted})
-        self.run(["config", "--local", "--remove-section", f"branch.{name}"], check=False)
-        for ref in deleted:
-            if ref.startswith("refs/tags/"):
-                (self.metadata_path / MANIFEST_DIRECTORY / (ref[len("refs/tags/"):] + MANIFEST_SUFFIX)).unlink(missing_ok=True)
-        self._write_changelog(None)
-        return f"已清理本地 {name} 及其全部 beta 标签；下次“同步远程”将传播删除。合并历史保留，恢复点：{namespace}。"
+        original_branch = self.current_branch()
+        switched = original_branch == name
+        if switched:
+            self.run(["switch", "--no-guess", "--no-overwrite-ignore", "--", "main"])
+        try:
+            self._assert_clean()
+            self._assert_branch_not_in_other_worktree(name)
+            if self.current_branch() == name:
+                raise GitError("删除前当前分支发生变化，请重新确认。")
+            self._replace_managed_refs(before, {ref: oid for ref, oid in before.items() if ref not in deleted})
+        except GitError:
+            if switched and self.current_branch() == "main":
+                self.run(["switch", "--no-guess", "--no-overwrite-ignore", "--", name], check=False)
+            raise
+        self._remove_branch_metadata(name, deleted)
+        self.remember_working_branch()
+        return f"已删除本地分支 {name} 及其全部 beta 标签；下次“同步远程”将传播删除。恢复点：{namespace}。"
+
+    def delete_merged_branch(self, name: str, expected: Optional[BranchDeletionPlan] = None) -> str:
+        return self.delete_branch(name, expected=expected)
 
     def head_label(self) -> str:
         exact = self.run(["describe", "--tags", "--exact-match", "HEAD"], check=False).strip()
@@ -3425,10 +3449,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.branch_combo.connect("changed", self.on_branch_selected)
         self.branch_bar.pack_start(self.branch_combo, False, False, 0)
         self.new_branch_button = self._command_button("新建分支", "list-add-symbolic", self.on_create_branch)
-        self.refresh_branches_button = self._command_button("刷新远程分支", "view-refresh-symbolic", self.on_refresh_remote_branches)
         self.merge_button = self._command_button("合并到 main", "emblem-shared-symbolic", self.on_merge_to_main)
-        self.delete_branch_button = self._command_button("删除已合并分支", "edit-delete-symbolic", self.on_delete_merged_branch)
-        for button in (self.new_branch_button, self.refresh_branches_button, self.merge_button, self.delete_branch_button):
+        self.delete_branch_button = self._command_button("删除分支", "edit-delete-symbolic", self.on_delete_branch)
+        for button in (self.new_branch_button, self.merge_button, self.delete_branch_button):
             self.branch_bar.pack_start(button, False, False, 0)
         self.branch_status_label = Gtk.Label(xalign=0, ellipsize=3)
         self.branch_status_label.set_hexpand(True)
@@ -3441,22 +3464,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.merge_status_label.set_line_wrap(True)
         self.merge_bar.pack_start(self.merge_status_label, False, False, 0)
         merge_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.conflict_combo = Gtk.ComboBoxText()
-        self.conflict_combo.set_hexpand(True)
-        merge_actions.pack_start(self.conflict_combo, True, True, 0)
-        self.merge_tool_button = Gtk.Button(label="对比分支与 main（完整目录）")
-        self.merge_tool_button.connect("clicked", self.on_merge_tool)
-        self.resolve_button = Gtk.Button(label="标记已解决")
-        self.resolve_button.connect("clicked", self.on_resolve_conflict)
-        self.resolve_delete_button = Gtk.Button(label="以删除解决")
-        self.resolve_delete_button.connect("clicked", self.on_resolve_conflict, True)
         self.complete_merge_button = Gtk.Button(label="完成合并")
         self.complete_merge_button.connect("clicked", self.on_complete_merge)
         self.abort_merge_button = Gtk.Button(label="取消合并")
         self.abort_merge_button.connect("clicked", self.on_abort_merge)
-        for button in (self.merge_tool_button, self.resolve_button, self.resolve_delete_button,
-                       self.complete_merge_button, self.abort_merge_button):
-            merge_actions.pack_start(button, False, False, 0)
+        merge_actions.pack_end(self.abort_merge_button, False, False, 0)
+        merge_actions.pack_end(self.complete_merge_button, False, False, 0)
         self.merge_bar.pack_start(merge_actions, False, False, 0)
         root.pack_start(self.merge_bar, False, False, 0)
 
@@ -3696,8 +3709,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.updating_history_scope = False
         self._save_repository_path(self.workspace_path)
         self.refresh()
-        if self.repository and self.repository.remote_url():
-            self.on_refresh_remote_branches(None)
 
     def _invalidate_requests(self) -> None:
         self.branch_generation += 1
@@ -3743,9 +3754,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.branch_bar.set_sensitive(not self.busy and not state.active)
             has_head = bool(repo.run(["rev-parse", "--verify", "HEAD"], check=False).strip())
             self.new_branch_button.set_sensitive(has_head)
-            self.refresh_branches_button.set_sensitive(bool(remote_url))
             self.merge_button.set_sensitive(any(branch.name == "main" for branch in branches) and len(branches) > 1)
-            self.delete_branch_button.set_sensitive(repo.current_branch() == "main" and len(branches) > 1)
+            self.delete_branch_button.set_sensitive(any(branch.name != "main" for branch in branches))
             self.branch_status_label.set_text("main 发正式版；开发分支发自己的预发布版")
             self._refresh_merge_controls(state)
         finally:
@@ -3756,61 +3766,20 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if not state.active:
             self.merge_bar.hide()
             return
-        self.merge_status_label.set_text(
-            f"正在合并 {state.source or '开发分支'} → main：{len(state.conflicts)} 个未解决冲突。"
-            "解决后请标记并完成合并；也可取消。完成前禁止切换、发布和同步。"
-            + ("\n" + state.notice if state.notice else "")
-        )
-        self.conflict_combo.remove_all()
-        for path in state.conflicts:
-            self.conflict_combo.append(path, path)
-        self.conflict_combo.set_active(0)
-        self.complete_merge_button.set_sensitive(state.ready)
-        self.merge_tool_button.set_label(f"对比 {state.source or '开发分支'} 与 main（完整目录）")
-        self.merge_tool_button.set_sensitive(state.active and not self.busy)
-        self.merge_tool_button.set_tooltip_text("左侧分支只读，右侧 main 编辑副本；关闭工具后确认写回，再标记解决。")
-        for button in (self.resolve_button, self.resolve_delete_button):
-            button.set_sensitive(bool(state.conflicts))
+        message = f"正在手动合并 {state.source or '开发分支'} → main。"
+        if state.tool_closed:
+            message += "对比工具已关闭，请完成合并或取消。"
+        else:
+            message += "请在对比工具内逐项同步，保存后关闭工具。"
+        message += "完成前禁止切换、发布和同步；VERSION 保留 main 原值。"
+        self.merge_status_label.set_text(message)
+        self.complete_merge_button.set_no_show_all(not state.tool_closed)
+        self.abort_merge_button.set_no_show_all(not state.tool_closed)
+        self.complete_merge_button.set_visible(state.tool_closed)
+        self.abort_merge_button.set_visible(state.tool_closed)
+        self.complete_merge_button.set_sensitive(state.ready and not self.busy)
+        self.abort_merge_button.set_sensitive(not self.busy)
         self.merge_bar.show_all()
-
-    def on_refresh_remote_branches(self, _button) -> None:
-        repo = self.repository
-        if not repo or self.busy:
-            return
-        try:
-            remote_url = repo._sync_target()
-        except GitError as error:
-            self.branch_status_label.set_text(str(error))
-            return
-        self.branch_generation += 1
-        generation = self.branch_generation
-        self.remote_branch_url = remote_url
-        self.refresh_branches_button.set_sensitive(False)
-        self.branch_status_label.set_text("正在读取远程分支…")
-
-        def worker():
-            try:
-                branches, error = repo.remote_branches(), ""
-            except Exception as exception:
-                branches, error = [], str(exception)
-            GLib.idle_add(self._remote_branches_complete, repo, generation, remote_url, branches, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _remote_branches_complete(self, repo, generation, remote_url, branches, error) -> bool:
-        if repo is not self.repository or generation != self.branch_generation or self.busy:
-            return False
-        try:
-            if repo._sync_target() != remote_url:
-                return False
-        except GitError:
-            return False
-        self.remote_branch_choices = branches
-        self._refresh_branch_choices()
-        message = "远程分支读取失败：" + error if error else f"origin 共 {len(branches)} 个分支；网站标签仍是仓库级列表。"
-        self.branch_status_label.set_text(message.splitlines()[0])
-        self.branch_status_label.set_tooltip_text(message)
-        return False
 
     def on_branch_selected(self, combo) -> None:
         if self.updating_branch_choices or self.busy or not self.repository:
@@ -3893,133 +3862,95 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             return False
         dialog = Gtk.MessageDialog(transient_for=self, modal=True,
                                    message_type=Gtk.MessageType.QUESTION,
-                                   buttons=Gtk.ButtonsType.OK_CANCEL, text="确认合并最新 beta 到 main？")
+                                   buttons=Gtk.ButtonsType.OK_CANCEL, text="打开手动合并目录对比？")
         dialog.format_secondary_text(
             f"来源：{display_version(plan.source_tag)}\n提交：{plan.source_oid}\n\n"
             f"目标：main / {plan.target_version}\n提交：{plan.target_oid}\n\n"
-            "Git 将保留双方历史；有冲突时由用户处理并标记解决。\n"
-            "本次只合并，不发布、不创建标签。VERSION 保留 main 的值；正式版本由用户另行发布。"
+            "左侧为来源只读副本，右侧为 main 编辑副本，请逐项同步后保存并关闭工具。\n"
+            "任一侧 .gitignore 忽略的路径均隐藏且不写回。完成时保存 main 普通提交，"
+            "不发布、不创建标签；VERSION 保留 main 的值。"
         )
         dialog.set_default_response(Gtk.ResponseType.CANCEL)
         response = dialog.run()
         dialog.destroy()
         if response == Gtk.ResponseType.OK:
             repo = self.repository
-            self.run_background("正在将最新 beta 合并到 main…",
-                                lambda: repo.merge_to_main(plan.source, expected=plan), "合并已完成，尚未发布。")
-        return False
-
-    def on_merge_tool(self, _button) -> None:
-        if self.repository and not self.busy:
-            repo = self.repository
             self.run_background(
-                "正在准备完整目录对比…", repo.prepare_merge_comparison, "编辑副本已准备。",
-                result_callback=self._background_comparison_prepared,
+                "正在准备手动合并目录…", lambda: repo.merge_to_main(plan.source, expected=plan),
+                "对比副本已就绪。", result_callback=self._background_comparison_prepared,
             )
+        return False
 
     def _background_comparison_prepared(self, session: MergeComparisonSession) -> bool:
         self._end_background()
         self.refresh()
         repo = self.repository
-        if not repo or not repo.merge_state().active:
-            return False
-        if session.choice_paths:
-            dialog = Gtk.MessageDialog(
-                transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
-                buttons=Gtk.ButtonsType.NONE, text="检测到已编辑或无法确认来源的冲突内容",
+        if repo and repo.merge_state().active:
+            self.run_background(
+                "请在对比工具中逐项同步，保存并关闭工具…",
+                lambda: repo.launch_merge_comparison(session), "对比工具已关闭。",
+                result_callback=self._background_comparison_ready,
             )
-            dialog.format_secondary_text(
-                "这些文件可能已有人工修改，原内容会先备份：\n"
-                + "\n".join(session.choice_paths)
-                + "\n\n选择右侧编辑副本的初始内容。实际 main 此时不会改变。"
-            )
-            dialog.add_button("取消", Gtk.ResponseType.CANCEL)
-            dialog.add_button("从 main 原内容开始", Gtk.ResponseType.NO)
-            dialog.add_button("沿用当前结果", Gtk.ResponseType.YES)
-            dialog.set_default_response(Gtk.ResponseType.YES)
-            response = dialog.run()
-            dialog.destroy()
-            if response in (Gtk.ResponseType.NO, Gtk.ResponseType.YES):
-                self.run_background(
-                    "正在准备完整目录对比…",
-                    lambda: repo.prepare_merge_comparison(use_main=response == Gtk.ResponseType.NO),
-                    "编辑副本已准备。", result_callback=self._background_comparison_prepared,
-                )
-            return False
-        self.run_background(
-            "完整目录对比已打开：左侧分支只读，右侧 main 可编辑…",
-            lambda: repo.launch_merge_comparison(session), "对比工具已关闭。",
-            result_callback=self._background_comparison_ready,
-        )
         return False
 
     def _background_comparison_ready(self, result: MergeComparisonResult) -> bool:
         self._end_background()
         self.refresh()
+        self.status_label.set_text(f"对比工具已关闭，共 {len(result.changes)} 项文件变更；请选择完成合并或取消合并。")
+        return False
+
+    def on_complete_merge(self, _button) -> None:
+        if not self.repository or self.busy:
+            return
+        repo = self.repository
+        def preview():
+            record = repo._merge_review_record()
+            session = MergeComparisonSession(record["comparison_session"], display_version(record["source_tag"]))
+            return repo.merge_comparison_result(session)
+        self.run_background("正在检查手动合并结果…", preview, "合并结果已就绪。",
+                            result_callback=self._confirm_complete_merge)
+
+    def _confirm_complete_merge(self, result: MergeComparisonResult) -> bool:
+        self._end_background()
+        self.refresh()
         if not self.repository:
             return False
-        if not result.changes:
-            self.status_label.set_text("没有需要写回的差异；编辑副本已保留，冲突仍需检查并标记。")
-            return False
-        dialog = Gtk.Dialog(title="将以下编辑结果应用到 main？", transient_for=self, modal=True)
-        dialog.add_button("保留副本，稍后处理", Gtk.ResponseType.CANCEL)
-        dialog.add_button("应用到 main", Gtk.ResponseType.OK)
+        dialog = Gtk.Dialog(title="完成合并", transient_for=self, modal=True)
+        dialog.add_buttons("返回", Gtk.ResponseType.CANCEL, "完成合并", Gtk.ResponseType.OK)
         dialog.set_default_response(Gtk.ResponseType.CANCEL)
         dialog.set_default_size(740, 480)
-        self._add_maximize_button(dialog)
         content = dialog.get_content_area()
-        note = Gtk.Label(
-            label="只应用右侧允许修改的差异文件。冲突文件采用的 main 原内容也会列在清单中。\n"
-                  "应用后请逐项检查并标记解决；本次不会完成合并、发布或创建 Tag。",
+        content.pack_start(Gtk.Label(
+            label="将以下手动选择的结果保存为 main 普通提交；保留 VERSION，不发布或创建标签。",
             xalign=0, wrap=True, margin=12,
-        )
-        content.pack_start(note, False, False, 0)
+        ), False, False, 0)
         view = Gtk.TextView(editable=False, monospace=True)
-        view.get_buffer().set_text("\n".join(f"{action} · {path}" for path, action in result.changes))
+        view.get_buffer().set_text("\n".join(f"{action} · {path}" for path, action in result.changes)
+                                   or "没有文件变化；完成后创建 main 普通提交以记录此次确认。")
         scroll = Gtk.ScrolledWindow()
         scroll.add(view)
         content.pack_start(scroll, True, True, 12)
+        cleanup = Gtk.CheckButton(label="删除来源分支及其全部 beta 标签（仅本地）", margin=12)
+        cleanup.set_active(True)
+        content.pack_start(cleanup, False, False, 0)
         dialog.show_all()
         response = dialog.run()
+        delete_source = cleanup.get_active()
         dialog.destroy()
         if response == Gtk.ResponseType.OK:
             repo = self.repository
-            self.run_background("正在校验并应用编辑结果…",
-                                lambda: repo.apply_merge_comparison(result), "已应用，请标记解决。")
+            self.run_background("正在保存 main 并完成合并…",
+                                lambda: repo.complete_merge(delete_source=delete_source), "合并已完成。")
         return False
 
-    def on_resolve_conflict(self, _button, delete: bool = False) -> None:
-        path = self.conflict_combo.get_active_id()
-        if not path or not self.repository:
-            return
-        if delete:
-            dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
-                                       buttons=Gtk.ButtonsType.OK_CANCEL, text=f"确定以删除解决 {path} 的冲突？")
-            response = dialog.run()
-            dialog.destroy()
-            if response != Gtk.ResponseType.OK:
-                return
-        repo = self.repository
-        self.run_background("正在记录冲突解决结果…", lambda: repo.resolve_merge_file(path, delete), "冲突已处理。")
-
-    def on_complete_merge(self, _button) -> None:
-        if self.repository:
-            self.run_background("正在完成合并…", self.repository.complete_merge, "合并已完成。")
-
     def on_abort_merge(self, _button) -> None:
-        if not self.repository:
-            return
-        dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
-                                   buttons=Gtk.ButtonsType.OK_CANCEL, text="取消合并并丢弃本次冲突解决内容？")
-        response = dialog.run()
-        dialog.destroy()
-        if response == Gtk.ResponseType.OK:
-            self.run_background("正在取消合并…", self.repository.abort_merge, "合并已取消。")
+        if self.repository and not self.busy:
+            self.run_background("正在取消手动合并…", self.repository.abort_merge, "合并已取消。")
 
-    def on_delete_merged_branch(self, _button) -> None:
+    def on_delete_branch(self, _button) -> None:
         if not self.repository or self.busy:
             return
-        name = self._choose_development_branch("清理已发布合并结果的开发分支")
+        name = self._choose_development_branch("删除分支")
         if name:
             repo = self.repository
             self.run_background("正在检查分支与 beta 标签清理清单…",
@@ -4033,11 +3964,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             if ref == f"refs/heads/{plan.name}" or self.repository._owned_ref(ref, plan.name):
                 label = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else display_version(ref[len("refs/tags/"):])
                 rows.append("本地 · " + label)
-        dialog = Gtk.Dialog(title="确认删除以下分支和标签", transient_for=self, modal=True)
+        dialog = Gtk.Dialog(title="删除分支", transient_for=self, modal=True)
         dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "确认删除", Gtk.ResponseType.OK)
         dialog.set_default_size(650, 400)
         text = Gtk.TextView(editable=False, monospace=True)
-        text.get_buffer().set_text("\n".join(rows) + "\n\n清理本地分支及全部 beta 标签；main 合并历史保留，下次整仓同步远程时传播删除。")
+        text.get_buffer().set_text("\n".join(rows) + "\n\n删除上述本地分支及其全部 beta 标签，包括尚未合入 main 的提交。main 不会被删除；下次整仓同步远程时传播删除。")
         scroll = Gtk.ScrolledWindow()
         scroll.add(text)
         dialog.get_content_area().pack_start(scroll, True, True, 12)
@@ -4046,7 +3977,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.destroy()
         if response == Gtk.ResponseType.OK:
             repo = self.repository
-            self.run_background("正在删除已合并分支…", lambda: repo.delete_merged_branch(
+            self.run_background("正在删除分支…", lambda: repo.delete_branch(
                 plan.name, expected=plan,
             ), "分支已删除。")
 
@@ -4151,6 +4082,16 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def _set_remote_status(self, status: RemoteSyncStatus) -> None:
         self.remote_status = status
+        if status.state == "unavailable":
+            self.remote_branch_choices = []
+            self._refresh_branch_choices()
+        elif status.state in ("pending", "synced") and status.snapshot is not None:
+            self.remote_branch_url = status.snapshot.remote_url
+            self.remote_branch_choices = sorted([
+                BranchInfo(ref[len("refs/heads/"):], "remote", oid)
+                for ref, oid in status.remote_refs if ref.startswith("refs/heads/")
+            ], key=lambda branch: branch.name)
+            self._refresh_branch_choices()
         self.remote_summary_label.set_text(status.message.splitlines()[0][:200])
         self.remote_summary_label.set_tooltip_text(status.message)
         pending = bool(status.local_changes or status.remote_changes)
@@ -4344,7 +4285,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def on_refresh(self, _button) -> None:
         self.remote_sync_error = None
         self.refresh()
-        self.on_refresh_remote_branches(None)
 
     def on_about(self, _button) -> None:
         dialog = Gtk.AboutDialog(transient_for=self, modal=True)

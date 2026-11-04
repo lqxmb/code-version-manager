@@ -782,7 +782,85 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.create_branch("test2")
         self.assertEqual("branches/test2/v0.3.0-beta.0.0.1", self.repository.next_version())
 
-    def test_merge_keeps_main_formal_version_and_merges_branch_history(self):
+    def test_manual_merge_isolated_until_single_parent_commit_and_optional_cleanup(self):
+        repo = self.repository
+        repo.create_branch("test1")
+        (self.path / "robot.txt").write_text("branch edit\n")
+        repo.save_version("test1/v0.2.0-beta.0.0.1", "feature", ["robot.txt"])
+        source_oid = repo.run(["rev-parse", "HEAD"]).strip()
+        repo.switch_branch("main")
+        (self.path / "robot.txt").write_text("main edit\n")
+        repo.save_version("v0.3.0", "formal", ["robot.txt"])
+        main_oid = repo.run(["rev-parse", "HEAD"]).strip()
+        tags = repo.tags()
+        refs = dict(repo._local_refs())
+
+        session = repo.merge_to_main("test1")
+        root, _data = repo._review_session_data(session)
+        self.assertEqual("main", repo.current_branch())
+        self.assertEqual(main_oid, repo.run(["rev-parse", "HEAD"]).strip())
+        self.assertEqual(refs, repo._local_refs())
+        self.assertFalse(repo._git_path("MERGE_HEAD").exists())
+        self.assertEqual("main edit\n", (self.path / "robot.txt").read_text())
+        (root / "main" / "robot.txt").write_text("manual result\n")
+
+        original = MODULE.subprocess.run
+        def close_tool(command, **options):
+            if command[0] == "git":
+                return original(command, **options)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        with mock.patch.object(MODULE.shutil, "which", return_value="/tool"), \
+                mock.patch.object(MODULE.subprocess, "run", side_effect=close_tool):
+            result = repo.launch_merge_comparison(session)
+        self.assertEqual((("robot.txt", "更新"),), result.changes)
+        repo.complete_merge(delete_source=False)
+
+        parents = repo.run(["rev-list", "--parents", "-n", "1", "HEAD"]).split()
+        self.assertEqual(2, len(parents))
+        self.assertEqual(main_oid, parents[1])
+        self.assertNotEqual(source_oid, parents[1])
+        self.assertEqual("manual result\n", (self.path / "robot.txt").read_text())
+        self.assertEqual("0.3.0\n", (self.path / "VERSION").read_text())
+        self.assertEqual(tags, repo.tags())
+        self.assertIn("refs/heads/test1", repo._local_refs())
+
+    def test_delete_unmerged_or_current_branch_and_beta_tags_with_recovery(self):
+        repo = self.repository
+        repo.create_branch("test1")
+        (self.path / "feature.txt").write_text("unmerged feature\n")
+        repo.save_version("test1/v0.2.0-beta.0.0.1", "feature", ["feature.txt"])
+        beta = MODULE.canonical_version("test1/v0.2.0-beta.0.0.1")
+        repo.delete_branch("test1", expected=repo.plan_branch_deletion("test1"))
+        self.assertNotIn("refs/heads/test1", repo._local_refs())
+        self.assertNotIn(beta, repo.tags())
+        self.assertTrue(repo.run(["for-each-ref", "--format=%(refname)", "refs/code-version-manager/recovery/"]).strip())
+        self.assertEqual("main", repo.current_branch())
+
+        repo.create_branch("current-feature")
+        repo.switch_branch("current-feature")
+        result = repo.delete_branch("current-feature")
+        self.assertIn("current-feature", result)
+        self.assertEqual("main", repo.current_branch())
+        with self.assertRaisesRegex(MODULE.GitError, "main 分支不能删除"):
+            repo.plan_branch_deletion("main")
+
+    def test_delete_branch_rejects_dirty_worktree_and_other_worktree_use(self):
+        repo = self.repository
+        repo.create_branch("test1")
+        (self.path / "robot.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.GitError, "工作区有尚未发布的修改"):
+            repo.plan_branch_deletion("test1")
+        (self.path / "robot.txt").write_text("base\n", encoding="utf-8")
+        repo.switch_branch("main")
+        worktree = self.root / "other-worktree"
+        repo.run(["worktree", "add", str(worktree), "test1"])
+        with self.assertRaisesRegex(MODULE.GitError, "另一个工作区使用"):
+            repo.plan_branch_deletion("test1")
+        repo.run(["worktree", "remove", str(worktree)])
+        repo.delete_branch("test1")
+        self.assertNotIn("refs/heads/test1", repo._local_refs())
+
+    def legacy_test_merge_keeps_main_formal_version_and_merges_branch_history(self):
         repo = self.repository
         repo.create_branch("test1")
         (self.path / "robot.txt").write_text("feature side\n")
@@ -810,7 +888,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.git(self.path, "merge-base", "--is-ancestor", feature, "main")
         self.assertNotIn("v0.3.1", repo.tags())
 
-    def test_merge_handles_both_branches_adding_version_and_can_abort(self):
+    def legacy_test_merge_handles_both_branches_adding_version_and_can_abort(self):
         self.repository.create_branch("branch1")
         (self.path / "robot.txt").write_text("branch1 side\n", encoding="utf-8")
         (self.path / "branch1.txt").write_text("feature\n", encoding="utf-8")
@@ -835,7 +913,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual("0.3.0\n", (self.path / "VERSION").read_text())
         self.assertFalse((self.path / "branch1.txt").exists())
 
-    def test_legacy_merge_does_not_introduce_beta_version_to_main(self):
+    def legacy_test_legacy_merge_does_not_introduce_beta_version_to_main(self):
         self.repository.run(["rm", "VERSION"])
         self.repository.run(["commit", "-m", "legacy main without VERSION"])
         self.repository.run(["tag", "-f", "-a", "v0.2.0", "-m", "legacy main"])
@@ -850,7 +928,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertFalse((self.path / "VERSION").exists())
         self.assertNotIn("v0.2.1", self.repository.tags())
 
-    def test_merge_keeps_newer_main_version_when_source_still_has_inherited_formal_number(self):
+    def legacy_test_merge_keeps_newer_main_version_when_source_still_has_inherited_formal_number(self):
         self.repository.create_branch("test1")
         (self.path / "feature.txt").write_text("feature\n", encoding="utf-8")
         self.repository.save_version(
@@ -865,7 +943,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual("0.3.0\n", (self.path / "VERSION").read_text())
         self.assertTrue((self.path / "feature.txt").is_file())
 
-    def test_legacy_custom_version_does_not_replace_main_formal_version(self):
+    def legacy_test_legacy_custom_version_does_not_replace_main_formal_version(self):
         self.repository.create_branch("test1")
         (self.path / "VERSION").write_text("nightly-custom\n")
         (self.path / "feature.txt").write_text("feature\n")
@@ -879,7 +957,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertTrue((self.path / "feature.txt").exists())
         self.assertNotIn("v0.2.1", self.repository.tags())
 
-    def test_merge_does_not_automatically_resolve_symlink_version_file(self):
+    def legacy_test_merge_does_not_automatically_resolve_symlink_version_file(self):
         self.repository.save_version("v0.2.1", "main version", ["robot.txt"])
         self.repository.create_branch("test1")
         (self.path / "VERSION").unlink()
@@ -897,7 +975,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertFalse((self.path / "VERSION").is_symlink())
         self.assertEqual("0.2.1\n", (self.path / "VERSION").read_text())
 
-    def test_merge_preserves_labels_until_formal_publication_and_explicit_cleanup(self):
+    def legacy_test_merge_preserves_labels_until_formal_publication_and_explicit_cleanup(self):
         self.repository.create_branch("test1")
         (self.path / "feature.txt").write_text("feature\n")
         self.repository.save_version("test1/v0.2.0-beta.0.0.1", "feature", ["feature.txt"])
@@ -919,7 +997,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("v0.2.0", self.repository.tags())
         self.git(self.path, "merge-base", "--is-ancestor", beta, "main")
 
-    def test_merge_conflicts_block_switch_and_publish_until_resolved_and_can_abort(self):
+    def legacy_test_merge_conflicts_block_switch_and_publish_until_resolved_and_can_abort(self):
         self.repository.create_branch("test1")
         (self.path / "robot.txt").write_text("test side\n", encoding="utf-8")
         self.repository.save_version("test1/v0.2.0-beta.0.0.1", "test edit", ["robot.txt"])
@@ -964,7 +1042,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertFalse(self.repository.merge_state().active)
         self.assertEqual(before_abort, self.repository.run(["rev-parse", "HEAD"]).strip())
 
-    def test_merge_is_local_and_does_not_implicitly_fast_forward_remote_changes(self):
+    def legacy_test_merge_is_local_and_does_not_implicitly_fast_forward_remote_changes(self):
         remote = self.root / "origin.git"
         self.git(self.root, "init", "--bare", "-q", str(remote))
         self.repository.configure_remote(str(remote), "Test", "test@example.com")
@@ -988,7 +1066,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertFalse((self.path / "remote.txt").exists())
         self.assertEqual(remote_head, self.git(remote, "rev-parse", "main"))
 
-    def test_whole_sync_propagates_branch_and_beta_cleanup_after_formal_publication(self):
+    def legacy_test_whole_sync_propagates_branch_and_beta_cleanup_after_formal_publication(self):
         remote = self.root / "origin.git"
         self.git(self.root, "init", "--bare", "-q", str(remote))
         self.repository.configure_remote(str(remote), "Test", "test@example.com")
@@ -1083,7 +1161,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("v0.2.0", self.repository.tags())
         self.assertNotIn("test1", [branch.name for branch in self.repository.local_branches()])
 
-    def test_merge_tools_receive_two_directories_and_require_explicit_application(self):
+    def legacy_test_merge_tools_receive_two_directories_and_require_explicit_application(self):
         self.repository.create_branch("test1")
         (self.path / "robot.txt").write_text("incoming side\n")
         self.repository.save_version("test1/v0.2.0-beta.0.0.1", "incoming", ["robot.txt"])
@@ -1116,7 +1194,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.resolve_merge_file("robot.txt")
         self.repository.complete_merge()
 
-    def test_directory_comparison_accepts_add_add_conflicts(self):
+    def legacy_test_directory_comparison_accepts_add_add_conflicts(self):
         self.repository.create_branch("test1")
         (self.path / "shared.txt").write_text("feature copy\n")
         self.repository.save_version("test1/v0.2.0-beta.0.0.1", "feature", ["shared.txt"])
@@ -1134,7 +1212,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.resolve_merge_file("shared.txt")
         self.repository.complete_merge()
 
-    def test_directory_comparison_accepts_modify_delete_conflicts(self):
+    def legacy_test_directory_comparison_accepts_modify_delete_conflicts(self):
         for deleted_side in ("main", "test1"):
             with self.subTest(deleted_side=deleted_side):
                 path = self.root / ("deleted-" + deleted_side)
