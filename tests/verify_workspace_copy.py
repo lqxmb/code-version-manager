@@ -116,7 +116,7 @@ def verify(workspace):
                 except MODULE.GitError as error:
                     anomalies[branch.name] = {'expected_legacy_warning': str(error)}
         report['branch_baselines'] = anomalies
-        repo.sync_remote()
+        repo.sync_remote(scope="all")
         assert managed_refs(remote) == original_refs
         report['initial_whole_push'] = 'passed'
         main = original_refs['refs/heads/main']
@@ -126,7 +126,7 @@ def verify(workspace):
                        and MODULE.parse_version_tag(ref)[0] is None), None)
         if formal:
             git(remote, 'update-ref', formal, main)
-        snap = repo.sync_snapshot()
+        snap = repo.sync_snapshot(scope="all")
         status = repo.remote_sync_status(snap)
         assert status.can_sync_local, status.local_message
         repo.sync_local_from_remote(snap, status)
@@ -135,13 +135,33 @@ def verify(workspace):
         report['whole_pull_with_shared_tag_change'] = 'passed'
         repo.run(['branch', '-D', 'cvm-verification-remote-only'])
         repo.run(['branch', 'cvm-verification-local-only', 'main'])
-        repo.sync_remote()
+        repo.sync_remote(scope="all")
         assert repo._local_refs() == managed_refs(remote)
         assert git(remote, 'show-ref', '--verify', 'refs/tags/cvm-verification-note')
         assert not git(remote, 'for-each-ref', '--format=%(refname)', 'refs/code-version-manager/')
         assert list((repo.metadata_path / 'recovery').rglob('git-config'))
         report['whole_push_with_branch_deletion'] = 'passed'
         report['private_refs_excluded_and_recovery_created'] = 'passed'
+        # Exercise the default current-branch scope against the same temporary
+        # origin, including independent branches absent on the other side.
+        repo.switch_branch('main')
+        git(copy, 'branch', 'cvm-verification-kept-local', 'main')
+        git(remote, 'update-ref', 'refs/heads/cvm-verification-kept-remote', git(remote, 'rev-parse', 'main'))
+        kept_local = git(copy, 'rev-parse', 'cvm-verification-kept-local')
+        kept_remote = git(remote, 'rev-parse', 'cvm-verification-kept-remote')
+        git(copy, 'commit', '--allow-empty', '-q', '-m', 'isolated current branch upload')
+        repo.sync_remote()
+        assert git(remote, 'rev-parse', 'cvm-verification-kept-remote') == kept_remote
+        assert not git(remote, 'for-each-ref', 'refs/heads/cvm-verification-kept-local')
+        remote_main = git(remote, 'rev-parse', 'main')
+        git(copy, 'commit', '--allow-empty', '-q', '-m', 'isolated current branch download')
+        snap = repo.sync_snapshot()
+        status = repo.remote_sync_status(snap)
+        repo.sync_local_from_remote(snap, status)
+        assert git(copy, 'rev-parse', 'main') == remote_main
+        assert git(copy, 'rev-parse', 'cvm-verification-kept-local') == kept_local
+        assert not git(copy, 'for-each-ref', 'refs/heads/cvm-verification-kept-remote')
+        report['current_branch_push_and_pull_preserve_other_branches'] = 'passed'
     after = fingerprint(source.path)
     report['source_unchanged'] = after == before
     if after != before:

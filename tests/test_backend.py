@@ -1030,7 +1030,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         remote = self.root / "origin.git"
         self.git(self.root, "init", "--bare", "-q", str(remote))
         self.repository.configure_remote(str(remote), "Test User", "test@example.com")
-        snapshot = self.repository.sync_snapshot()
+        snapshot = self.repository.sync_snapshot(scope="all")
         status = self.repository.remote_sync_status(snapshot)
         self.repository.sync_remote_from_local(snapshot, status)
         self.assertIn(version, self.git(remote, "tag").splitlines())
@@ -1442,7 +1442,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.git(peer, "tag", "-f", "-a", "v0.2.0", "-m", "rewritten remote label")
         self.git(peer, "push", "-q", "--force", "origin", "main", "refs/tags/v0.2.0")
 
-        snapshot = self.repository.sync_snapshot()
+        snapshot = self.repository.sync_snapshot(scope="all")
         status = self.repository.remote_sync_status(snapshot)
 
         self.assertTrue(status.can_sync_remote, status.remote_message)
@@ -1479,7 +1479,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         notes = (imported / "CHANGELOG.rst").read_text()
         self.assertIn("camera preview", notes)
         self.assertNotIn("0.3.0 (", notes)
-        snapshot = repo.sync_snapshot()
+        snapshot = repo.sync_snapshot(scope="all")
         status = repo.remote_sync_status(snapshot)
         self.assertTrue(status.can_sync_local, status.local_message)
         repo.sync_local_from_remote(snapshot, status)
@@ -1498,7 +1498,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.switch_branch("main")
         self.git(self.path, "tag", "-d", "v0.2.0")
 
-        snapshot = self.repository.sync_snapshot()
+        snapshot = self.repository.sync_snapshot(scope="all")
         status = self.repository.remote_sync_status(snapshot)
 
         self.assertTrue(status.can_sync_local, status.local_message)
@@ -2033,8 +2033,9 @@ class RemoteRepositoryTest(unittest.TestCase):
 
 
     def test_uses_actual_working_branch_instead_of_assuming_main(self):
-        self.repository.run(["switch", "-c", "release"])
         self.configure()
+        self.repository.sync_remote()
+        self.repository.run(["switch", "-c", "release"])
         self.publish("v0.0.1-beta.0.0.1")
         self.repository.sync_remote()
 
@@ -2677,7 +2678,7 @@ class BranchPresentationTest(unittest.TestCase):
         self.assertTrue(rows["branch:feature"][3])
         self.assertFalse(rows["branch:main"][3])
 
-    def test_delete_branch_selection_starts_backend_delete_without_confirmation(self):
+    def test_delete_branch_selection_checks_remote_before_confirmation(self):
         window = mock.Mock()
         window.repository = mock.Mock()
         window.busy = False
@@ -2686,10 +2687,12 @@ class BranchPresentationTest(unittest.TestCase):
         MODULE.VersionManagerWindow.on_delete_branch(window, None)
 
         busy, operation, success = window.run_background.call_args.args
-        self.assertEqual("正在删除分支…", busy)
-        self.assertEqual("分支已删除。", success)
+        self.assertEqual("正在检查分支和远程状态…", busy)
+        self.assertEqual("", success)
         operation()
-        window.repository.delete_branch.assert_called_once_with("retreat_teb")
+        window.repository.preview_branch_deletion.assert_called_once_with("retreat_teb")
+        window.repository.delete_branch.assert_not_called()
+        self.assertIn("result_callback", window.run_background.call_args.kwargs)
 
     def test_inherited_formal_release_is_marked_read_only(self):
         temp = tempfile.TemporaryDirectory()
