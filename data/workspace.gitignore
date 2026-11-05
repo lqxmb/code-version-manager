@@ -1,0 +1,30 @@
+# Catkin-generated output
+/build/
+/devel/
+/install/
+/build_isolated/
+/devel_isolated/
+/install_isolated/
+/.catkin_workspace
+
+# Local editor settings
+/.vscode/
+
+# Logs and caches
+/log/
+/logs/
+/.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor temporary files
+*.swp
+*~
+
+# ZIP exports
+*.zip
+
+# Local generated release files
+/VERSION
+/CHANGELOG.rst

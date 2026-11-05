@@ -23,6 +23,8 @@ install -m 0755 "$project_dir/debian/postinst" "$stage/DEBIAN/postinst"
 install -m 0755 "$project_dir/debian/postrm" "$stage/DEBIAN/postrm"
 install -m 0755 "$project_dir/src/code_version_manager.py" \
     "$stage/usr/lib/$package_name/code_version_manager.py"
+install -m 0644 "$project_dir/data/workspace.gitignore" \
+    "$stage/usr/lib/$package_name/workspace.gitignore"
 install -m 0644 "$project_dir/VERSION" "$stage/usr/lib/$package_name/VERSION"
 install -m 0644 "$project_dir/data/bcompare/BCSessions.xml" \
     "$stage/usr/lib/$package_name/bcompare/BCSessions.xml"

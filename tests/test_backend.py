@@ -66,8 +66,8 @@ class GitRepositoryTest(unittest.TestCase):
             / MODULE.MANIFEST_DIRECTORY
             / f"v0.0.2{MODULE.MANIFEST_SUFFIX}"
         )
-        self.assertEqual("VERSION\nrobot.txt\n", manifest.read_text(encoding="utf-8"))
-        self.assertEqual([".git"], sorted(path.name for path in self.path.glob(".*")))
+        self.assertEqual(".gitignore\nrobot.txt\n", manifest.read_text(encoding="utf-8"))
+        self.assertEqual([".git", ".gitignore"], sorted(path.name for path in self.path.glob(".*")))
         downloaded_changelog = self.path / "CHANGELOG.rst"
         self.repository.download_changelog(downloaded_changelog)
         changelog_text = downloaded_changelog.read_text(encoding="utf-8")
@@ -122,7 +122,7 @@ class GitRepositoryTest(unittest.TestCase):
         self.repository.run(["config", "--local", "codeversionmanager.syncVersionFile", "false"])
         self.repository.save_version("v0.0.2", "mandatory version", ["robot.txt"])
         self.assertEqual("0.0.2\n", (self.path / "VERSION").read_text())
-        self.assertIn("VERSION", self.repository.manifest("v0.0.2"))
+        self.assertNotIn("VERSION", self.repository.manifest("v0.0.2"))
         other = self.path / "other-workspace"
         other.mkdir()
         MODULE.create_repository(other)
@@ -131,7 +131,7 @@ class GitRepositoryTest(unittest.TestCase):
     def test_publish_syncs_existing_version_even_when_not_selected(self):
         version_path = self.path / "VERSION"
         version_path.write_text("0.0.1\n", encoding="utf-8")
-        self.git("add", "VERSION")
+        self.git("add", "-f", "VERSION")
         self.git("commit", "-q", "-m", "add VERSION")
         version_path.write_text("staged version\n", encoding="utf-8")
         (self.path / "other.txt").write_text("staged other\n", encoding="utf-8")
@@ -142,21 +142,21 @@ class GitRepositoryTest(unittest.TestCase):
         self.repository.save_version("v1.7.8.9.7", "new release", ["robot.txt"])
 
         self.assertEqual("1.7.8.9.7\n", version_path.read_text(encoding="utf-8"))
-        self.assertEqual("1.7.8.9.7\n", self.repository.run(["show", "v1.7.8.9.7:VERSION"]))
-        self.assertEqual("1.7.8.9.7\n", self.repository.run(["show", ":VERSION"]))
+        self.assertNotIn("VERSION", self.repository.run(["ls-tree", "--name-only", "v1.7.8.9.7"]).splitlines())
+        self.assertEqual("", self.repository.run(["ls-files", "--", "VERSION"]))
         self.assertEqual(staged_other, self.repository.run(["show", ":other.txt"]))
         self.assertEqual("unstaged other\n", (self.path / "other.txt").read_text(encoding="utf-8"))
-        self.assertEqual(["VERSION", "robot.txt"], self.repository.manifest("v1.7.8.9.7"))
+        self.assertEqual([".gitignore", "robot.txt"], self.repository.manifest("v1.7.8.9.7"))
         archive = self.path / "release.zip"
         self.repository.export("v1.7.8.9.7", archive)
         with zipfile.ZipFile(archive) as bundle:
-            self.assertEqual(b"1.7.8.9.7\n", bundle.read("VERSION"))
+            self.assertNotIn("VERSION", bundle.namelist())
 
     def test_main_publication_always_creates_and_updates_version(self):
         for version in ("v0.0.2", "v0.0.3", "v0.0.4"):
             self.repository.save_version(version, "formal release", ["robot.txt"])
             self.assertEqual(version[1:] + "\n", (self.path / "VERSION").read_text())
-            self.assertIn("VERSION", self.repository.manifest(version))
+            self.assertNotIn("VERSION", self.repository.manifest(version))
 
     def test_current_version_uses_nearest_history_tag_and_ignores_unrelated_tags(self):
         self.assertEqual("v0.0.1", self.repository.current_version_tag())
@@ -168,14 +168,16 @@ class GitRepositoryTest(unittest.TestCase):
         self.assertEqual("v0.0.0", self.repository.current_version_tag())
         self.assertEqual("0.0.0\n", (self.path / "VERSION").read_text())
 
-    def test_no_version_tags_does_not_create_or_replace_version(self):
+    def test_no_version_tags_refresh_clears_stale_version(self):
         self.repository.run(["tag", "-d", "v0.0.1"])
         self.repository.run(["tag", "unmanaged-tag"])
         self.assertIsNone(self.repository.current_version_tag())
         self.assertFalse((self.path / "VERSION").exists())
         (self.path / "VERSION").write_text("custom value\n")
         self.assertIsNone(self.repository.current_version_tag())
-        self.assertEqual("custom value\n", (self.path / "VERSION").read_text())
+        self.repository.refresh_workspace_generated_files()
+        self.assertFalse((self.path / "VERSION").exists())
+        self.assertIn("尚无版本", (self.path / "CHANGELOG.rst").read_text())
 
     def test_failed_commit_restores_version_and_staged_files(self):
         hook = Path(self.repository.run(["rev-parse", "--absolute-git-dir"]).strip()) / "hooks" / "pre-commit"
@@ -186,7 +188,7 @@ class GitRepositoryTest(unittest.TestCase):
                 version_path = self.path / "VERSION"
                 if original is not None:
                     version_path.write_bytes(original)
-                    self.git("add", "VERSION")
+                    self.git("add", "-f", "VERSION")
                 head = self.repository.run(["rev-parse", "HEAD"])
                 index = self.repository.run(["ls-files", "--stage", "-z"])
                 with self.assertRaises(MODULE.GitError):
@@ -203,13 +205,13 @@ class GitRepositoryTest(unittest.TestCase):
     def test_version_sync_respects_ignores_and_does_not_follow_symlinks(self):
         version_path = self.path / "VERSION"
         (self.path / ".gitignore").write_text("/VERSION\n", encoding="utf-8")
-        with self.assertRaisesRegex(MODULE.GitError, "VERSION 被 .gitignore"):
-            self.repository.save_version("v0.0.2", "blocked", ["robot.txt"])
-        self.assertFalse(version_path.exists())
-        (self.path / ".gitignore").unlink()
+        self.repository.save_version("v0.0.2", "local version", ["robot.txt"])
+        self.assertEqual("0.0.2\n", version_path.read_text())
+        self.assertNotIn("VERSION", self.repository.manifest("v0.0.2"))
+        version_path.unlink()
         version_path.symlink_to(self.path / "other.txt")
         with self.assertRaisesRegex(MODULE.GitError, "普通文件"):
-            self.repository.save_version("v0.0.2", "blocked", ["robot.txt"])
+            self.repository.save_version("v0.0.3", "blocked", ["robot.txt"])
         self.assertEqual("other\n", (self.path / "other.txt").read_text(encoding="utf-8"))
 
     def test_publish_rejects_unsafe_changelog_target_without_changing_repository(self):
@@ -306,7 +308,8 @@ class GitRepositoryTest(unittest.TestCase):
             self.assertNotIn("CHANGELOG.rst", bundle.namelist())
         self.repository.update_version_message("v0.0.2", "edited description")
         self.repository.delete_version("v0.0.2")
-        self.assertEqual(generated, changelog.read_text(encoding="utf-8"))
+        self.assertNotIn("0.0.2 (", changelog.read_text(encoding="utf-8"))
+        self.assertEqual("0.0.1\n", (self.path / "VERSION").read_text())
 
     def test_recent_workspaces_are_deduplicated_limited_and_persisted(self):
         config_file = self.path / "config" / "settings.ini"
@@ -518,7 +521,7 @@ class GitRepositoryTest(unittest.TestCase):
             sorted(path.name for path in left.iterdir()),
         )
         self.assertEqual(
-            ["VERSION", "other.txt", "robot.txt"],
+            [".gitignore", "other.txt", "robot.txt"],
             sorted(path.name for path in right.iterdir()),
         )
         self.assertEqual(
@@ -707,9 +710,9 @@ class GitRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(repository.changelog_text(), (root / "CHANGELOG.rst").read_text())
         self.assertIn("* initial", (root / "CHANGELOG.rst").read_text())
-        self.assertEqual(b"# custom rules\r\n*.tmp\r\n/CHANGELOG.rst\r\n", (root / ".gitignore").read_bytes())
-        self.assertEqual("1.2.3\n", repository.run(["show", "v1.2.3:VERSION"]))
-        self.assertEqual([".gitignore", "VERSION", "keep.txt"], repository.manifest("v1.2.3"))
+        self.assertEqual(b"# custom rules\r\n*.tmp\r\n/VERSION\r\n/CHANGELOG.rst\r\n", (root / ".gitignore").read_bytes())
+        self.assertEqual("1.2.3\n", (root / "VERSION").read_text())
+        self.assertEqual([".gitignore", "keep.txt"], repository.manifest("v1.2.3"))
         self.assertEqual([], repository.status())
 
     def test_first_publish_in_preconfigured_empty_repository_creates_reference_files(self):
@@ -721,8 +724,8 @@ class GitRepositoryTest(unittest.TestCase):
         repository.save_version("v1.0.0", "first release", ["keep.txt"])
         self.assertTrue((root / "CHANGELOG.rst").exists())
         self.assertEqual("CHANGELOG.rst\n", repository.run(["check-ignore", "CHANGELOG.rst"]))
-        self.assertEqual([".gitignore", "VERSION", "keep.txt"], repository.manifest("v1.0.0"))
-        self.assertEqual("1.0.0\n", repository.run(["show", "v1.0.0:VERSION"]))
+        self.assertEqual([".gitignore", "keep.txt"], repository.manifest("v1.0.0"))
+        self.assertEqual("1.0.0\n", (root / "VERSION").read_text())
         self.assertEqual([], repository.status())
 
     def test_nested_workspace_does_not_use_parent_repository(self):
@@ -997,10 +1000,9 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
             "test1/v0.2.0-beta.0.0.1", "preview one", ["robot.txt", "VERSION"]
         )
         self.assertEqual("test1/v0.2.0-beta.0.0.1\n", (self.path / "VERSION").read_text())
-        self.assertEqual(
-            "test1/v0.2.0-beta.0.0.1\n",
-            self.repository.run(["show", "branches/test1/v0.2.0-beta.0.0.1:VERSION"]),
-        )
+        self.assertNotIn("VERSION", self.repository.run([
+            "ls-tree", "--name-only", "branches/test1/v0.2.0-beta.0.0.1",
+        ]).splitlines())
         legacy = "branches/test1/v0.2.0-beta.9"
         self.repository.run(["tag", "-a", legacy, "-m", "legacy nine"])
         version = "branches/test1/v0.2.0-beta.0.0.10"
@@ -1019,7 +1021,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         archive = self.root / "preview.zip"
         self.repository.export(version, archive)
         with zipfile.ZipFile(archive) as bundle:
-            self.assertEqual(b"test1/v0.2.0-beta.0.0.10\n", bundle.read("VERSION"))
+            self.assertNotIn("VERSION", bundle.namelist())
         notes = "test1/v0.2.0-beta.0.0.10 (2026-11-03)"
         (self.path / "CHANGELOG.rst").write_text(
             f"{notes}\n{'-' * len(notes)}\n* preview notes\n", encoding="utf-8",
@@ -1056,7 +1058,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         notes = self.path / "CHANGELOG.rst"
         original_notes = notes.read_bytes()
         version_file.write_text("staged draft\n")
-        self.repository.run(["add", "VERSION"])
+        self.repository.run(["add", "-f", "VERSION"])
         version_file.write_text("unstaged draft\n")
         before_index = self.repository.run(["ls-files", "--stage", "-z"])
         before_refs = self.repository._local_refs()
@@ -1076,7 +1078,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.repository.save_version(version, "preview", ["robot.txt"])
         self.assertEqual("feature/camera/v0.2.0-beta.0.0.1\n", version_file.read_text())
         self.assertEqual(version, self.repository.current_version_tag())
-        self.assertIn("VERSION", self.repository.manifest(version))
+        self.assertNotIn("VERSION", self.repository.manifest(version))
         self.assertEqual([], self.repository.status())
 
     def test_manual_merge_isolated_until_single_parent_commit_and_optional_cleanup(self):
@@ -1472,7 +1474,11 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual("feature/camera", repo.current_branch())
         self.assertIn("v0.2.0", repo.tags())
         self.assertNotIn("v0.3.0", repo.tags())
-        self.assertEqual(["v0.2.0"], [entry.tags[0] for entry in repo.history()])
+        self.assertEqual(["branches/feature%2Fcamera/v0.2.0-beta.0.0.1", "v0.2.0"], [entry.tags[0] for entry in repo.history()])
+        self.assertEqual("feature/camera/v0.2.0-beta.0.0.1\n", (imported / "VERSION").read_text())
+        notes = (imported / "CHANGELOG.rst").read_text()
+        self.assertIn("camera preview", notes)
+        self.assertNotIn("0.3.0 (", notes)
         snapshot = repo.sync_snapshot()
         status = repo.remote_sync_status(snapshot)
         self.assertTrue(status.can_sync_local, status.local_message)
@@ -1623,7 +1629,7 @@ class WorkspaceReleaseFilesTest(unittest.TestCase):
         (self.path / "CHANGELOG.rst").write_bytes(b"\xff\xfe")
         self.assertIsNone(MODULE.workspace_version_message(self.path, "v0.0.1"))
 
-    def test_generated_ignores_cover_artifacts_and_leave_version_trackable(self):
+    def test_generated_ignores_cover_artifacts_and_both_generated_files(self):
         MODULE.prepare_workspace_release_files(self.path)
         subprocess.run(["git", "init", "-q", str(self.path)], check=True)
         repository = MODULE.GitRepository(self.path)
@@ -1635,7 +1641,7 @@ class WorkspaceReleaseFilesTest(unittest.TestCase):
             "release.zip", "CHANGELOG.rst",
         ]
         self.assertEqual([], repository.filter_ignored(ignored))
-        self.assertEqual(["VERSION", "src/main.py"], repository.filter_ignored(["VERSION", "src/main.py"]))
+        self.assertEqual(["src/main.py"], repository.filter_ignored(["VERSION", "src/main.py"]))
         self.assertEqual([], MODULE.prepare_workspace_release_files(self.path))
         self.assertEqual(1, (self.path / ".gitignore").read_text().splitlines().count("/CHANGELOG.rst"))
 
@@ -1643,8 +1649,9 @@ class WorkspaceReleaseFilesTest(unittest.TestCase):
         notes = self.write_sections().encode("utf-8")
         original = b"*.tmp\r\n/CHANGELOG.rst\r\n"
         (self.path / ".gitignore").write_bytes(original)
+        self.assertEqual([".gitignore"], MODULE.prepare_workspace_release_files(self.path))
+        self.assertEqual(original + b"/VERSION\r\n", (self.path / ".gitignore").read_bytes())
         self.assertEqual([], MODULE.prepare_workspace_release_files(self.path))
-        self.assertEqual(original, (self.path / ".gitignore").read_bytes())
         self.assertEqual(notes, (self.path / "CHANGELOG.rst").read_bytes())
 
     def test_enable_prepares_root_files_before_empty_workspace_check(self):
@@ -1889,7 +1896,7 @@ class RemoteRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(["v0.0.1", "v0.0.2"], self.git(self.remote, "tag").splitlines())
         self.assertEqual("origin/main", self.git(self.path, "rev-parse", "--abbrev-ref", "@{u}"))
-        self.assertEqual([".gitignore", "VERSION", "robot.txt"], self.git(self.remote, "ls-tree", "-r", "--name-only", "main").splitlines())
+        self.assertEqual([".gitignore", "robot.txt"], self.git(self.remote, "ls-tree", "-r", "--name-only", "main").splitlines())
         self.repository.sync_remote()
         self.assertEqual("2", self.git(self.remote, "rev-list", "--count", "main"))
 
@@ -1900,7 +1907,7 @@ class RemoteRepositoryTest(unittest.TestCase):
             self.publish(version)
             self.assertIn(version, self.repository.tags())
             self.assertEqual([], self.repository.status())
-            self.assertEqual(["VERSION", "robot.txt"], self.repository.manifest(version))
+            self.assertEqual(["robot.txt"], self.repository.manifest(version))
             self.assertIn(version[1:], self.repository.changelog_text())
 
         self.git(self.root, "init", "--bare", "-q", str(missing))
@@ -2121,7 +2128,7 @@ class RemoteRepositoryTest(unittest.TestCase):
         self.assertIn("推送分支与版本标签", str(raised.exception))
         self.assertNotIn("Git 最后输出", str(raised.exception))
         self.assertEqual(["v0.0.1", "v0.0.2"], self.repository.tags())
-        self.assertEqual(["VERSION", "robot.txt"], self.repository.manifest("v0.0.2"))
+        self.assertEqual(["robot.txt"], self.repository.manifest("v0.0.2"))
         self.assertEqual("", self.git(self.remote, "for-each-ref"))
 
     def test_retry_after_timeout_when_remote_already_accepted_updates_is_idempotent(self):
@@ -2423,69 +2430,112 @@ class DownloadVersionTest(unittest.TestCase):
 class DownloadChangelogTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.destination = self.root / "CHANGELOG.rst"
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.destination = self.root / "custom-history.rst"
         self.window = mock.Mock()
-        self.window.repository.path = self.root
+        self.window.repository.path = self.workspace
+        self.window.history_scope_combo.get_active_id.return_value = "current"
         self.window.repository.download_changelog.side_effect = (
-            lambda path: path.write_text("generated history\n", encoding="utf-8")
+            lambda path, all_versions=False: path.write_text(
+                "all history\n" if all_versions else "current history\n", encoding="utf-8",
+            )
         )
+        self.dialog = mock.Mock()
+        self.dialog.run.return_value = MODULE.Gtk.ResponseType.OK
+        self.dialog.get_filename.return_value = str(self.destination)
+        chooser_patch = mock.patch.object(MODULE.Gtk, "FileChooserDialog", return_value=self.dialog)
+        self.chooser = chooser_patch.start()
+        self.addCleanup(chooser_patch.stop)
 
-    def tearDown(self):
-        self.temp.cleanup()
+    def test_download_chooses_location_and_runs_in_background(self):
+        root_notes = self.workspace / "CHANGELOG.rst"
+        root_notes.write_text("workspace notes\n")
+        MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
 
-    def test_download_writes_to_workspace_root_without_file_chooser(self):
-        with mock.patch.object(MODULE.Gtk, "FileChooserDialog") as file_chooser, mock.patch.object(
-            MODULE.Gtk, "MessageDialog"
-        ) as message_dialog:
-            MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
-
-        self.assertEqual("generated history\n", self.destination.read_text(encoding="utf-8"))
-        self.window.repository.download_changelog.assert_called_once_with(self.destination)
-        self.window.status_label.set_text.assert_called_once_with(
-            f"CHANGELOG 已下载到 {self.destination}"
+        self.chooser.assert_called_once_with(
+            title="下载 CHANGELOG", parent=self.window, action=MODULE.Gtk.FileChooserAction.SAVE,
         )
-        file_chooser.assert_not_called()
-        message_dialog.assert_not_called()
+        self.dialog.set_current_folder.assert_called_once_with(str(self.workspace))
+        self.dialog.set_current_name.assert_called_once_with("CHANGELOG.rst")
+        self.dialog.set_do_overwrite_confirmation.assert_called_once_with(True)
+        self.dialog.destroy.assert_called_once_with()
+        self.window.repository.download_changelog.assert_not_called()
+        busy, operation, success = self.window.run_background.call_args.args
+        self.assertEqual("正在下载 CHANGELOG...", busy)
+        self.assertEqual(f"CHANGELOG 已下载到 {self.destination}", success)
+        operation()
+        self.window.repository.download_changelog.assert_called_once_with(
+            self.destination, all_versions=False,
+        )
+        self.assertEqual("current history\n", self.destination.read_text())
+        self.assertEqual("workspace notes\n", root_notes.read_text())
         self.window.show_error.assert_not_called()
 
-    def test_existing_file_is_overwritten_after_confirmation(self):
-        self.destination.write_text("manual notes\n", encoding="utf-8")
-        dialog = mock.Mock()
-        dialog.run.return_value = MODULE.Gtk.ResponseType.OK
-        with mock.patch.object(MODULE.Gtk, "MessageDialog", return_value=dialog):
-            MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
+    def test_all_versions_scope_is_passed_to_background_download(self):
+        self.window.history_scope_combo.get_active_id.return_value = "all"
+        self.window.run_background.side_effect = lambda _busy, operation, _success: operation()
 
-        self.assertEqual("generated history\n", self.destination.read_text(encoding="utf-8"))
-        self.window.repository.download_changelog.assert_called_once_with(self.destination)
-        dialog.destroy.assert_called_once_with()
+        MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
+
+        self.window.repository.download_changelog.assert_called_once_with(
+            self.destination, all_versions=True,
+        )
+        self.assertEqual("all history\n", self.destination.read_text())
+
+    def test_existing_file_uses_save_dialog_overwrite_confirmation(self):
+        self.destination.write_text("manual notes\n")
+        with mock.patch.object(MODULE.Gtk, "MessageDialog") as message_dialog:
+            MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
+        self.dialog.set_do_overwrite_confirmation.assert_called_once_with(True)
+        self.assertEqual("manual notes\n", self.destination.read_text())
+        self.window.run_background.call_args.args[1]()
+        self.assertEqual("current history\n", self.destination.read_text())
+        message_dialog.assert_not_called()
 
     def test_cancel_preserves_existing_file(self):
-        self.destination.write_text("manual notes\n", encoding="utf-8")
-        dialog = mock.Mock()
-        dialog.run.return_value = MODULE.Gtk.ResponseType.CANCEL
-        with mock.patch.object(MODULE.Gtk, "MessageDialog", return_value=dialog):
-            MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
-
-        self.assertEqual("manual notes\n", self.destination.read_text(encoding="utf-8"))
-        self.window.repository.download_changelog.assert_not_called()
-        dialog.destroy.assert_called_once_with()
-
-    def test_rejects_symlink_and_directory_targets(self):
-        external_file = self.root / "external.rst"
-        external_file.write_text("preserve\n", encoding="utf-8")
-        self.destination.symlink_to(external_file)
+        self.destination.write_text("manual notes\n")
+        self.dialog.run.return_value = MODULE.Gtk.ResponseType.CANCEL
         MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
-        self.assertEqual("preserve\n", external_file.read_text(encoding="utf-8"))
-        self.window.repository.download_changelog.assert_not_called()
-        self.window.show_error.assert_called_once()
 
-        self.destination.unlink()
-        self.destination.mkdir()
-        self.window.show_error.reset_mock()
-        MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
+        self.assertEqual("manual notes\n", self.destination.read_text())
         self.window.repository.download_changelog.assert_not_called()
-        self.window.show_error.assert_called_once()
+        self.window.run_background.assert_not_called()
+        self.dialog.get_filename.assert_not_called()
+        self.dialog.destroy.assert_called_once_with()
+
+    def test_empty_filename_does_not_start_download(self):
+        self.dialog.get_filename.return_value = None
+        MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
+        self.window.run_background.assert_not_called()
+        self.dialog.destroy.assert_called_once_with()
+
+    def test_no_repository_does_not_open_save_dialog(self):
+        self.window.repository = None
+        MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
+        self.chooser.assert_not_called()
+        self.window.run_background.assert_not_called()
+
+    def test_download_errors_use_background_error_handler(self):
+        for error in (MODULE.GitError("目标路径必须是普通文件"), OSError("磁盘写入失败")):
+            with self.subTest(error=error):
+                self.window.busy = False
+                self.window.branch_generation = 0
+                self.window.repository.download_changelog.side_effect = error
+                self.window.run_background.side_effect = lambda *args: MODULE.VersionManagerWindow.run_background(
+                    self.window, *args,
+                )
+                with mock.patch.object(MODULE.GLib, "timeout_add_seconds", return_value=42), \
+                        mock.patch.object(MODULE.GLib, "idle_add") as idle_add, \
+                        mock.patch.object(MODULE.threading, "Thread") as thread:
+                    MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
+                    self.window.repository.download_changelog.assert_not_called()
+                    thread.call_args.kwargs["target"]()
+                idle_add.assert_called_once_with(self.window._background_failed, str(error))
+                self.window.repository.download_changelog.reset_mock()
+                self.assertFalse(self.destination.exists())
 
 
 class EditVersionMessageTest(unittest.TestCase):

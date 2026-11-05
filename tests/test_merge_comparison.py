@@ -127,6 +127,9 @@ class MergeComparisonTest(unittest.TestCase):
         self.assertIn("refs/tags/v0.0.3", refs)
         self.assertIn("refs/tags/v0.0.6", refs)
         self.assertEqual("selected\n", (self.path / "shared.txt").read_text())
+        self.assertEqual("0.0.6\n", (self.path / "VERSION").read_text())
+        self.assertNotIn("beta", (self.path / "CHANGELOG.rst").read_text())
+        self.assertEqual([], self.repo.status())
 
     def test_all_tools_receive_isolated_directories_and_never_write_main(self):
         session, directory, _data = self.begin()

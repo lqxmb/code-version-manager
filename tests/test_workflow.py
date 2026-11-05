@@ -148,10 +148,9 @@ class UnifiedWorkflowTest(unittest.TestCase):
         (self.path / 'VERSION').write_text('manually changed\n', encoding='utf-8')
         self.repo.save_version('branch1/v0.0.3-beta.0.0.1', 'preview', ['shared.txt'])
         self.assertEqual('branch1/v0.0.3-beta.0.0.1\n', (self.path / 'VERSION').read_text())
-        self.assertEqual(
-            'branch1/v0.0.3-beta.0.0.1\n',
-            self.repo.run(['show', 'branches/branch1/v0.0.3-beta.0.0.1:VERSION']),
-        )
+        self.assertNotIn('VERSION', self.repo.run([
+            'ls-tree', '--name-only', 'branches/branch1/v0.0.3-beta.0.0.1',
+        ]).splitlines())
         with self.assertRaisesRegex(MODULE.GitError, '基线'):
             self.repo.save_version('branch1/v0.0.6-beta.0.0.1', 'bad', ['shared.txt'])
 

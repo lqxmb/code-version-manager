@@ -19,6 +19,7 @@ import time
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
@@ -76,36 +77,7 @@ DEFAULT_EXCLUDED_DIRECTORIES = {
     "log",
     "logs",
 }
-DEFAULT_WORKSPACE_GITIGNORE = """# Catkin-generated output
-/build/
-/devel/
-/install/
-/build_isolated/
-/devel_isolated/
-/install_isolated/
-/.catkin_workspace
-
-# Local editor settings
-/.vscode/
-
-# Logs and caches
-/log/
-/logs/
-/.cache/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-
-# Editor temporary files
-*.swp
-*~
-
-# ZIP exports
-*.zip
-
-# Local release notes, read by the publish dialog
-/CHANGELOG.rst
-"""
+WORKSPACE_GENERATED_FILES = (WORKSPACE_VERSION, WORKSPACE_CHANGELOG)
 # Ubuntu's bcompare launcher re-quotes arguments, so this must not end in a backslash.
 # The order is the same as Beyond Compare's Name Filters view: include files,
 # include folders, then the excluded file/folder masks.
@@ -1381,6 +1353,8 @@ class GitRepository:
         ]).split("\0")
         conflicts = set()
         for ignored_path in filter(None, ignored_paths):
+            if ignored_path in WORKSPACE_GENERATED_FILES:
+                continue
             ignored_path = ignored_path.rstrip("/")
             for target_path in filter(None, target_paths):
                 if (
@@ -1468,6 +1442,7 @@ class GitRepository:
     ) -> str:
         if not status.can_sync_local:
             raise GitError(status.local_message or "远程整仓覆盖预检查未通过，请刷新。")
+        self._validate_generated_files()
         self._validate_sync_confirmation(snapshot, status)
         desired = dict(status.remote_refs)
         self._validate_mirror_source(desired, "远程")
@@ -1475,48 +1450,53 @@ class GitRepository:
         namespace = self._recovery_namespace("pull")
         fetched = self._fetch_remote_refs(snapshot, desired, namespace + "/incoming")
         self._validate_sync_confirmation(snapshot, status)
+        self._validate_generated_files(fetched[target])
         before = dict(snapshot.refs)
         backup = self._save_metadata_recovery(namespace)
         self._save_recovery_refs(namespace, before, "before")
         for ref, oid in self._origin_tracking_refs().items():
             self.run(["update-ref", namespace + "/before/" + ref[len("refs/"):], oid])
         old_head = self.run(["rev-parse", "--verify", "HEAD"], check=False).strip()
-        dirty = self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        dirty = self._user_status()
         if dirty and not old_head:
             raise GitError(f"尚无提交的工作区存在文件，请先移走或保存后同步。恢复资料：{backup}")
         # Record ignored collisions before stash restores the old .gitignore.
         ignored = self._ignored_path_conflicts(fetched[target])
-        stash_ref = None
-        if dirty:
-            self.run(["stash", "push", "--include-untracked", "--message", f"整仓同步恢复点 {namespace}"])
-            stash = self.run(["rev-parse", "--verify", "refs/stash"]).strip()
-            stash_ref = namespace + "/before/worktree"
-            self.run(["update-ref", stash_ref, stash])
-        self.last_local_sync_stash_ref = stash_ref
-        self._move_ignored_conflicts(ignored, backup)
-        applied = False
-        try:
-            self._validate_sync_confirmation(snapshot, status)
-            self._assert_sync_worktrees(snapshot, desired)
-            if old_head:
-                self.run(["switch", "--detach", "--no-overwrite-ignore", old_head])
-            self._replace_managed_refs(before, desired)
-            applied = True
-            if old_head:
-                self.run(["switch", "--no-guess", "--no-overwrite-ignore", target[len("refs/heads/"):]])
-            else:
-                self.run(["read-tree", "--reset", "-u", fetched[target]])
-                self.run(["symbolic-ref", "HEAD", target])
-        except GitError as error:
+        with self._generated_file_transition(fetched[target]) as transition:
+            stash_ref = None
+            if dirty:
+                self.run(["stash", "push", "--include-untracked", "--message", f"整仓同步恢复点 {namespace}"])
+                stash = self.run(["rev-parse", "--verify", "refs/stash"]).strip()
+                stash_ref = namespace + "/before/worktree"
+                self.run(["update-ref", stash_ref, stash])
+                # Source edits now belong to the recovery stash. On a later
+                # failure restore the clean post-stash index, ready for apply.
+                transition["index"] = self._git_path("index").read_bytes()
+            self.last_local_sync_stash_ref = stash_ref
+            self._move_ignored_conflicts(ignored, backup)
+            applied = False
             try:
-                if applied:
-                    self._replace_managed_refs(desired, before)
+                self._validate_sync_confirmation(snapshot, status)
+                self._assert_sync_worktrees(snapshot, desired)
                 if old_head:
                     self.run(["switch", "--detach", "--no-overwrite-ignore", old_head])
-                self.run(["symbolic-ref", "HEAD", snapshot.branch_ref])
-            except GitError:
-                pass  # Never overwrite concurrent changes to force a rollback.
-            raise GitError(f"整仓同步本地未完成：{error}\n引用恢复点：{namespace}/before\n配置和元数据：{backup}\n工作区恢复点：{stash_ref or '无'}") from error
+                self._replace_managed_refs(before, desired)
+                applied = True
+                if old_head:
+                    self.run(["switch", "--no-guess", "--no-overwrite-ignore", target[len("refs/heads/"):]])
+                else:
+                    self.run(["read-tree", "--reset", "-u", fetched[target]])
+                    self.run(["symbolic-ref", "HEAD", target])
+            except GitError as error:
+                try:
+                    if applied:
+                        self._replace_managed_refs(desired, before)
+                    if old_head:
+                        self.run(["switch", "--detach", "--no-overwrite-ignore", old_head])
+                    self.run(["symbolic-ref", "HEAD", snapshot.branch_ref])
+                except GitError:
+                    pass  # Never overwrite concurrent changes to force a rollback.
+                raise GitError(f"整仓同步本地未完成：{error}\n引用恢复点：{namespace}/before\n配置和元数据：{backup}\n工作区恢复点：{stash_ref or '无'}") from error
         for ref in sorted(set(before) | set(desired)):
             if ref.startswith("refs/heads/") and ref not in desired:
                 self.run(["config", "--local", "--remove-section", "branch." + ref[len("refs/heads/"):]], check=False)
@@ -1526,6 +1506,7 @@ class GitRepository:
         self._write_changelog(None)
         self.remember_working_branch()
         self._delete_fetched_refs(snapshot, desired, namespace + "/incoming")
+        self.refresh_workspace_generated_files()
         message = f"全部本地分支和版本标签已按远程覆盖。引用恢复点：{namespace}/before；配置、版本清单和 CHANGELOG：{backup}。"
         if target != snapshot.branch_ref:
             message += "原工作分支已被来源端删除，当前已转到 main。"
@@ -1548,6 +1529,7 @@ class GitRepository:
     ) -> str:
         if not status.can_sync_remote:
             raise GitError(status.remote_message or "远程覆盖预检查未通过，请刷新状态并检查权限或仓库规则。")
+        self._validate_generated_files()
         self._validate_sync_confirmation(snapshot, status)
         remote = dict(status.remote_refs)
         desired = dict(snapshot.refs)
@@ -1562,6 +1544,7 @@ class GitRepository:
             raise GitError(f"推送后远程状态又发生变化，请刷新；远程旧引用恢复点：{namespace}/before。")
         self._refresh_tracking_refs(desired)
         self._delete_fetched_refs(snapshot, remote, namespace + "/incoming")
+        self.refresh_workspace_generated_files()
         return f"全部远程分支和版本标签已按本地覆盖。远程旧引用：{namespace}/before；本地配置备份：{backup}。"
 
     def current_branch(self) -> Optional[str]:
@@ -1581,7 +1564,8 @@ class GitRepository:
 
     def _assert_clean(self, target: Optional[str] = None) -> None:
         self._assert_no_operation()
-        if self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]):
+        self._validate_generated_files(target)
+        if self._user_status():
             raise GitError("工作区有尚未发布的修改（包括暂存内容和未跟踪文件），请先处理。")
         if target:
             conflicts = self._ignored_path_conflicts(target)
@@ -1686,19 +1670,21 @@ class GitRepository:
         if base is None:
             raise GitError("请选择 main 历史中的正式版本；尚无正式版本时请先在 main 发布。")
         self._assert_clean(base.commit)
-        self.run(["switch", "--no-overwrite-ignore", "--no-track", "-c", name, base.commit])
+        self._switch_generated(["switch", "--no-overwrite-ignore", "--no-track", "-c", name, base.commit], base.commit)
         self.run(["config", "--local", f"branch.{name}.codeVersionManagerBase", base.name])
         self.remember_working_branch()
+        self.refresh_workspace_generated_files()
         return f"已从 {base.name} 创建并切换到 {name}；beta 基线固定，不会随 main 后续发布改变。"
 
     def switch_branch(self, name: str, source: str = "local", expected_oid: Optional[str] = None) -> str:
         self._validate_branch_name(name)
         existing = next((branch for branch in self.local_branches() if branch.name == name), None)
         if existing and existing.current:
+            self.refresh_workspace_generated_files()
             return f"当前已在 {name}。"
         if existing:
             self._assert_clean(existing.oid)
-            self.run(["switch", "--no-guess", "--no-overwrite-ignore", "--", name])
+            self._switch_generated(["switch", "--no-guess", "--no-overwrite-ignore", "--", name], existing.oid)
         elif source == "remote":
             self._assert_clean()
             remote_url = self._sync_target()
@@ -1716,7 +1702,7 @@ class GitRepository:
                     raise GitError("远程分支在读取期间发生变化，请刷新后重试。")
                 baselines = {
                     ref: tag_oid for ref, tag_oid in remote_refs.items()
-                    if ref.startswith("refs/tags/") and (parsed := parse_version_tag(ref)) and parsed[0] is None
+                    if ref.startswith("refs/tags/") and (parsed := parse_version_tag(ref)) and parsed[0] in (None, name)
                 }
                 self._ensure_objects(remote_url, baselines)
                 baselines = {
@@ -1729,20 +1715,21 @@ class GitRepository:
                 for ref, tag_oid in baselines.items():
                     if ref in local_refs and local_refs[ref] != tag_oid:
                         label = ref[len("refs/tags/"):]
-                        raise GitError(f"正式基线 {label} 与远程不同，请先处理标签冲突。")
+                        raise GitError(f"版本标签 {label} 与远程不同，请先处理标签冲突。")
                 if self._sync_target() != remote_url or self._remote_refs(remote_url) != remote_refs:
                     raise GitError("远程分支或正式标签在读取期间发生变化，请刷新后重试。")
                 self._assert_clean(oid)
                 for ref, tag_oid in baselines.items():
                     if ref not in local_refs:
                         self.run(["update-ref", ref, tag_oid, "0" * len(tag_oid)])
-                self.run(["switch", "--no-overwrite-ignore", "--no-track", "-c", name, oid])
+                self._switch_generated(["switch", "--no-overwrite-ignore", "--no-track", "-c", name, oid], oid)
                 self._set_upstream(name, oid)
             finally:
                 self.run(["update-ref", "-d", incoming], check=False)
         else:
             raise GitError(f"本地分支 {name} 不存在。")
         self.remember_working_branch()
+        self.refresh_workspace_generated_files()
         return f"已切换到 {name}。"
 
     def _set_upstream(self, branch: str, oid: str) -> None:
@@ -1837,6 +1824,7 @@ class GitRepository:
         return session
 
     def complete_merge(self, delete_source: bool = True) -> str:
+        self._validate_generated_files("refs/heads/main")
         if not self.merge_state().ready:
             raise GitError("请先关闭对比工具，确认对比结果后完成合并。")
         record = self._merge_review_record()
@@ -1894,8 +1882,8 @@ class GitRepository:
         applied = False
         try:
             if self.current_branch() != "main":
-                self.run(["switch", "--no-guess", "--no-overwrite-ignore", "--", "main"])
-            if (self._local_refs() != before_refs or self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])):
+                self._switch_generated(["switch", "--no-guess", "--no-overwrite-ignore", "--", "main"], "refs/heads/main")
+            if (self._local_refs() != before_refs or self._user_status()):
                 raise GitError("写回前分支引用或 main 工作区发生变化。")
             for path in paths:
                 actual = self._review_file_state(self.path, path)
@@ -1957,6 +1945,7 @@ class GitRepository:
                 self._remove_branch_metadata(record["source"], deleted)
                 message += f"已删除本地 {record['source']} 及其全部 beta 标签；下次“同步远程”时传播删除。"
             self.remember_working_branch()
+            self.refresh_workspace_generated_files()
         except (GitError, OSError) as error:
             message += f"\n提交已完成，元数据清理未完成：{error}；恢复资料：{backup}"
         self._remove_review_session(root)
@@ -2000,7 +1989,7 @@ class GitRepository:
             raise GitError("手动合并期间分支或标签引用已变化；请备份对比副本后取消并重新确认。")
         if (self.current_branch() != record.get("original_branch")
                 or self.run(["rev-parse", "--verify", "HEAD"], check=False).strip() != record.get("original_head")
-                or self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])):
+                or self._user_status()):
             raise GitError("手动合并期间工作区或检出分支已变化；请保存修改后取消并重新开始。")
         if self._git_path("MERGE_HEAD").exists():
             raise GitError("检测到其他 Git 合并操作；请先处理该操作。")
@@ -2099,7 +2088,7 @@ class GitRepository:
             "branch": self.current_branch(),
             "head": self.run(["rev-parse", "--verify", "HEAD"], check=False).strip(),
             "index": self.run(["ls-files", "--stage", "-z"]),
-            "status": self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+            "status": self._user_status(),
         }
 
     def _review_session_data(self, session: MergeComparisonSession) -> Tuple[Path, dict]:
@@ -2224,7 +2213,7 @@ class GitRepository:
         for path in paths:
             left = self._review_file_state(root / "branch", path)
             right = self._review_file_state(root / "main", path)
-            if (path not in special and path != WORKSPACE_VERSION
+            if (path not in special and path not in WORKSPACE_GENERATED_FILES
                     and not self._review_same_content(left, right)):
                 editable.append(path)
                 entry = main.get(path) or incoming.get(path)
@@ -2379,6 +2368,7 @@ class GitRepository:
         self._write_changelog(None)
 
     def delete_branch(self, name: str, expected: Optional[BranchDeletionPlan] = None) -> str:
+        self._validate_generated_files()
         plan = self.plan_branch_deletion(name)
         if expected is not None and expected != plan:
             raise GitError("删除确认后本地引用已变化，请重新查看删除清单。")
@@ -2391,7 +2381,7 @@ class GitRepository:
         original_branch = self.current_branch()
         switched = original_branch == name
         if switched:
-            self.run(["switch", "--no-guess", "--no-overwrite-ignore", "--", "main"])
+            self._switch_generated(["switch", "--no-guess", "--no-overwrite-ignore", "--", "main"], "refs/heads/main")
         try:
             self._assert_no_operation()
             self._assert_branch_not_in_other_worktree(name)
@@ -2404,6 +2394,7 @@ class GitRepository:
             raise
         self._remove_branch_metadata(name, deleted)
         self.remember_working_branch()
+        self.refresh_workspace_generated_files()
         return f"已删除本地分支 {name} 及其全部 beta 标签；下次“同步远程”将传播删除。恢复点：{namespace}。"
 
     def delete_merged_branch(self, name: str, expected: Optional[BranchDeletionPlan] = None) -> str:
@@ -2414,7 +2405,7 @@ class GitRepository:
         return exact or self.run(["rev-parse", "--short", "HEAD"]).strip()
 
     def status(self) -> List[Change]:
-        raw = self.run(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+        raw = self._user_status("normal")
         fields = raw.split("\0")
         changes: List[Change] = []
         index = 0
@@ -2446,11 +2437,11 @@ class GitRepository:
         ])
         return sorted({
             path for path in raw.split("\0")
-            if path and not os.path.lexists(self.path / path)
+            if path and path not in WORKSPACE_GENERATED_FILES and not os.path.lexists(self.path / path)
         })
 
     def changed_paths(self) -> List[str]:
-        raw = self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        raw = self._user_status()
         fields = raw.split("\0")
         paths: List[str] = []
         index = 0
@@ -2617,7 +2608,7 @@ class GitRepository:
             content = manifest_path.read_text(encoding="utf-8")
         except OSError:
             return None
-        return [line for line in content.splitlines() if line]
+        return [line for line in content.splitlines() if line and line not in WORKSPACE_GENERATED_FILES]
 
     def _tag_for_reference(self, reference: str) -> Optional[str]:
         reference = canonical_version(reference)
@@ -2647,12 +2638,16 @@ class GitRepository:
         manifest_path.write_text("".join(f"{path}\n" for path in sorted(selected_files)), encoding="utf-8")
         return manifest_path
 
-    def changelog_text(self, pending=None) -> str:
+    def changelog_text(self, pending=None, *, current_branch_only: bool = False) -> str:
         sections = []
         if pending:
             version, message, _file_count = pending
             sections.append((version, date.today().isoformat(), normalize_changes(message)))
-        for tag in sorted((tag for tag in self.tags() if parse_version_tag(tag)), key=version_sort_key, reverse=True):
+        if current_branch_only:
+            tags = [tag.name for tag in self.version_tags()]
+        else:
+            tags = [tag for tag in self.tags() if parse_version_tag(tag)]
+        for tag in sorted(tags, key=version_sort_key, reverse=True):
             commit = self.run(["rev-list", "-n", "1", tag]).strip()
             version_date = self.run(
                 ["show", "-s", "--date=short", "--format=%ad", commit]
@@ -2701,7 +2696,7 @@ class GitRepository:
         except OSError as error:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
-            raise GitError(f"无法写入 CHANGELOG.rst：{error}") from error
+            raise GitError(f"无法写入 {destination.name}：{error}") from error
 
     def _install_changelog_download(self, temporary_path: Path, destination: Path) -> None:
         self._validate_changelog_destination(destination)
@@ -2709,12 +2704,14 @@ class GitRepository:
         temporary_path.chmod(mode)
         os.replace(temporary_path, destination)
 
-    def download_changelog(self, destination: Path) -> None:
-        temporary_path = self._prepare_changelog_download(destination, self.changelog_text())
+    def download_changelog(self, destination: Path, all_versions: bool = False) -> None:
+        temporary_path = self._prepare_changelog_download(
+            destination, self.changelog_text(current_branch_only=not all_versions),
+        )
         try:
             self._install_changelog_download(temporary_path, destination)
         except OSError as error:
-            raise GitError(f"无法写入 CHANGELOG.rst：{error}") from error
+            raise GitError(f"无法写入 {destination.name}：{error}") from error
         finally:
             temporary_path.unlink(missing_ok=True)
 
@@ -2725,15 +2722,135 @@ class GitRepository:
         except FileNotFoundError:
             return
         if not stat.S_ISREG(mode):
-            raise GitError("无法下载 CHANGELOG.rst：工作空间根目录同名路径必须是普通文件。")
+            raise GitError(f"无法写入 {destination}：目标路径必须是普通文件。")
 
-    def _ignore_workspace_changelog(self) -> None:
+    def _validate_generated_files(self, target: Optional[str] = None) -> None:
+        for name in WORKSPACE_GENERATED_FILES:
+            self._validate_changelog_destination(self.path / name)
+        if target:
+            for entry in self.run(["ls-tree", "-z", target, "--", *WORKSPACE_GENERATED_FILES]).split("\0"):
+                if entry and entry.split()[0] not in ("100644", "100755"):
+                    name = entry.split("\t", 1)[1]
+                    raise GitError(f"目标版本中的 {name} 必须是普通文件，请先处理旧版本路径。")
+
+    def _ignore_workspace_generated_files(self) -> None:
+        # Older branches may not have the migrated .gitignore yet. This local
+        # fallback keeps generated untracked files out of Git without dirtying it.
         exclude = self._git_path("info/exclude")
         content = exclude.read_bytes() if exclude.exists() else b""
-        if b"/CHANGELOG.rst" not in content.splitlines():
+        updated = append_generated_ignore_rules(content)
+        if updated != content:
             exclude.parent.mkdir(parents=True, exist_ok=True)
-            separator = b"" if not content or content.endswith(b"\n") else b"\n"
-            exclude.write_bytes(content + separator + b"/CHANGELOG.rst\n")
+            exclude.write_bytes(updated)
+
+    def _prepare_generated_files(self, pending=None) -> Dict[str, Optional[Path]]:
+        self._validate_generated_files()
+        tag = pending[0] if pending else self.current_version_tag()
+        contents = {
+            WORKSPACE_VERSION: workspace_version_value(tag) + "\n" if tag else None,
+            WORKSPACE_CHANGELOG: self.changelog_text(pending, current_branch_only=True),
+        }
+        prepared = {}
+        try:
+            for name, content in contents.items():
+                prepared[name] = (self._prepare_changelog_download(self.path / name, content)
+                                  if content is not None else None)
+            return prepared
+        except Exception:
+            for temporary in prepared.values():
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            raise
+
+    def _install_generated_files(self, prepared: Dict[str, Optional[Path]]) -> None:
+        self._validate_generated_files()
+        backups = {name: ((self.path / name).read_bytes(), stat.S_IMODE((self.path / name).stat().st_mode))
+                   if (self.path / name).exists() else None for name in prepared}
+        installed = []
+        try:
+            for name, temporary in prepared.items():
+                if temporary is None:
+                    (self.path / name).unlink(missing_ok=True)
+                else:
+                    self._install_changelog_download(temporary, self.path / name)
+                installed.append(name)
+        except Exception:
+            for name in installed:
+                previous = backups[name]
+                if previous is None:
+                    (self.path / name).unlink(missing_ok=True)
+                else:
+                    temporary = self._prepare_changelog_download(
+                        self.path / name, "")
+                    temporary.write_bytes(previous[0])
+                    try:
+                        temporary.chmod(previous[1])
+                        os.replace(temporary, self.path / name)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+            raise
+
+    def refresh_workspace_generated_files(self) -> None:
+        prepared = self._prepare_generated_files()
+        try:
+            self._ignore_workspace_generated_files()
+            self._install_generated_files(prepared)
+        except OSError as error:
+            raise GitError(f"无法刷新工作区 VERSION / CHANGELOG.rst：{error}") from error
+        finally:
+            for temporary in prepared.values():
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+
+    def _user_status(self, untracked: str = "all") -> str:
+        # Disable rename collapsing so moving a generated file to a source path
+        # still reports the source addition, and vice versa.
+        return self.run(["-c", "status.renames=false", "status", "--porcelain=v1", "-z",
+                         "--untracked-files=" + untracked, "--", ".",
+                         *[":(top,exclude,literal)" + name for name in WORKSPACE_GENERATED_FILES]])
+
+    @contextmanager
+    def _generated_file_transition(self, target: str):
+        """Allow safe checkout of legacy trees that still track generated files."""
+        self._validate_generated_files(target)
+        original = {name: ((self.path / name).read_bytes(), stat.S_IMODE((self.path / name).stat().st_mode))
+                    if (self.path / name).exists() else None for name in WORKSPACE_GENERATED_FILES}
+        index = self._git_path("index")
+        checkpoint = {"index": index.read_bytes() if index.exists() else None}
+        try:
+            head = self.run(["rev-parse", "--verify", "HEAD"], check=False).strip()
+            if head:
+                self.run(["reset", "--quiet", "HEAD", "--", *WORKSPACE_GENERATED_FILES])
+            else:
+                self.run(["update-index", "--force-remove", "--", *WORKSPACE_GENERATED_FILES])
+            for name in WORKSPACE_GENERATED_FILES:
+                tracked = self.run(["ls-files", "--", name]).strip()
+                if tracked:
+                    self.run(["checkout-index", "--force", "--", name])
+                else:
+                    (self.path / name).unlink(missing_ok=True)
+            yield checkpoint
+        except Exception:
+            if checkpoint["index"] is None:
+                index.unlink(missing_ok=True)
+            else:
+                index.write_bytes(checkpoint["index"])
+            for name, previous in original.items():
+                if previous is None:
+                    (self.path / name).unlink(missing_ok=True)
+                else:
+                    temporary = self._prepare_changelog_download(self.path / name, "")
+                    try:
+                        temporary.write_bytes(previous[0])
+                        temporary.chmod(previous[1])
+                        os.replace(temporary, self.path / name)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+            raise
+
+    def _switch_generated(self, arguments: Sequence[str], target: str) -> None:
+        with self._generated_file_transition(target):
+            self.run(arguments)
 
     def _add_paths(
         self, paths: Sequence[str], *, env: Optional[Dict[str, str]] = None,
@@ -2762,7 +2879,7 @@ class GitRepository:
             for value in result.stdout.split(b"\0")
             if value
         }
-        return [path for path in paths if path not in ignored and path != WORKSPACE_CHANGELOG]
+        return [path for path in paths if path not in ignored and path not in WORKSPACE_GENERATED_FILES]
 
     def ignored_tracked_files(self) -> List[str]:
         # Include HEAD as well as the index so staged removals are not missed.
@@ -2780,7 +2897,7 @@ class GitRepository:
         selected_scopes: Optional[Sequence[str]] = None,
     ) -> None:
         self._assert_no_operation()
-        self._validate_changelog_destination(self.path / WORKSPACE_CHANGELOG)
+        self._validate_generated_files()
         if self.current_branch() is None:
             raise GitError("当前正在查看历史版本。请先返回工作分支，再发布新版本。")
         branch = self.current_branch()
@@ -2805,96 +2922,85 @@ class GitRepository:
         commit_message = changes[0]
         if len(changes) > 1:
             commit_message += "\n\n" + "\n".join(changes[1:])
-        if not self.run(["rev-parse", "--verify", "HEAD"], check=False).strip():
-            added = prepare_workspace_release_files(self.path)
-            selected_files = sorted(set(selected_files) | set(added))
-        selected = validate_selected_files(self.path, selected_files)
-        selected = self.filter_ignored(selected)
-        version_path = self.path / WORKSPACE_VERSION
-        if version_path.is_symlink() or (version_path.exists() and not version_path.is_file()):
-            raise GitError("发布版本需要根目录下的普通文件 VERSION，请先检查 VERSION 的路径类型。")
-        if not self.filter_ignored([WORKSPACE_VERSION]):
-            raise GitError("VERSION 被 .gitignore 排除，请先移除对应忽略规则，再发布版本。")
-        selected = sorted(set(selected) | {WORKSPACE_VERSION})
-        scopes = validate_top_level_scopes(selected_scopes or [])
-        deleted = self.filter_ignored([
-            path for path in self.deleted_files()
-            if any(path == scope or path.startswith(scope + "/") for scope in scopes)
-        ])
-        ignored_removals = self.ignored_tracked_files()
-        if not selected and not deleted and not ignored_removals:
-            raise GitError("至少选择一个未被 .gitignore 排除的文件或已删除项。")
-        if self.run(["ls-files", "--unmerged", "-z"]):
-            raise GitError("Git 工作区存在尚未解决的合并冲突。请先解决冲突再发布版本。")
-        if any(
-            self.run(["rev-parse", "--verify", "--quiet", state], check=False).strip()
-            for state in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
-        ):
-            raise GitError("Git 工作区有尚未完成的合并、拣选或还原操作。请先完成该操作再发布版本。")
-        self.metadata_path.mkdir(parents=True, exist_ok=True)
-        self._ignore_workspace_changelog()
-        added_paths = sorted(set(selected) | set(deleted))
-        paths = sorted(set(added_paths) | set(ignored_removals))
-        destination = self.path / WORKSPACE_CHANGELOG
-        # Prepare the download before committing so path and write failures do not
-        # leave a new version behind. Final content comes from the actual tag.
-        temporary_changelog = self._prepare_changelog_download(
-            destination, self.changelog_text((version, message, len(selected))),
-        )
+        # Prepare both outputs before touching the release tree or user index.
+        prepared = self._prepare_generated_files((version, message, 0))
+        gitignore = self.path / ".gitignore"
+        previous_ignore = gitignore.read_bytes() if gitignore.is_file() and not gitignore.is_symlink() else None
+        had_changelog = (self.path / WORKSPACE_CHANGELOG).exists()
+        committed = False
         try:
+            added = prepare_workspace_release_files(self.path)
+            selected = validate_selected_files(self.path, sorted(set(selected_files) | set(added)))
+            selected = self.filter_ignored(selected)
+            # Required migration rules must be recorded even if the user did not
+            # select dotfiles, or has a broad ignore rule matching .gitignore.
+            old_ignore_oid = self.run(["rev-parse", "--verify", "--quiet", "HEAD:.gitignore"], check=False).strip()
+            old_ignore = self.run_bytes(["cat-file", "blob", old_ignore_oid]) if old_ignore_oid else b""
+            if added or append_generated_ignore_rules(old_ignore) != old_ignore:
+                selected = sorted(set(selected) | {".gitignore"})
+            scopes = validate_top_level_scopes(selected_scopes or [])
+            deleted = self.filter_ignored([
+                path for path in self.deleted_files()
+                if any(path == scope or path.startswith(scope + "/") for scope in scopes)
+            ])
+            tracked_ignored = set(self.ignored_tracked_files())
+            ignored_removals = sorted((tracked_ignored | set(WORKSPACE_GENERATED_FILES))
+                                      - ({".gitignore"} if ".gitignore" in selected else set()))
+            if not selected and not deleted and not tracked_ignored:
+                raise GitError("至少选择一个未被 .gitignore 排除的文件或已删除项。")
+            if self.run(["ls-files", "--unmerged", "-z"]):
+                raise GitError("Git 工作区存在尚未解决的合并冲突。请先解决冲突再发布版本。")
+            self.metadata_path.mkdir(parents=True, exist_ok=True)
+            added_paths = sorted(set(selected) | set(deleted))
+            paths = sorted(set(added_paths) | set(ignored_removals))
             with tempfile.TemporaryDirectory(prefix="publish-", dir=self.metadata_path) as temporary:
-                # Start from HEAD so unrelated staged content stays out of this version.
-                # A failed add or commit leaves the user's index unchanged.
                 environment = os.environ.copy()
                 environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
                 has_head = self.run(["rev-parse", "--verify", "HEAD"], check=False).strip()
-                self.run(
-                    ["read-tree", "HEAD"] if has_head else ["read-tree", "--empty"],
-                    env=environment,
-                )
-                previous_version = version_path.read_bytes() if version_path.exists() else None
-                try:
-                    version_path.write_text(workspace_version_value(version) + "\n", encoding="utf-8")
-                    self._add_paths(added_paths, env=environment)
-                    if ignored_removals:
-                        # Remove ignored historical files from the version, never from disk.
-                        self.run(
-                            ["update-index", "--force-remove", "-z", "--stdin"],
-                            input="\0".join(ignored_removals) + "\0",
-                            env=environment,
-                        )
-                    self.run(["commit", "--allow-empty", "-m", commit_message], env=environment)
-                except Exception:
-                    if previous_version is None:
-                        version_path.unlink(missing_ok=True)
-                    else:
-                        version_path.write_bytes(previous_version)
-                    raise
-                # Match the real index to the new commit only for published paths.
-                # NUL-delimited stdin handles large selections and literal filenames.
-                self.run(
-                    ["--literal-pathspecs", "reset", "--quiet", "HEAD",
-                     "--pathspec-from-file=-", "--pathspec-file-nul"],
-                    input="\0".join(paths) + "\0",
-                )
+                self.run(["read-tree", "HEAD"] if has_head else ["read-tree", "--empty"], env=environment)
+                self._add_paths([path for path in added_paths if path != ".gitignore"], env=environment)
+                if ".gitignore" in selected:
+                    self.run(["add", "--force", "--", ".gitignore"], env=environment)
+                self.run(["update-index", "--force-remove", "-z", "--stdin"],
+                         input="\0".join(ignored_removals) + "\0", env=environment)
+                self.run(["commit", "--allow-empty", "-m", commit_message], env=environment)
+                committed = True
+                self.run(["--literal-pathspecs", "reset", "--quiet", "HEAD",
+                          "--pathspec-from-file=-", "--pathspec-file-nul"], input="\0".join(paths) + "\0")
             self.run(["tag", "-a", version, "-m", commit_message])
             self._write_manifest(version, selected)
-            internal_changelog = self._write_changelog(None)
+            self._write_changelog(None)
             try:
-                with temporary_changelog.open("wb") as handle:
-                    handle.write(internal_changelog.read_bytes())
+                # Rebuild from actual tags after the annotated tag is created.
+                notes = prepared[WORKSPACE_CHANGELOG]
+                with notes.open("w", encoding="utf-8") as handle:
+                    handle.write(self.changelog_text(current_branch_only=True))
                     handle.flush()
                     os.fsync(handle.fileno())
-                self._install_changelog_download(temporary_changelog, destination)
+                self._ignore_workspace_generated_files()
+                self._install_generated_files(prepared)
             except (GitError, OSError) as error:
                 raise GitError(
-                    f"版本 {display_version(version)} 已发布到本地，但自动下载 CHANGELOG.rst 失败：{error}。"
-                    "请使用“下载 CHANGELOG”重试，无需重复发布。"
+                    f"版本 {display_version(version)} 已发布到本地，但自动下载 VERSION / CHANGELOG.rst 失败：{error}。"
+                    "请修复文件问题后重新切换当前分支重试，无需重复发布。"
                 ) from error
+        except Exception:
+            if not committed:
+                if previous_ignore is None:
+                    if gitignore.is_file() and not gitignore.is_symlink():
+                        gitignore.unlink()
+                else:
+                    gitignore.write_bytes(previous_ignore)
+                if not had_changelog:
+                    (self.path / WORKSPACE_CHANGELOG).unlink(missing_ok=True)
+            raise
         finally:
-            temporary_changelog.unlink(missing_ok=True)
+            for temporary in prepared.values():
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
     def update_version_message(self, version: str, message: str) -> None:
+        self._validate_generated_files()
         version = self._assert_version_editable(version)
         changes = normalize_changes(message)
         if not changes:
@@ -2906,16 +3012,19 @@ class GitRepository:
         ensure_git_identity(self)
         self.run(["tag", "-f", "-a", version, "-m", commit_message, commit])
         self._write_changelog(None)
+        self.refresh_workspace_generated_files()
 
     def switch_main(self) -> None:
         self.switch_branch("main")
 
     def delete_version(self, version: str) -> None:
+        self._validate_generated_files()
         version = self._assert_version_editable(version)
         self.run(["tag", "--delete", version])
         self._remove_version_metadata(version)
 
     def delete_latest_version_commit(self, version: str) -> None:
+        self._validate_generated_files()
         version = self._assert_version_editable(version)
         if not parse_version_tag(version) or version not in self.tags():
             raise GitError(f"版本 {version} 不存在或已经删除。")
@@ -2949,6 +3058,7 @@ class GitRepository:
         except FileNotFoundError:
             pass
         self._write_changelog(None)
+        self.refresh_workspace_generated_files()
 
     def _archive_bytes(self, reference: str) -> bytes:
         paths = self.manifest(reference)
@@ -2960,7 +3070,15 @@ class GitRepository:
         args = ["--literal-pathspecs", "archive", "--format=tar", reference]
         if paths:
             args.extend(["--", *paths])
-        return self.run_bytes(args)
+        raw = self.run_bytes(args)
+        output = io.BytesIO()
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as source:
+            with tarfile.open(fileobj=output, mode="w:") as bundle:
+                for member in source:
+                    if member.name.rstrip("/") in WORKSPACE_GENERATED_FILES:
+                        continue
+                    bundle.addfile(member, source.extractfile(member) if member.isfile() else None)
+        return output.getvalue()
 
     def materialize(self, reference: str, destination: Path) -> None:
         destination.mkdir(parents=True, exist_ok=True)
@@ -3011,10 +3129,22 @@ class GitRepository:
             with zipfile.ZipFile(destination, "w"):
                 pass
             return
-        args = ["--literal-pathspecs", "archive", "--format=zip", f"--output={destination}", reference]
-        if paths:
-            args.extend(["--", *paths])
-        self.run(args)
+        # Keep large exports on disk; filtering old Git trees must not require
+        # loading the complete ZIP (or a large member) into application memory.
+        with tempfile.TemporaryDirectory(prefix="code-version-manager-export-") as temporary:
+            original = Path(temporary) / "archive.zip"
+            args = ["--literal-pathspecs", "archive", "--format=zip", f"--output={original}", reference]
+            if paths:
+                args.extend(["--", *paths])
+            self.run(args)
+            with zipfile.ZipFile(original) as source:
+                with zipfile.ZipFile(destination, "w") as bundle:
+                    bundle.comment = source.comment
+                    for member in source.infolist():
+                        if member.filename.rstrip("/") in WORKSPACE_GENERATED_FILES:
+                            continue
+                        with source.open(member) as incoming, bundle.open(member, "w") as outgoing:
+                            shutil.copyfileobj(incoming, outgoing)
 
     def commit_details(self, reference: str) -> str:
         return self.run(["show", "--stat", "--format=fuller", reference])
@@ -3106,14 +3236,38 @@ def workspace_version_message(root: Path, version: str) -> Optional[str]:
     return None
 
 
+def workspace_gitignore_template_path() -> Path:
+    source = Path(__file__).resolve()
+    for candidate in (source.with_name("workspace.gitignore"), source.parents[1] / "data" / "workspace.gitignore"):
+        if candidate.is_file():
+            return candidate
+    raise GitError("找不到工作区忽略规则模板 workspace.gitignore，请检查安装文件。")
+
+
+def append_generated_ignore_rules(content: bytes) -> bytes:
+    newline = b"\r\n" if b"\r\n" in content else (b"\r" if b"\r" in content else b"\n")
+    for name in WORKSPACE_GENERATED_FILES:
+        rule = ("/" + name).encode("utf-8")
+        # Rules after a negation must win too.
+        lines = content.splitlines()
+        relevant = [line for line in lines if line == rule or line.startswith(b"!")]
+        if not relevant or relevant[-1] != rule:
+            separator = b"" if not content or content.endswith((b"\n", b"\r")) else newline
+            content += separator + rule + newline
+    return content
+
+
 def prepare_workspace_release_files(root: Path) -> List[str]:
     """Create the local notes template and return changed files to publish."""
+    for name in WORKSPACE_GENERATED_FILES:
+        GitRepository._validate_changelog_destination(root / name)
     changelog = root / WORKSPACE_CHANGELOG
     if changelog.is_symlink() or (changelog.exists() and not changelog.is_file()):
         raise GitError("无法创建 CHANGELOG.rst：根目录同名路径必须是普通文件。")
     gitignore = root / ".gitignore"
     if gitignore.is_symlink() or (gitignore.exists() and not gitignore.is_file()):
         raise GitError("无法更新 .gitignore：根目录 .gitignore 必须是普通文件。")
+    template = workspace_gitignore_template_path() if not gitignore.exists() else None
     if not changelog.exists() and not changelog.is_symlink():
         title = f"Changelog for {root.name}"
         marker = "^" * max(39, len(title))
@@ -3125,13 +3279,13 @@ def prepare_workspace_release_files(root: Path) -> List[str]:
             encoding="utf-8",
         )
     if not gitignore.exists():
-        gitignore.write_text(DEFAULT_WORKSPACE_GITIGNORE, encoding="utf-8")
+        shutil.copyfile(template, gitignore)
+        gitignore.write_bytes(append_generated_ignore_rules(gitignore.read_bytes()))
         return [".gitignore"]
     content = gitignore.read_bytes()
-    if b"/CHANGELOG.rst" not in content.splitlines():
-        newline = b"\r\n" if b"\r\n" in content else b"\n"
-        separator = b"" if not content or content.endswith(b"\n") else newline
-        gitignore.write_bytes(content + separator + b"/CHANGELOG.rst" + newline)
+    updated = append_generated_ignore_rules(content)
+    if content != updated:
+        gitignore.write_bytes(updated)
         return [".gitignore"]
     return []
 
@@ -3973,7 +4127,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             message += "对比工具已关闭，请完成合并或取消。"
         else:
             message += "请在对比工具内逐项同步，保存后关闭工具。"
-        message += "完成前禁止切换、发布和同步；VERSION 保留 main 原值。"
+        message += "完成前禁止切换、发布和同步。"
         self.merge_status_label.set_text(message)
         self.complete_merge_button.set_no_show_all(not state.tool_closed)
         self.abort_merge_button.set_no_show_all(not state.tool_closed)
@@ -4070,7 +4224,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             f"目标：main / {plan.target_version}\n提交：{plan.target_oid}\n\n"
             "左侧为来源只读副本，右侧为 main 编辑副本，请逐项同步后保存并关闭工具。\n"
             "任一侧 .gitignore 忽略的路径均隐藏且不写回。完成时保存 main 普通提交，"
-            "不发布、不创建标签；VERSION 保留 main 的值。"
+            "不发布、不创建标签；完成后刷新 main 的本地版本文件。"
         )
         dialog.set_default_response(Gtk.ResponseType.CANCEL)
         response = dialog.run()
@@ -5432,33 +5586,29 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def on_download_changelog(self, _button) -> None:
         if not self.repository:
             return
-        destination = self.repository.path / WORKSPACE_CHANGELOG
-        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
-            self.show_error("无法下载 CHANGELOG.rst：工作空间根目录同名路径必须是普通文件。")
-            return
-        if destination.exists():
-            dialog = Gtk.MessageDialog(
-                transient_for=self,
-                modal=True,
-                message_type=Gtk.MessageType.QUESTION,
-                buttons=Gtk.ButtonsType.NONE,
-                text="覆盖工作空间根目录的 CHANGELOG.rst？",
-            )
-            dialog.format_secondary_text(
-                f"现有文件将被 Git 标签生成的 CHANGELOG 替换。\n{destination}"
-            )
-            dialog.add_button("取消", Gtk.ResponseType.CANCEL)
-            overwrite_button = dialog.add_button("覆盖", Gtk.ResponseType.OK)
-            overwrite_button.get_style_context().add_class("destructive-action")
-            response = dialog.run()
-            dialog.destroy()
-            if response != Gtk.ResponseType.OK:
-                return
+        repository = self.repository
+        all_versions = self.history_scope_combo.get_active_id() == "all"
+        dialog = Gtk.FileChooserDialog(
+            title="下载 CHANGELOG",
+            parent=self,
+            action=Gtk.FileChooserAction.SAVE,
+        )
+        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "下载", Gtk.ResponseType.OK)
+        dialog.set_current_folder(str(repository.path))
+        dialog.set_current_name(WORKSPACE_CHANGELOG)
+        dialog.set_do_overwrite_confirmation(True)
         try:
-            self.repository.download_changelog(destination)
-            self.status_label.set_text(f"CHANGELOG 已下载到 {destination}")
-        except (GitError, OSError) as error:
-            self.show_error(str(error))
+            response = dialog.run()
+            filename = dialog.get_filename() if response == Gtk.ResponseType.OK else None
+        finally:
+            dialog.destroy()
+        if filename:
+            destination = Path(filename)
+            self.run_background(
+                "正在下载 CHANGELOG...",
+                lambda: repository.download_changelog(destination, all_versions=all_versions),
+                f"CHANGELOG 已下载到 {destination}",
+            )
 
     def on_history_activated(self, _tree, path, _column) -> None:
         index = path.get_indices()[0]
