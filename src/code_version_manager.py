@@ -153,6 +153,13 @@ def display_version(name: str) -> str:
     return f"{parsed[0]}/{parsed[1]}" if parsed and parsed[0] else name
 
 
+def workspace_version_value(name: str) -> str:
+    parsed = parse_version_tag(name)
+    if not parsed:
+        raise GitError(f"无法将无效版本标签 {name} 写入 VERSION。")
+    return parsed[1][1:] if parsed[0] is None else display_version(name)
+
+
 def canonical_version(value: str, branch: Optional[str] = None) -> str:
     if value.startswith("refs/tags/"):
         value = value[len("refs/tags/"):]
@@ -2503,6 +2510,29 @@ class GitRepository:
                 ))
         return sorted(tags, key=lambda tag: version_sort_key(tag.name), reverse=True)
 
+    def current_version_tag(self) -> Optional[str]:
+        """Find the current branch's last published tag along its first-parent history."""
+        head = self.run(["rev-parse", "--verify", "HEAD^{commit}"], check=False).strip()
+        if not head:
+            return None
+        branch = self.current_branch()
+        tags = self.version_tags(all_versions=True)
+        exact = [tag for tag in tags if tag.commit == head and (
+            branch is None or tag.owner is None or (branch != "main" and tag.owner == branch)
+        )]
+        if exact:
+            return max(exact, key=lambda tag: (tag.owner == branch, version_sort_key(tag.name))).name
+        owned = [tag for tag in tags if branch is None or tag.owner == (None if branch == "main" else branch)]
+        by_commit: Dict[str, List[str]] = {}
+        for tag in owned:
+            by_commit.setdefault(tag.commit, []).append(tag.name)
+        for commit in self.run(["rev-list", "--first-parent", head]).splitlines():
+            if commit in by_commit:
+                return max(by_commit[commit], key=version_sort_key)
+        if branch and branch != "main" and tags:
+            return self.branch_base(branch)
+        return None
+
     def _assert_version_editable(self, version: str) -> str:
         self._assert_no_operation()
         version = canonical_version(version)
@@ -2593,6 +2623,10 @@ class GitRepository:
         reference = canonical_version(reference)
         if reference in self.tags():
             return reference
+        if reference == "HEAD":
+            tag = self.current_version_tag()
+            if tag and self.run(["rev-parse", f"{tag}^{{commit}}"]).strip() == self.run(["rev-parse", "HEAD"]).strip():
+                return tag
         tags = self.run(["tag", "--points-at", reference], check=False).splitlines()
         return sorted(tags, key=version_sort_key)[-1] if tags else None
 
@@ -2651,8 +2685,55 @@ class GitRepository:
         changelog_path.write_text(self.changelog_text(pending), encoding="utf-8")
         return changelog_path
 
+    def _prepare_changelog_download(self, destination: Path, content: str) -> Path:
+        self._validate_changelog_destination(destination)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=destination.parent,
+                prefix=f".{destination.name}.", delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            return temporary_path
+        except OSError as error:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise GitError(f"无法写入 CHANGELOG.rst：{error}") from error
+
+    def _install_changelog_download(self, temporary_path: Path, destination: Path) -> None:
+        self._validate_changelog_destination(destination)
+        mode = stat.S_IMODE(destination.lstat().st_mode) if destination.exists() else 0o644
+        temporary_path.chmod(mode)
+        os.replace(temporary_path, destination)
+
     def download_changelog(self, destination: Path) -> None:
-        destination.write_text(self.changelog_text(), encoding="utf-8")
+        temporary_path = self._prepare_changelog_download(destination, self.changelog_text())
+        try:
+            self._install_changelog_download(temporary_path, destination)
+        except OSError as error:
+            raise GitError(f"无法写入 CHANGELOG.rst：{error}") from error
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _validate_changelog_destination(destination: Path) -> None:
+        try:
+            mode = destination.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(mode):
+            raise GitError("无法下载 CHANGELOG.rst：工作空间根目录同名路径必须是普通文件。")
+
+    def _ignore_workspace_changelog(self) -> None:
+        exclude = self._git_path("info/exclude")
+        content = exclude.read_bytes() if exclude.exists() else b""
+        if b"/CHANGELOG.rst" not in content.splitlines():
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            separator = b"" if not content or content.endswith(b"\n") else b"\n"
+            exclude.write_bytes(content + separator + b"/CHANGELOG.rst\n")
 
     def _add_paths(
         self, paths: Sequence[str], *, env: Optional[Dict[str, str]] = None,
@@ -2699,6 +2780,7 @@ class GitRepository:
         selected_scopes: Optional[Sequence[str]] = None,
     ) -> None:
         self._assert_no_operation()
+        self._validate_changelog_destination(self.path / WORKSPACE_CHANGELOG)
         if self.current_branch() is None:
             raise GitError("当前正在查看历史版本。请先返回工作分支，再发布新版本。")
         branch = self.current_branch()
@@ -2714,9 +2796,6 @@ class GitRepository:
             base = self.branch_base(branch)
             if parsed[1].split("-beta.", 1)[0] != base:
                 raise GitError(f"此分支基线固定为 {base}，请使用 {display_version(self.next_version())}。")
-            changed = set(self.changed_paths())
-            if WORKSPACE_VERSION in changed:
-                raise GitError("开发分支不能发布 VERSION 修改，请先还原该文件；VERSION 只由 main 发布正式版本时更新。")
         if version in self.tags():
             raise GitError(f"版本 {version} 已存在。")
         ensure_git_identity(self)
@@ -2731,14 +2810,12 @@ class GitRepository:
             selected_files = sorted(set(selected_files) | set(added))
         selected = validate_selected_files(self.path, selected_files)
         selected = self.filter_ignored(selected)
-        sync_version = branch == "main"
         version_path = self.path / WORKSPACE_VERSION
-        if sync_version:
-            if version_path.is_symlink() or (version_path.exists() and not version_path.is_file()):
-                raise GitError("同步 VERSION 需要根目录下的普通文件，请先检查 VERSION 的路径类型。")
-            if not self.filter_ignored([WORKSPACE_VERSION]):
-                raise GitError("VERSION 被 .gitignore 排除，请先移除对应忽略规则，再在 main 发布正式版。")
-            selected = sorted(set(selected) | {WORKSPACE_VERSION})
+        if version_path.is_symlink() or (version_path.exists() and not version_path.is_file()):
+            raise GitError("发布版本需要根目录下的普通文件 VERSION，请先检查 VERSION 的路径类型。")
+        if not self.filter_ignored([WORKSPACE_VERSION]):
+            raise GitError("VERSION 被 .gitignore 排除，请先移除对应忽略规则，再发布版本。")
+        selected = sorted(set(selected) | {WORKSPACE_VERSION})
         scopes = validate_top_level_scopes(selected_scopes or [])
         deleted = self.filter_ignored([
             path for path in self.deleted_files()
@@ -2755,48 +2832,67 @@ class GitRepository:
         ):
             raise GitError("Git 工作区有尚未完成的合并、拣选或还原操作。请先完成该操作再发布版本。")
         self.metadata_path.mkdir(parents=True, exist_ok=True)
+        self._ignore_workspace_changelog()
         added_paths = sorted(set(selected) | set(deleted))
         paths = sorted(set(added_paths) | set(ignored_removals))
-        with tempfile.TemporaryDirectory(prefix="publish-", dir=self.metadata_path) as temporary:
-            # Start from HEAD so unrelated staged content stays out of this version.
-            # A failed add or commit leaves the user's index unchanged.
-            environment = os.environ.copy()
-            environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
-            has_head = self.run(["rev-parse", "--verify", "HEAD"], check=False).strip()
-            self.run(
-                ["read-tree", "HEAD"] if has_head else ["read-tree", "--empty"],
-                env=environment,
-            )
-            previous_version = version_path.read_bytes() if sync_version and version_path.exists() else None
-            try:
-                if sync_version:
-                    version_path.write_text(parsed[1][1:] + "\n", encoding="utf-8")
-                self._add_paths(added_paths, env=environment)
-                if ignored_removals:
-                    # Remove ignored historical files from the version, never from disk.
-                    self.run(
-                        ["update-index", "--force-remove", "-z", "--stdin"],
-                        input="\0".join(ignored_removals) + "\0",
-                        env=environment,
-                    )
-                self.run(["commit", "--allow-empty", "-m", commit_message], env=environment)
-            except Exception:
-                if sync_version:
+        destination = self.path / WORKSPACE_CHANGELOG
+        # Prepare the download before committing so path and write failures do not
+        # leave a new version behind. Final content comes from the actual tag.
+        temporary_changelog = self._prepare_changelog_download(
+            destination, self.changelog_text((version, message, len(selected))),
+        )
+        try:
+            with tempfile.TemporaryDirectory(prefix="publish-", dir=self.metadata_path) as temporary:
+                # Start from HEAD so unrelated staged content stays out of this version.
+                # A failed add or commit leaves the user's index unchanged.
+                environment = os.environ.copy()
+                environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
+                has_head = self.run(["rev-parse", "--verify", "HEAD"], check=False).strip()
+                self.run(
+                    ["read-tree", "HEAD"] if has_head else ["read-tree", "--empty"],
+                    env=environment,
+                )
+                previous_version = version_path.read_bytes() if version_path.exists() else None
+                try:
+                    version_path.write_text(workspace_version_value(version) + "\n", encoding="utf-8")
+                    self._add_paths(added_paths, env=environment)
+                    if ignored_removals:
+                        # Remove ignored historical files from the version, never from disk.
+                        self.run(
+                            ["update-index", "--force-remove", "-z", "--stdin"],
+                            input="\0".join(ignored_removals) + "\0",
+                            env=environment,
+                        )
+                    self.run(["commit", "--allow-empty", "-m", commit_message], env=environment)
+                except Exception:
                     if previous_version is None:
                         version_path.unlink(missing_ok=True)
                     else:
                         version_path.write_bytes(previous_version)
-                raise
-            # Match the real index to the new commit only for published paths.
-            # NUL-delimited stdin handles large selections and literal filenames.
-            self.run(
-                ["--literal-pathspecs", "reset", "--quiet", "HEAD",
-                 "--pathspec-from-file=-", "--pathspec-file-nul"],
-                input="\0".join(paths) + "\0",
-            )
-        self.run(["tag", "-a", version, "-m", commit_message])
-        self._write_manifest(version, selected)
-        self._write_changelog(None)
+                    raise
+                # Match the real index to the new commit only for published paths.
+                # NUL-delimited stdin handles large selections and literal filenames.
+                self.run(
+                    ["--literal-pathspecs", "reset", "--quiet", "HEAD",
+                     "--pathspec-from-file=-", "--pathspec-file-nul"],
+                    input="\0".join(paths) + "\0",
+                )
+            self.run(["tag", "-a", version, "-m", commit_message])
+            self._write_manifest(version, selected)
+            internal_changelog = self._write_changelog(None)
+            try:
+                with temporary_changelog.open("wb") as handle:
+                    handle.write(internal_changelog.read_bytes())
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                self._install_changelog_download(temporary_changelog, destination)
+            except (GitError, OSError) as error:
+                raise GitError(
+                    f"版本 {display_version(version)} 已发布到本地，但自动下载 CHANGELOG.rst 失败：{error}。"
+                    "请使用“下载 CHANGELOG”重试，无需重复发布。"
+                ) from error
+        finally:
+            temporary_changelog.unlink(missing_ok=True)
 
     def update_version_message(self, version: str, message: str) -> None:
         version = self._assert_version_editable(version)
@@ -5119,16 +5215,6 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             Gtk.Label(label="改动内容（每行一条）", xalign=0), False, False, 0
         )
         content.pack_start(changes_scroll, True, True, 0)
-        note = Gtk.Label(
-            label="版本号匹配 CHANGELOG.rst 中的版本节时，会自动载入对应说明；未匹配时保留当前内容。",
-            xalign=0,
-        )
-        note.set_line_wrap(True)
-        content.pack_start(note, False, False, 0)
-        content.pack_start(Gtk.Label(
-            label="main 发布时自动更新 VERSION；开发分支保留继承的正式号，beta 不写入 VERSION。",
-            xalign=0, wrap=True,
-        ), False, False, 0)
         dialog.get_content_area().pack_start(content, True, True, 0)
         dialog.show_all()
         version_entry.grab_focus()

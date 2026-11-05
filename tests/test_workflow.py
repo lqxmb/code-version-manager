@@ -53,7 +53,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.repo.run(['commit', '--amend', '--no-edit', '-q'])
         self.repo.run(['tag', '-f', '-a', MODULE.canonical_version(
             'branch1/v0.0.3-beta.0.0.1'), '-m', 'branch beta'])
-        self.assertEqual('0.0.3\n', (self.path / 'VERSION').read_text())
+        self.assertEqual('branch1/v0.0.3-beta.0.0.1\n', (self.path / 'VERSION').read_text())
         self.repo.switch_branch('main')
         self.publish(self.repo, 'v0.0.6', 'main content\n')
         (self.path / 'main-only.txt').write_text('keep main work\n', encoding='utf-8')
@@ -117,7 +117,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         peer.switch_branch('feature/camera')
         self.assertEqual('v0.0.3', peer.branch_base())
         self.assertEqual('branches/feature%2Fcamera/v0.0.3-beta.0.0.2', peer.next_version())
-        self.assertEqual('0.0.3\n', (peer.path / 'VERSION').read_text())
+        self.assertEqual('feature/camera/v0.0.3-beta.0.0.1\n', (peer.path / 'VERSION').read_text())
 
     def test_unpublished_branch_base_recovers_from_first_parent(self):
         self.repo.create_branch('feature', 'v0.0.3')
@@ -143,14 +143,15 @@ class UnifiedWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.GitError, '无法唯一恢复基线'):
             peer.branch_base()
 
-    def test_beta_rejects_changed_version_and_wrong_base(self):
+    def test_beta_publication_updates_changed_version_and_rejects_wrong_base(self):
         self.repo.create_branch('branch1', 'v0.0.3')
-        before = self.refs(self.path)
-        (self.path / 'VERSION').write_text('0.0.3-beta.0.0.1\n', encoding='utf-8')
-        with self.assertRaisesRegex(MODULE.GitError, 'VERSION'):
-            self.repo.save_version('branch1/v0.0.3-beta.0.0.1', 'bad', ['shared.txt', 'VERSION'])
-        self.assertEqual(before, self.refs(self.path))
-        self.repo.run(['restore', 'VERSION'])
+        (self.path / 'VERSION').write_text('manually changed\n', encoding='utf-8')
+        self.repo.save_version('branch1/v0.0.3-beta.0.0.1', 'preview', ['shared.txt'])
+        self.assertEqual('branch1/v0.0.3-beta.0.0.1\n', (self.path / 'VERSION').read_text())
+        self.assertEqual(
+            'branch1/v0.0.3-beta.0.0.1\n',
+            self.repo.run(['show', 'branches/branch1/v0.0.3-beta.0.0.1:VERSION']),
+        )
         with self.assertRaisesRegex(MODULE.GitError, '基线'):
             self.repo.save_version('branch1/v0.0.6-beta.0.0.1', 'bad', ['shared.txt'])
 

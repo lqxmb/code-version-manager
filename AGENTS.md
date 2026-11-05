@@ -16,9 +16,16 @@
 | `VERSION` | 软件发行版本，与受管理工作空间的 Git 版本无关 |
 | `data/`、`debian/`、`build_deb.sh` | 图标、启动器、Beyond Compare 配置及 Debian 打包 |
 
-入口为 `main()`，应用 ID 为 `cn.local.CodeVersionManager`。安装启动器 `/usr/bin/code-version-manager` 加载 `/usr/lib/code-version-manager/code_version_manager.py`。启动工作空间依次读取 `CODE_VERSION_MANAGER_REPOSITORY`、GTK 用户配置 `code-version-manager/settings.ini`、`~/catkin_ws`。最近工作空间最多保存 10 个。
+入口为 `main()`，应用 ID 为 `cn.local.CodeVersionManager`。安装启动器 `/usr/bin/code-version-manager` 加载 `/usr/lib/code-version-manager/code_version_manager.py`。启动工作空间依次读取 `CODE_VERSION_MANAGER_REPOSITORY`、GTK 用户配置 `code-version-manager/settings.ini`、`~/catkin_ws`。最近工作空间最多保存 10 个。GTK 初始化、窗口、对话框及主线程事件回调均位于同一源码文件；后端操作由 `GitRepository` 负责。
 
 所选目录必须是独立 Git 根目录。初始化用 `git init`，默认分支为 main。已管理仓库的 Git 身份、唯一 origin、推送超时、比较工具和分支基线都保存在仓库本地配置。用户级 `code-version-manager/settings.ini` 另存 GitHub 账号、默认提交姓名和邮箱，作为新启用工作空间的默认值；打开已有仓库的“Git 账号”时，非空默认姓名和邮箱逐项预填，只有保存该窗口才写入仓库本地配置，单独保存设置不会修改已有仓库。应用元数据保存在实际 Git 目录下 `code-version-manager/`，不进入用户工作树或远程同步。
+
+## 源码导航与配置
+
+- 源码依次组织为标签解析与数据类型、用户配置及 SSH 辅助函数、`GitRepository`、发布文件准备及打包选择辅助函数、`FileSelectionDialog`、`VersionManagerWindow` 和应用入口。优先在相应现有方法中扩展业务，不拆分服务或引入包管理框架。
+- Git 交互统一经过 `GitRepository.run()` / `run_bytes()`；远程操作用 `_run_remote()` 和 `run_remote_process()` 管理非交互 SSH、超时及传输子进程组清理。
+- 用户配置中的 `[git_defaults]` 保存 `github_account`、`user_name` 和 `user_email`；读写设置须保留最近工作空间等其他配置节。GitHub 账号只用于地址示例，不自动设置 origin，也不代表 SSH 登录身份。
+- 仓库本地配置键包括 `user.name`、`user.email`、`codeversionmanager.pushTimeout`、`codeversionmanager.compareTool`、`codeversionmanager.lastWorkingBranch` 及各分支的 `codeVersionManagerBase`。提交身份记录作者；SSH 密钥负责远程授权。
 
 ## 分支、标签与发布
 
@@ -33,9 +40,12 @@
 - `create_branch(name, base_version)` 从所选正式标签提交创建分支，`branch_base()` 校验固定基线。缓存键为 `branch.<name>.codeVersionManagerBase`。
 - 多基线、无共同历史、标签不属于分支历史、浅克隆等情况明确报错，不猜测或静默重写。
 - 默认历史范围显示当前分支相关标签及其正式基线；其他分支版本和继承的正式版本只读。“全部分支版本”只改变展示范围。
-- main 发布时根目录 `VERSION` 写入不带 `v` 的正式版本号并换行，纳入提交、manifest 和 ZIP。开发分支保留继承的 VERSION，不发布 beta VERSION；改动或删除 VERSION 后拒绝 beta 发布。
-- main 的 VERSION 必须是普通文件，不能是符号链接、目录或被忽略。发布使用临时 index，只提交所选文件、选定顶层删除范围及必要 VERSION，并保留其他暂存内容。
-- 发布始终离线。根目录 `CHANGELOG.rst` 是说明输入和下载目标，不进入提交、manifest 或 ZIP。首次发布准备 `.gitignore` 和 CHANGELOG 模板；已有忽略规则保留。
+- 正式版发布将根目录 `VERSION` 写为不带 `v` 的正式号，例如 `0.0.3`；开发分支 beta 发布写入显示标签，例如 `branch1/v0.0.3-beta.0.0.1`。两者都纳入发布提交、manifest 和 ZIP。
+- VERSION 在每个发布提交中固定该次标签号；后续未发布提交继续显示最近已发布版本，干净切换分支则从目标提交恢复对应值。合并保留 main 原 VERSION，不发布、不打标签、不更新 VERSION。
+- `current_version_tag()` 优先查当前 HEAD 上属于当前分支的版本标签或正式标签；没有精确标签时按第一父链找最近正式标签或本分支 beta，无 beta 时校验固定正式基线。无版本标签时返回空值，不生成假版本。`workspace_version_value()` 统一转换文件显示值。
+- 升级前的旧 beta 提交保留原 VERSION，切换、同步和查看历史不会重写旧提交或额外修改 VERSION；下一次 beta 发布后开始记录新的 beta 标签显示号。
+- 发布时 VERSION 必须是普通文件路径，不能是符号链接、目录或被忽略。版本管理自动维护它，不因 beta 发布前的用户改动拒绝发布；使用临时 index，只提交所选文件、选定顶层删除范围及必要 VERSION，并保留其他暂存内容。
+- 发布始终离线。根目录 `CHANGELOG.rst` 是说明输入和下载目标，不进入提交、manifest 或 ZIP。成功发布后按全部版本标签重新生成并覆盖该文件；发布前拒绝符号链接、目录和特殊文件目标。首次启用版本管理准备 `.gitignore` 和 CHANGELOG 模板；已有忽略规则保留。
 
 ## 手动合并
 
@@ -79,10 +89,24 @@
 ## 元数据、GTK 与错误处理
 
 - `code-version-manager/versions/` 存放按完整标签名分层的 manifest；内部 CHANGELOG 从标签说明生成；`recovery/` 保存配置、版本清单、引用恢复点和同步资料。
+- 用户配置位于 `GLib.get_user_config_dir()/code-version-manager/settings.ini`，通常为 `~/.config/code-version-manager/settings.ini`。保存“设置”本身不改仓库身份；Git 账号对话框按姓名/邮箱分别预填非空用户默认值。
+- CHANGELOG 发布前先校验路径类型、生成同目录临时文件；成功后用实际标签历史原子替换根目录文件并保留权限。手动下载仍保留现有文件覆盖确认；标签说明编辑和标签删除只重建内部 CHANGELOG，根目录文件可手动重新下载。
+- 旧仓库没有根目录 CHANGELOG 忽略规则时，发布会在 Git `info/exclude` 补充 `/CHANGELOG.rst`，不改用户 `.gitignore`，避免自动生成文件阻挡下一次分支切换。已跟踪的旧 CHANGELOG 在新发布中停止跟踪。
+- 发布前 CHANGELOG 路径非法或临时文件准备失败时不创建发布提交、标签，不改原 VERSION 和 index；若最终替换发生异常，会明确提示版本已发布及重新下载入口，保留原 CHANGELOG，避免误导用户重复发布。
 - `run()` / `run_bytes()` 使用 `git -C <目录>` 和参数列表。业务错误用具体中文 `GitError`，不把 traceback 展示为用户提示，不拼接不可信 shell 命令。
 - 远程读取、发布、切换、合并、同步及分支删除都在后台线程运行；工作线程不得操作 GTK，通过 `GLib.idle_add` 回主线程。新建分支按钮只在当前分支为 main 时启用，后端 `create_branch()` 也独立校验。
-- branch generation、remote status generation、仓库实例和操作快照共同防止旧后台结果覆盖当前状态。刷新优先通过统一状态机重建 UI。
+- `run_background()` 负责忙碌状态、耗时提示和后台线程调度；成功、失败与特定结果回调经 `GLib.idle_add` 回主线程刷新界面。不要在 worker 内访问 GTK。
+- branch generation、remote status generation、仓库实例和操作快照共同防止旧后台结果覆盖当前状态。刷新优先通过统一状态机重建 UI；同步按钮状态由 `RemoteSyncStatus` 驱动。
 - 本地与 origin 同名分支合成一行；当前分支以绿色标识，不在标签文字添加“当前”。
+
+## 测试、兼容与打包
+
+- `tests/test_backend.py` 覆盖解析、仓库后端、发布、身份配置、远程验证、GTK 回调和文件安全；`tests/test_workflow.py` 使用临时工作仓库与 bare origin 覆盖整仓同步及并发变化；`tests/test_merge_comparison.py` 覆盖隔离目录合并；`tests/verify_workspace_copy.py` 只操作验证副本和临时 origin。
+- `legacy_test_*` 是历史流程用例，不会被 unittest 自动发现，不作为当前合并规则或验证通过的依据；新增用例应使用 `test_*`。配置相关测试应指向临时 settings.ini，避免依赖实际用户设置。
+- 常规验证运行完整 unittest、源码 `py_compile` 和 `git diff --check`。实仓验证必须先复制 Git 数据与元数据，不得对来源目录或真实 origin 执行覆盖。
+- `VERSION`（项目根目录）是 Debian 软件包版本；`<工作空间>/VERSION` 是被管理仓库中的发布标签显示号，两者不能混用。`build_deb.sh` 从项目根 VERSION 命名 deb 并复制源码、README、INSTALL、图标、桌面入口和 Beyond Compare 默认会话。
+- Debian 入口为 `data/code-version-manager`，包控制文件为 `debian/control`，安装/卸载脚本只更新桌面数据库和图标缓存，不清理工作空间或用户配置。
+- 兼容基线为 Git 2.25、Python 3.8、GTK 3；避免使用这些版本不支持的 Git 参数、Python 语法或 GTK API。
 
 ## 开发与验证
 
@@ -96,4 +120,4 @@ python3 src/code_version_manager.py
 sh build_deb.sh
 ```
 
-测试使用临时 Git 仓库和 bare origin，覆盖固定 beta 基线、手动合并到单父提交、合并取消、可选清理、分支直接删除、忽略规则并集、整仓同步删除、并发引用变化和恢复点。实仓验证只复制 Git 与元数据，在副本和临时 origin 操作；不得写入真实来源或 origin。兼容基线为 Git 2.25、Python 3.8、GTK 3。
+本项目根目录的 CHANGELOG.rst、build/、dist/ 和 Python 缓存被 Git 忽略。更新 CHANGELOG 后不会出现在普通 `git status` 中；不要因此强制纳入 Git，也不要清理用户已有的发行包或生成文件。
