@@ -705,6 +705,11 @@ class GitDefaultsTest(unittest.TestCase):
         )
 
     def test_new_repository_uses_defaults_and_blank_fields_fall_back(self):
+        settings_path = mock.patch.object(
+            MODULE, "settings_file_path", return_value=self.config_file,
+        )
+        settings_path.start()
+        self.addCleanup(settings_path.stop)
         workspace = self.root / "workspace"
         workspace.mkdir()
         (workspace / "file.txt").write_text("content\n", encoding="utf-8")
@@ -742,6 +747,66 @@ class GitDefaultsTest(unittest.TestCase):
                     ("fallback-user", "fallback-user@localhost"),
                     MODULE.effective_git_identity(config_file=self.config_file),
                 )
+
+    def test_git_account_identity_prefers_each_nonblank_default(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        repository = MODULE.create_repository(workspace)
+        repository.run(["config", "user.name", "Repository User"])
+        repository.run(["config", "user.email", "repository@example.com"])
+
+        MODULE.save_git_default_settings(
+            "", "Default User", "default@example.com", self.config_file,
+        )
+        self.assertEqual(
+            ("Default User", "default@example.com"),
+            MODULE.git_account_identity(repository, self.config_file),
+        )
+
+        MODULE.save_git_default_settings("", "Name Default", "", self.config_file)
+        self.assertEqual(
+            ("Name Default", "repository@example.com"),
+            MODULE.git_account_identity(repository, self.config_file),
+        )
+
+        MODULE.save_git_default_settings("", "", "", self.config_file)
+        self.assertEqual(
+            ("Repository User", "repository@example.com"),
+            MODULE.git_account_identity(repository, self.config_file),
+        )
+
+    def test_git_account_identity_does_not_write_defaults_until_saved(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        repository = MODULE.create_repository(workspace)
+        repository.run(["config", "user.name", "Repository User"])
+        repository.run(["config", "user.email", "repository@example.com"])
+        MODULE.save_git_default_settings(
+            "", "Default User", "default@example.com", self.config_file,
+        )
+
+        self.assertEqual(
+            ("Default User", "default@example.com"),
+            MODULE.git_account_identity(repository, self.config_file),
+        )
+        self.assertEqual(
+            "Repository User", repository.run(["config", "--local", "user.name"]).strip(),
+        )
+        self.assertEqual(
+            "repository@example.com",
+            repository.run(["config", "--local", "user.email"]).strip(),
+        )
+
+        repository.configure_remote(
+            str(self.root / "remote.git"), "Default User", "default@example.com",
+        )
+        self.assertEqual(
+            "Default User", repository.run(["config", "--local", "user.name"]).strip(),
+        )
+        self.assertEqual(
+            "default@example.com",
+            repository.run(["config", "--local", "user.email"]).strip(),
+        )
 
 
 class BranchReleaseWorkflowTest(unittest.TestCase):

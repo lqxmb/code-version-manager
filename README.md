@@ -92,9 +92,9 @@ Python 3 + GTK 3 桌面 Git 管理器，支持任意工作空间、本地离线�
 
 ## Git 账号与 SSH
 
-“设置”可以保存应用级 GitHub 账号（用户名或组织名）、默认提交姓名和默认提交邮箱；这些值只用于之后新启用版本管理的工作空间。留空的身份字段沿用当前有效 Git 配置，Git 仍未配置时使用本机默认身份。已有仓库的 origin 和提交身份不会因这里的默认值改变。
+“设置”可以保存应用级 GitHub 账号（用户名或组织名）、默认提交姓名和默认提交邮箱；这些是新启用工作空间的默认值。打开已有仓库的“Git 账号”时，非空默认姓名和邮箱会分别预填；只有保存该窗口时才写入仓库，单独保存“设置”不会改变已有仓库。留空的身份字段沿用当前有效 Git 配置，Git 仍未配置时使用本机默认身份。
 
-“Git 账号”配置当前工作空间的唯一 origin SSH 地址、提交姓名、邮箱及推送超时；本地绝对路径也可作为远程用于离线同步。未设置 origin 的工作空间会用“设置”中的 GitHub 账号生成 SSH 地址示例，示例不会自动写入 origin。
+“Git 账号”配置当前工作空间的唯一 origin SSH 地址、提交姓名、邮箱及推送超时；本地绝对路径也可作为远程用于离线同步。提交身份保存在仓库本地 Git 配置中，用于记录提交作者，不决定 SSH 登录身份。未设置 origin 的工作空间会用“设置”中的 GitHub 账号生成 SSH 地址示例，示例不会自动写入 origin。
 
 1. 先创建远程仓库。GitHub 可使用“创建远程仓库（网页）”，创建时不要初始化 README、.gitignore 或许可证。
 2. 填写真实 SSH 地址，例如 `git@github.com:<账号>/<仓库>.git`。提交姓名和邮箱记录作者，SSH 密钥决定登录身份。
@@ -127,6 +127,9 @@ sudo apt install --reinstall ./dist/code-version-manager_$(cat VERSION)_all.deb
 
 # 先退出正在运行的软件，再安装或升级
 sudo apt install ./dist/code-version-manager_$(cat VERSION)_all.deb
+
+# 卸载
+sudo apt remove code-version-manager
 ```
 
 完整依赖与故障排查见 [INSTALL.md](INSTALL.md)。安装后从应用菜单打开 Code Version Manager，或执行 `code-version-manager`。

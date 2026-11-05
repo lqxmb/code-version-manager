@@ -496,6 +496,19 @@ def effective_git_identity(
     return name or os.environ.get("USER", "Local User"), email or f"{user}@localhost"
 
 
+def git_account_identity(
+    repository: Optional["GitRepository"],
+    config_file: Optional[Path] = None,
+) -> Tuple[str, str]:
+    """Resolve identity fields shown in the Git account dialog."""
+    if repository is None:
+        return effective_git_identity(config_file=config_file)
+    _account, default_name, default_email = git_default_settings(config_file)
+    name = default_name or repository.run(["config", "user.name"], check=False).strip()
+    email = default_email or repository.run(["config", "user.email"], check=False).strip()
+    return name, email
+
+
 def github_ssh_example(account: str, repository_name: str) -> str:
     account = validate_github_account(account) or GITHUB_ACCOUNT_PLACEHOLDER
     return f"git@github.com:{account}/{repository_name}.git"
@@ -4379,7 +4392,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         description = Gtk.Label(
             label=(
                 "GitHub 账号、提交姓名和邮箱作为新工作空间启用版本管理时的默认值；"
-                "已有仓库的 origin 和提交身份不会被修改。\n"
+                "非空姓名和邮箱也会预填到“Git 账号”窗口。保存这里不会修改已有仓库，"
+                "只有在“Git 账号”中保存后才会应用。\n"
                 "留空的身份字段沿用当前有效 Git 配置，仍未配置时使用本机默认身份。"
             ),
             xalign=0,
@@ -4426,10 +4440,10 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         note.set_max_width_chars(60)
         grid.attach(note, 0, 5, 2, 1)
         content.pack_start(grid, False, False, 0)
-        content.pack_start(
-            Gtk.Label(label=f"当前工作空间：{self.workspace_path}", xalign=0),
-            False, False, 0,
-        )
+        # content.pack_start(
+        #     Gtk.Label(label=f"当前工作空间：{self.workspace_path}", xalign=0),
+        #     False, False, 0,
+        # )
         dialog.get_content_area().add(content)
         dialog.show_all()
         response = dialog.run()
@@ -4472,19 +4486,17 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         remote_placeholder = github_ssh_example(
             configured_account, workspace_repository_name(self.workspace_path.name),
         )
-        default_name, default_email = effective_git_identity(repository)
+        default_name, default_email = git_account_identity(repository)
         values = [
             ("SSH 仓库地址", suggested_remote or configured_remote, remote_placeholder),
             (
                 "提交姓名",
-                repository.run(["config", "user.name"], check=False).strip()
-                if repository else default_name,
+                default_name,
                 "Git 提交作者姓名",
             ),
             (
                 "提交邮箱",
-                repository.run(["config", "user.email"], check=False).strip()
-                if repository else default_email,
+                default_email,
                 "name@example.com",
             ),
         ]
@@ -4520,7 +4532,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                     "请在“设置”中填写仓库所属的 GitHub 账号或组织名，或直接在上方填写完整地址；"
                     "并确认仓库已创建。"
                 )
-        address_hint = Gtk.Label(label=f"当前工作空间：{self.workspace_path}\n{source}", xalign=0)
+        address_hint = Gtk.Label(label=source, xalign=0)
         address_hint.set_selectable(True)
         address_hint.set_line_wrap(True)
         address_hint.set_max_width_chars(72)
