@@ -13,6 +13,7 @@
 | `tests/test_merge_comparison.py` | 手动合并隔离副本、忽略规则、提交及取消测试 |
 | `tests/test_version_deletion.py` | 末尾版本撤回、暂存保护、固定基线、确认快照、恢复及 GTK 删除回调测试 |
 | `tests/test_recovery_cleanup.py` | 恢复文件清理、stash 保护、文件安全、并发变化、失败报告及 GTK 清理回调测试 |
+| `tests/test_ui_layout.py` | 工具栏顺序、最近两项选择、动态比较、独立日志、窗口尺寸记忆及忙碌状态回归 |
 | `tests/verify_workspace_copy.py` | 仅在工作区隔离副本和临时远程中验证，不改来源和真实 origin |
 | `README.md` / `INSTALL.md` | 用户说明与 Ubuntu 安装、故障排查 |
 | `README_ai.md`（若存在） | 历史讨论，不作为当前业务规则依据 |
@@ -28,6 +29,7 @@
 - 源码依次组织为标签解析与数据类型、用户配置及 SSH 辅助函数、`GitRepository`、发布文件准备及打包选择辅助函数、`FileSelectionDialog`、`VersionManagerWindow` 和应用入口。优先在相应现有方法中扩展业务，不拆分服务或引入包管理框架。
 - Git 交互统一经过 `GitRepository.run()` / `run_bytes()`；远程操作用 `_run_remote()` 和 `run_remote_process()` 管理非交互 SSH、超时及传输子进程组清理。
 - 用户配置中的 `[git_defaults]` 保存 `github_account`、`user_name` 和 `user_email`；读写设置须保留最近工作空间等其他配置节。GitHub 账号只用于地址示例，不自动设置 origin，也不代表 SSH 登录身份。
+- 用户配置中的 `[window]` 保存主窗口普通状态的 `width`、`height` 及独立的 `maximized`；通过 `window_settings()` / `save_window_settings()` 读写，不能写入仓库 Git 配置。记录是应用级的，不按工作空间区分；未配置或尺寸无效时回退为 1120 × 720，不按屏幕占比重新计算。
 - 仓库本地配置键包括 `user.name`、`user.email`、`codeversionmanager.pushTimeout`、`codeversionmanager.compareTool`、`codeversionmanager.lastWorkingBranch` 及各分支的 `codeVersionManagerBase`。提交身份记录作者；SSH 密钥负责远程授权。
 
 ## 常见修改入口与存储边界
@@ -42,14 +44,28 @@
 | 手动合并 | `plan_merge()`、`merge_to_main()`、`prepare_merge_comparison()`、`complete_merge()`、`abort_merge()` |
 | 版本删除与提交撤回 | `preview_version_deletion()`、`delete_version()`、`delete_latest_version_commit()`；GTK 的 `on_delete_version()`、`_background_version_deletion_ready()` |
 | 恢复文件清理 | `plan_recovery_cleanup()`、`clear_recovery_files(expected)`；GTK 的 `on_clear_recovery_files()` 及清理结果回调 |
+| 主窗口布局与版本选择 | `_build_header()`、`_build_content()`、`on_history_selection_changed()`、`_update_history_actions()`、`on_compare_selected()` |
+| 主窗口尺寸记忆 | `window_settings()`、`save_window_settings()`；GTK 的 `_on_window_configure()`、`_on_window_state()`、`_flush_window_settings()` |
+| 操作状态与独立日志 | `_set_operation_status()`、`on_operation_log()`、`_refresh_operation_log()`、`_operation_log_text()` |
 
 - 用户 settings.ini 中 `[repository] path` 记录上次工作空间，`[recent_workspaces] paths` 保存 JSON 数组；路径会展开、去重并过滤不存在目录。删除最近记录只改列表，不删除工作空间或改写上次启动路径。
 - 对比工具默认 Beyond Compare，通过“设置”保存到仓库本地配置；只接受预设 Beyond Compare、Meld、KDiff3。GitHub 创建入口仅打开网页，默认建议私有仓库，不代用户创建或授权远程。
 - SSH 公钥辅助只读取有效普通 `.pub` 文件，拒绝符号链接；生成 Ed25519 密钥在临时目录完成，再以不覆盖方式发布成对文件。不得记录私钥或口令。
 - 版本清单按完整标签名分层存为 `versions/<tag>.manifest`；beta 路径包含 `branches/<编码分支名>/...`。标签对象更新后只失效受影响清单，避免继续使用旧清单。
+- `manifest()` 返回 `None` 表示没有可用清单，应使用完整 Git 树；返回 `[]` 表示明确的空清单，应导出空包。不得用同一个真假判断合并两种含义。
 - 恢复引用在 `refs/code-version-manager/recovery/<id>/<操作>/before/`，配套资料在实际 Git 目录 `code-version-manager/recovery/<id>/`，包括 git-config、state.json、versions 和内部 CHANGELOG。它们仅存在本机，不随日常或高级同步上传。
 - 发布选择器按顶层目录分组，后端展开成文件；删除范围另经 `selected_scopes` 明确传入。导出优先使用 manifest，否则用 Git 完整树；大 ZIP 通过磁盘临时文件和流复制过滤，避免整包载入内存。
 - `storage_size()` 统计实际 Git 存储及元数据，`allocated_disk_usage()` 按 inode 去重并优先使用已分配块大小；它不是工作树源文件总大小。
+
+### 存储范围速查
+
+| 数据 | 保存位置与生命周期 | 修改约束 |
+| --- | --- | --- |
+| 上次工作空间、最近列表、Git 默认身份、主窗口尺寸 | 用户级 `code-version-manager/settings.ini`，跨启动保留 | 修改一个节时保留其他节；不修改已有仓库身份 |
+| origin、比较工具、同步超时、分支基线 | 当前仓库本地 Git 配置 | 通过现有后端入口读写；不是用户级默认值 |
+| 清单、内部 CHANGELOG、恢复资料、手动合并会话 | 实际 Git 目录下 `code-version-manager/` | 使用 `metadata_path` / `_git_path()`，不假定工作空间 `.git` 一定是目录 |
+| 工作空间 `VERSION`、`CHANGELOG.rst` | 工作树根目录，按当前分支重新生成 | 不进入新发布提交或导出；普通界面刷新不隐式写入 |
+| 操作日志 | 主窗口 `operation_logs` 内存，按工作空间路径分组 | 每组最多 200 条；关闭日志窗口保留，退出应用丢弃 |
 
 ## 分支、标签与发布
 
@@ -64,6 +80,7 @@
 - `create_branch(name, base_version)` 从所选正式标签提交创建分支，`branch_base()` 校验固定基线。缓存键为 `branch.<name>.codeVersionManagerBase`。
 - 多基线、无共同历史、标签不属于分支历史、浅克隆等情况明确报错，不猜测或静默重写。
 - 默认历史范围显示当前分支相关标签及其正式基线；其他分支版本和继承的正式版本只读。“全部分支版本”只改变展示范围。
+- `history()` 基于 `version_tags()` 构造已发布标签记录，默认最多 500 项，按数字版本排序，不是完整 Git 提交日志。每条 `HistoryEntry` 保留引用和只读标记；列表重新排序或重建时同步处理选择状态，不把行号当作持久化版本标识。
 - 工作区根目录 `VERSION`、`CHANGELOG.rst` 为软件生成的本地状态，不进入新发布提交、manifest、ZIP 或新的远程发布快照。软件自身项目根目录 `VERSION` 是独立的 Debian 发行号；当前项目 `.gitignore` 忽略 `/VERSION`，该文件未受 Git 跟踪，但启动和打包仍读取它。不得把两种 VERSION 混用，也不要擅自改变其跟踪状态。
 - `current_version_tag()` 优先查 HEAD 上属于当前分支的标签或正式标签，否则沿第一父链查最近正式标签或本分支 beta；无 beta 的开发分支校验固定正式基线。无标签返回空，不伪造版本。
 - `workspace_version_value()` 将正式版转换成不带 v 的号（`0.0.3`），beta 转换成未编码分支名与标签（`feature/camera/v0.0.3-beta.0.0.1`）。
@@ -116,6 +133,13 @@
 - 提交和删除引用使用完成阶段生成的本地恢复点。合并清理只影响本地；远程来源分支及 beta 需从“删除分支”选择 origin 条目后显式删除，日常同步 main 不再传播该删除。
 - 取消删除临时对比副本和会话状态，不创建恢复引用、不改变原检出分支、工作树、index、提交、分支或标签。
 - Beyond Compare 使用内置 `data/bcompare/BCSessions.xml`；普通历史目录比较配置保持独立。
+- 忽略规则由隔离副本中的临时 Git 仓库执行 `check-ignore --no-index --stdin -z` 解析；禁用系统、用户和全局 excludes，随后删除临时 `.git`。不要改成 Python 自行匹配通配符，否则会改变嵌套规则和反选语义。
+
+### 普通比较与手动合并的差别
+
+- 普通历史比较通过 `materialize()` / `_archive_bytes()` 物化历史版本，有 manifest 时使用清单；无清单才使用完整树。与当前版本比较时右侧是实际可编辑工作空间；两个历史版本比较时使用两个临时副本。
+- 手动合并通过 `_review_git_files()` 读取完整跟踪树，之后按两侧忽略规则过滤；不能复用按 manifest 裁剪的导出路径。特殊路径、只读侧和写回输出均有单独校验。
+- `prepare_bcompare_config()` 将用户比较工具配置复制到临时配置目录，再替换内置会话；手动合并另用二进制内容比较和空过滤规则。不要改写用户原有 `~/.config/bcompare`。
 
 ## 分支删除
 
@@ -155,6 +179,17 @@
 
 ## 元数据、GTK 与错误处理
 
+### 主窗口、选择与状态
+
+- 独立标题栏只放应用名称、关于及窗口控制；工作空间工具行放打开、最近、刷新、Git 账号、设置及高级操作菜单。主要操作行按发布、分支选择、新建、合并、删除排序，右侧为单行远程摘要及同步。高级整仓覆盖从高级操作菜单进入。
+- 主窗口的 `configure-event` 用 `Gtk.Window.get_size()` 记录普通窗口宽高，避免把客户端装饰尺寸重复计入；`window-state-event` 单独记录最大化。最大化、全屏、最小化的配置事件不覆盖普通尺寸。连续拖动合并为停止 400 毫秒后保存，销毁时移除定时器并补存最新值；只保存变化，写入失败不阻断主窗口关闭。
+- 窗口设置通过同目录临时文件、`fsync` 和原子替换保存，保留原文件权限和其他配置节；不记录窗口位置，也不把日志、对话框的临时尺寸混入主窗口记录。
+- 历史操作条按范围、动态比较、删除版本、下载版本、修改说明、查看 CHANGELOG、下载 CHANGELOG 排列；保持单行并在窄窗口允许横向滚动，显示“已选 N / 2”。单选比较当前工作空间，双选比较两个版本；删除、下载和修改说明仅单选启用。最近两项按选中时间维护，第三项淘汰最早项，取消重选视为最新，一次加入多项按列表顺序处理；重建历史时清空选择顺序，保留 Ctrl／Shift 的 GTK 选择行为。
+- 底部路径和状态必须单行、省略且允许缩小，长结果不得增加窗口最小尺寸。所有操作结果通过 `_set_operation_status()` 更新，完整详情记录为 `OperationLogEntry`，日常刷新和耗时计时使用 `record=False`。非模态独立日志窗口按时间倒序展示、自动换行滚动、支持选择和复制全部，同一主窗口复用日志窗口。日志按工作空间路径在内存隔离，每个最多 200 条，关闭日志窗口保留，退出应用不落盘；失败记录完整错误并保留既有错误、恢复及确认弹窗。
+- `run_background()` 的禁用范围须包括工作空间工具行、主要操作行和历史操作条；底部日志入口保持可用。移动同步按钮后 CSS 不得依赖 headerbar 父级；禁用条件继续由仓库、分支、合并状态和 `RemoteSyncStatus` 决定。
+
+### 元数据、生成文件与后台回调
+
 - `code-version-manager/versions/` 存放按完整标签名分层的 manifest；内部 CHANGELOG 从标签说明生成；`recovery/` 保存配置、版本清单、引用恢复点和同步资料。
 - 用户配置位于 `GLib.get_user_config_dir()/code-version-manager/settings.ini`，通常为 `~/.config/code-version-manager/settings.ini`。保存“设置”本身不改仓库身份；Git 账号对话框按姓名/邮箱分别预填非空用户默认值。
 - 两个根目录生成目标仅允许普通文件或不存在；符号链接、目录、FIFO 等在发布、切换或其他引用变更前拒绝。生成使用同目录临时文件、fsync 与原子替换，保留权限；两文件替换中途失败时尝试恢复已替换文件。
@@ -171,10 +206,13 @@
 ## 测试、兼容与打包
 
 - `tests/test_backend.py` 覆盖解析、仓库后端、发布、身份配置、远程验证、GTK 回调和文件安全；`tests/test_workflow.py` 使用临时工作仓库与 bare origin 覆盖当前分支同步、显式远程删除、高级整仓覆盖及并发变化；`tests/test_generated_files.py` 覆盖生成文件、旧仓库迁移、分支范围、文件安全和独立忽略模板；`tests/test_merge_comparison.py` 覆盖隔离目录合并；`tests/test_version_deletion.py` 覆盖版本撤回和故障恢复；`tests/test_recovery_cleanup.py` 覆盖恢复清理及受保护备份；`tests/verify_workspace_copy.py` 只操作验证副本和临时 origin，包括清理副本中的恢复目录并核对来源未变。
+- `tests/test_ui_layout.py` 使用临时用户配置和真实 GTK 控件，覆盖工具栏顺序、最近两项选择与比较调度、日志隔离和复制、尺寸记忆、最大化保护、写入失败以及忙碌状态。没有显示服务时 GTK 用例会跳过，配置读写用例仍可运行；验证时检查实际跳过情况。
 - `legacy_test_*` 是历史流程用例，不会被 unittest 自动发现，不作为当前合并规则或验证通过的依据；新增用例应使用 `test_*`。配置相关测试应指向临时 settings.ini，避免依赖实际用户设置。
+- 测试通过 `importlib.util.spec_from_file_location()` 直接加载单文件源码，各测试模块可拥有独立的 `MODULE`；mock 要作用于被测模块，不能假定所有用例共享一次导入。补丁生命周期须覆盖 GTK 销毁及延迟定时器，防止尺寸保存写入真实用户配置。
 - 常规验证运行完整 unittest、源码 `py_compile` 和 `git diff --check`。实仓验证必须先复制 Git 数据与元数据，不得对来源目录或真实 origin 执行覆盖。
 - `VERSION`（项目根目录）是 Debian 软件包版本；`<工作空间>/VERSION` 是被管理仓库的本地生成标签显示号，两者不能混用。`build_deb.sh` 从项目根 VERSION 命名 deb 并复制源码、README、INSTALL、图标、桌面入口、Beyond Compare 默认会话及 `data/workspace.gitignore`。模板安装到 `/usr/lib/code-version-manager/workspace.gitignore`，可在打包前直接修改，不改 Python 源码。
 - Debian 入口为 `data/code-version-manager`，包控制文件为 `debian/control`，安装/卸载脚本只更新桌面数据库和图标缓存，不清理工作空间或用户配置。
+- `build_deb.sh` 使用 `dpkg-deb --root-owner-group` 生成 `Architecture: all` 包，当前版本的暂存目录为 `build/code-version-manager_<VERSION>_all/`，产物为 `dist/code-version-manager_<VERSION>_all.deb`。默认比较工具列为建议依赖；SVG 图标、桌面入口和启动脚本均来自 `data/`。
 - 兼容基线为 Git 2.25、Python 3.8、GTK 3；避免使用这些版本不支持的 Git 参数、Python 语法或 GTK API。
 
 ## 开发与验证
@@ -182,6 +220,10 @@
 依赖来自系统 APT：python3、python3-gi、gir1.2-gtk-3.0、git、openssh-client；比较工具另装。不使用 pip/venv 作为项目运行要求。无显示会话时部分 GTK 用例会跳过，需要界面回归时可使用已安装的 Xvfb。
 
 开始先运行 `git status --short`。保留用户已有源码、文档、测试和生成文件，不 reset、checkout 或清理实际用户仓库。业务规则变化时更新 README、INSTALL、AGENTS 和对应测试。
+
+- 以当前工作树为准核对实现，不能因改动尚未提交就将其视为可丢弃；用户已经回退代码时，先重读当前文件，再叠加新需求。
+- `tests/verify_workspace_copy.py` 先计算来源指纹，在独立 Git 副本及临时 origin 中操作，完成后再核对来源指纹；素材须有 main，元数据含链接时拒绝复制。脚本中的 reset、整仓覆盖和恢复清理只允许作用于验证副本。
+- 窗口与配置修改可先运行 `python3 -m unittest discover -s tests -p 'test_ui_layout.py'`；涉及提交、同步、合并、恢复或生成文件时选择对应专项测试，再执行完整验证。测试命令、交互启动、隔离实仓验证和 Debian 打包是不同步骤，不要把启动主窗口或构建 deb 当作单元测试。
 
 ```bash
 python3 -m unittest discover -s tests -p 'test*.py'

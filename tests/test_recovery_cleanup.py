@@ -445,7 +445,7 @@ class RecoveryCleanupUITest(unittest.TestCase):
         with mock.patch.object(MODULE.Gtk, "MessageDialog") as factory:
             MODULE.VersionManagerWindow._background_recovery_cleanup_complete(window, window.repository, 8, message)
         window.refresh.assert_called_once_with(update_remote=False)
-        window.status_label.set_text.assert_called_once_with(message)
+        window._set_operation_status.assert_called_once_with(message, level="info")
         factory.return_value.format_secondary_text.assert_called_once_with(message)
         self.assertEqual(MODULE.Gtk.MessageType.INFO, factory.call_args.kwargs["message_type"])
 

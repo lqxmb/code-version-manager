@@ -30,7 +30,7 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 
 def load_application_version() -> str:
@@ -60,6 +60,8 @@ MANAGER_CHANGELOG = "CHANGELOG.rst"
 WORKSPACE_CHANGELOG = "CHANGELOG.rst"
 WORKSPACE_VERSION = "VERSION"
 RECENT_WORKSPACE_LIMIT = 10
+OPERATION_LOG_LIMIT = 200
+DEFAULT_WINDOW_SIZE = (1120, 720)
 DELETE_TAG_RESPONSE = 1
 DELETE_COMMIT_RESPONSE = 2
 REMOTE_TIMEOUT = 120
@@ -448,6 +450,49 @@ def _read_settings(config_file: Path) -> configparser.ConfigParser:
     return parser
 
 
+def window_settings(config_file: Optional[Path] = None) -> Tuple[int, int, bool]:
+    """Read the last normal main-window size and maximized state."""
+    parser = _read_settings(config_file or settings_file_path())
+    try:
+        width = parser.getint("window", "width")
+        height = parser.getint("window", "height")
+        if not (0 < width <= 32767 and 0 < height <= 32767):
+            raise ValueError("invalid window size")
+    except (ValueError, configparser.Error):
+        return (*DEFAULT_WINDOW_SIZE, False)
+    try:
+        maximized = parser.getboolean("window", "maximized", fallback=False)
+    except (ValueError, configparser.Error):
+        maximized = False
+    return width, height, maximized
+
+
+def save_window_settings(
+    width: int, height: int, maximized: bool, config_file: Optional[Path] = None,
+) -> None:
+    """Persist main-window geometry without replacing other settings sections."""
+    config_file = config_file or settings_file_path()
+    parser = _read_settings(config_file)
+    if not parser.has_section("window"):
+        parser.add_section("window")
+    parser.set("window", "width", str(width))
+    parser.set("window", "height", str(height))
+    parser.set("window", "maximized", "true" if maximized else "false")
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=".settings-", dir=str(config_file.parent))
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            parser.write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if config_file.exists():
+            temporary.chmod(stat.S_IMODE(config_file.stat().st_mode))
+        os.replace(temporary, config_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def validate_github_account(value: str) -> str:
     """Validate a GitHub user or organization name used in SSH examples."""
     value = value.strip()
@@ -636,6 +681,14 @@ class HistoryEntry:
     @property
     def reference(self) -> str:
         return self.tags[0] if self.tags else self.commit
+
+
+@dataclass(frozen=True)
+class OperationLogEntry:
+    timestamp: float
+    summary: str
+    details: str
+    level: str = "info"
 
 
 def run_remote_process(command: Sequence[str], timeout: int, **options):
@@ -4166,11 +4219,20 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def __init__(self, application: Gtk.Application, initial_path: Path):
         super().__init__(application=application, title=APP_NAME)
         self.get_style_context().add_class("version-manager-app")
-        self.set_default_size(1120, 720)
+        self.window_settings_path = settings_file_path()
+        width, height, self.window_maximized = window_settings(self.window_settings_path)
+        self.window_normal_size = (width, height)
+        self.saved_window_settings = (width, height, self.window_maximized)
+        self.window_settings_timer: Optional[int] = None
+        self.set_default_size(width, height)
         self.set_icon_name("code-version-manager")
         self.repository: Optional[GitRepository] = None
         self.workspace_path = initial_path.expanduser().resolve()
         self.history_entries: List[HistoryEntry] = []
+        self.history_selection_order: List[int] = []
+        self.updating_history_selection = False
+        self.operation_logs: Dict[Path, List[OperationLogEntry]] = {}
+        self.log_window: Optional[Gtk.Window] = None
         self.info_mode = ""
         self.busy = False
         self.background_timer: Optional[int] = None
@@ -4185,11 +4247,62 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.updating_branch_choices = False
         self.updating_history_scope = False
         self.connect("destroy", lambda _window: self._invalidate_requests())
+        self.connect("configure-event", self._on_window_configure)
+        self.connect("window-state-event", self._on_window_state)
+        self.connect("destroy", self._flush_window_settings)
 
         self._build_header()
         self._build_content()
         self._apply_style()
         self.load_workspace(initial_path)
+        if self.window_maximized:
+            self.maximize()
+
+    def _on_window_configure(self, _window, _event) -> bool:
+        if not self.get_mapped():
+            return False
+        native = self.get_window()
+        state = native.get_state() if native is not None else 0
+        if self.window_maximized or state & (
+            Gdk.WindowState.MAXIMIZED | Gdk.WindowState.FULLSCREEN | Gdk.WindowState.ICONIFIED
+        ):
+            return False
+        # Match set_default_size() coordinates; configure-event can include decorations.
+        size = tuple(self.get_size())
+        if size != self.window_normal_size and all(value > 0 for value in size):
+            self.window_normal_size = size
+            self._queue_window_settings()
+        return False
+
+    def _on_window_state(self, _window, event) -> bool:
+        if event.changed_mask & Gdk.WindowState.MAXIMIZED:
+            maximized = bool(event.new_window_state & Gdk.WindowState.MAXIMIZED)
+            if maximized != self.window_maximized:
+                self.window_maximized = maximized
+                self._queue_window_settings()
+        return False
+
+    def _queue_window_settings(self) -> None:
+        if self.window_settings_timer is not None:
+            GLib.source_remove(self.window_settings_timer)
+        self.window_settings_timer = GLib.timeout_add(400, self._save_window_settings)
+
+    def _save_window_settings(self) -> bool:
+        self.window_settings_timer = None
+        settings = (*self.window_normal_size, self.window_maximized)
+        if settings != self.saved_window_settings:
+            try:
+                save_window_settings(*settings, config_file=self.window_settings_path)
+            except (OSError, configparser.Error) as error:
+                print(f"无法保存窗口大小：{error}", file=sys.stderr)
+            else:
+                self.saved_window_settings = settings
+        return False
+
+    def _flush_window_settings(self, _window) -> None:
+        if self.window_settings_timer is not None:
+            GLib.source_remove(self.window_settings_timer)
+        self._save_window_settings()
 
     def _build_header(self) -> None:
         header = Gtk.HeaderBar()
@@ -4200,10 +4313,15 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         header.props.title = APP_NAME
         self.set_titlebar(header)
 
+        about_button = self._command_button("关于", "help-about-symbolic", self.on_about)
+        header.pack_end(about_button)
+
+        self.workspace_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.workspace_bar.get_style_context().add_class("workspace-bar")
         open_button = self._command_button(
             "打开工作空间", "folder-open-symbolic", self.on_open_workspace
         )
-        header.pack_start(open_button)
+        self.workspace_bar.pack_start(open_button, False, False, 0)
 
         self.recent_button = Gtk.MenuButton(label="最近工作空间")
         self.recent_button.set_image(
@@ -4214,40 +4332,42 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.recent_popover = Gtk.Popover.new(self.recent_button)
         self.recent_popover.connect("show", self.on_recent_popover_show)
         self.recent_button.set_popover(self.recent_popover)
-        header.pack_start(self.recent_button)
+        self.workspace_bar.pack_start(self.recent_button, False, False, 0)
 
-        settings_button = self._command_button(
-            "设置", "preferences-system-symbolic", self.on_settings
-        )
-        header.pack_start(settings_button)
+        self.workspace_name_label = self._single_line_label()
+        self.workspace_name_label.get_style_context().add_class("workspace-status")
+        self.workspace_bar.pack_start(self.workspace_name_label, True, True, 0)
+
+        refresh_button = self._command_button("刷新", "view-refresh-symbolic", self.on_refresh)
+        self.workspace_bar.pack_start(refresh_button, False, False, 0)
 
         self.git_account_button = self._command_button(
             "Git 账号", "avatar-default-symbolic", self.on_git_account
         )
-        header.pack_end(self.git_account_button)
-        sync_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.sync_local_button = Gtk.Button(label="↓  同步本地")
-        self.sync_local_button.set_tooltip_text("以远程为准覆盖当前分支及所属版本标签，包括回退和删除")
-        self.sync_local_button.connect("clicked", self.on_sync_local)
-        self.sync_local_button.get_style_context().add_class("sync-action")
-        self.sync_remote_button = Gtk.Button(label="↑  同步远程")
-        self.sync_remote_button.set_tooltip_text("以本地为准覆盖当前分支及所属版本标签，包括回退和删除")
-        self.sync_remote_button.connect("clicked", self.on_sync_remote)
-        self.sync_remote_button.get_style_context().add_class("sync-action")
-        self.sync_local_button.set_sensitive(False)
-        self.sync_remote_button.set_sensitive(False)
-        sync_actions.pack_start(self.sync_local_button, False, False, 0)
-        sync_actions.pack_start(self.sync_remote_button, False, False, 0)
-        header.pack_end(sync_actions)
+        self.workspace_bar.pack_start(self.git_account_button, False, False, 0)
 
-        advanced_button = self._command_button("高级整仓覆盖", "dialog-warning-symbolic", self.on_advanced_sync)
-        advanced_button.set_tooltip_text("以一端为准覆盖所有分支和版本标签，包括回退和删除其他分支")
-        header.pack_end(advanced_button)
+        settings_button = self._command_button(
+            "设置", "preferences-system-symbolic", self.on_settings
+        )
+        self.workspace_bar.pack_start(settings_button, False, False, 0)
 
-        refresh_button = self._icon_button("view-refresh-symbolic", "刷新", self.on_refresh)
-        header.pack_end(refresh_button)
-        about_button = self._icon_button("help-about-symbolic", "关于", self.on_about)
-        header.pack_end(about_button)
+        self.advanced_button = Gtk.MenuButton(label="高级操作")
+        menu = Gtk.Menu()
+        item = Gtk.MenuItem(label="高级整仓覆盖")
+        item.set_tooltip_text("以一端为准覆盖所有分支和版本标签，包括回退和删除其他分支")
+        item.connect("activate", self.on_advanced_sync)
+        menu.append(item)
+        menu.show_all()
+        self.advanced_button.set_popup(menu)
+        self.workspace_bar.pack_start(self.advanced_button, False, False, 0)
+
+    @staticmethod
+    def _single_line_label() -> Gtk.Label:
+        label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        label.set_single_line_mode(True)
+        label.set_width_chars(1)
+        label.set_hexpand(True)
+        return label
 
     def _icon_button(self, icon: str, tooltip: str, callback) -> Gtk.Button:
         button = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
@@ -4261,6 +4381,184 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         button.set_always_show_image(True)
         button.connect("clicked", callback)
         return button
+
+    @staticmethod
+    def _operation_summary(message: str) -> str:
+        first = message.splitlines()[0] if message else "操作已完成"
+        first = first.split("。", 1)[0].strip()
+        if "已下载到" in first:
+            first = first.split("已下载到", 1)[0] + "已下载"
+        elif first.startswith("已从最近列表移除："):
+            first = "已移除最近工作空间记录"
+        return first[:64] + ("…" if len(first) > 64 else "")
+
+    def _set_operation_status(
+        self, message: str, summary: Optional[str] = None,
+        level: str = "info", record: bool = True,
+    ) -> None:
+        summary = self._operation_summary(summary if summary is not None else message)
+        self.status_label.set_text(summary)
+        self.status_label.set_tooltip_text(message)
+        context = self.status_label.get_style_context()
+        for name in ("warning", "error"):
+            context.remove_class(name)
+        if level in ("warning", "error"):
+            context.add_class(level)
+        if record and message:
+            entries = self.operation_logs.setdefault(self.workspace_path, [])
+            entry = OperationLogEntry(time.time(), summary, message, level)
+            entries.append(entry)
+            trimmed = len(entries) > OPERATION_LOG_LIMIT
+            del entries[:-OPERATION_LOG_LIMIT]
+            if (self.log_window is not None and self.workspace_path in self.operation_logs
+                    and not self.log_window.get_modal()):
+                if trimmed:
+                    self._refresh_operation_log()
+                else:
+                    self._append_operation_log_entry(entry)
+
+    def on_operation_log(self, _button) -> None:
+        if self.log_window is None:
+            window = Gtk.Window(title="操作日志", transient_for=self)
+            window.set_default_size(940, 660)
+            window.set_destroy_with_parent(True)
+            window.get_style_context().add_class("version-manager-app")
+            header = Gtk.HeaderBar(title="操作日志", show_close_button=True)
+            header.get_style_context().add_class("app-header")
+            window.set_titlebar(header)
+            window.connect("destroy", self._operation_log_closed)
+            self.log_window = window
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            window.add(root)
+            self.log_workspace_label = self._single_line_label()
+            self.log_workspace_label.set_margin_start(16)
+            self.log_workspace_label.set_margin_end(16)
+            self.log_workspace_label.set_margin_top(12)
+            self.log_workspace_label.set_margin_bottom(12)
+            root.pack_start(self.log_workspace_label, False, False, 0)
+            self.log_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=16)
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            self.log_scroll = scroll
+            scroll.add(self.log_list)
+            root.pack_start(scroll, True, True, 0)
+            actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            actions.get_style_context().add_class("footer")
+            hint = self._single_line_label()
+            hint.set_text("本次应用会话内保存，可选择并复制文字")
+            hint.get_style_context().add_class("storage-status")
+            actions.pack_start(hint, True, True, 0)
+            self.copy_log_button = self._command_button("复制全部", "edit-copy-symbolic", self.on_copy_operation_log)
+            actions.pack_start(self.copy_log_button, False, False, 0)
+            close = Gtk.Button(label="关闭")
+            close.connect("clicked", lambda _button: window.destroy())
+            actions.pack_start(close, False, False, 0)
+            root.pack_end(actions, False, False, 0)
+        self._refresh_operation_log()
+        self.log_window.show_all()
+        self.log_window.present()
+
+    def _operation_log_closed(self, _window) -> None:
+        self.log_window = None
+
+    def _refresh_operation_log(self) -> None:
+        entries = self.operation_logs.get(self.workspace_path, [])
+        self.log_workspace_label.set_text(f"{self.workspace_path} · {len(entries)} 条记录")
+        self.log_workspace_label.set_tooltip_text(str(self.workspace_path))
+        self.copy_log_button.set_sensitive(bool(entries))
+        for child in self.log_list.get_children():
+            child.destroy()
+        self.empty_log_label = None
+        if not entries:
+            self.empty_log_label = Gtk.Label(label="当前工作空间暂无操作日志。")
+            self.log_list.pack_start(self.empty_log_label, False, False, 0)
+        for entry in reversed(entries):
+            self._append_operation_log_entry(entry, prepend=False)
+        self.log_list.show_all()
+
+    def _append_operation_log_entry(
+        self, entry: OperationLogEntry, prepend: bool = True,
+    ) -> Gtk.Widget:
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.get_style_context().add_class("log-card")
+        heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        title = self._single_line_label()
+        title.set_text(entry.summary)
+        title.set_tooltip_text(entry.summary)
+        title.get_style_context().add_class("log-heading")
+        title.get_style_context().add_class(entry.level)
+        heading.pack_start(title, True, True, 0)
+        timestamp = Gtk.Label(label=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.timestamp)))
+        timestamp.get_style_context().add_class("storage-status")
+        heading.pack_end(timestamp, False, False, 0)
+        card.pack_start(heading, False, False, 0)
+        details = Gtk.TextView(editable=False, wrap_mode=Gtk.WrapMode.CHAR)
+        details.set_cursor_visible(False)
+        details.get_buffer().set_text(entry.details)
+        details.get_style_context().add_class("log-details")
+        card.pack_start(details, False, False, 0)
+        if prepend:
+            if self.empty_log_label is not None:
+                self.empty_log_label.destroy()
+                self.empty_log_label = None
+            self.log_list.pack_start(card, False, False, 0)
+            self.log_list.reorder_child(card, 0)
+            self.copy_log_button.set_sensitive(True)
+            if hasattr(self, "log_scroll"):
+                self.log_scroll.get_vadjustment().set_value(0)
+            children = self.log_list.get_children()
+            if len(children) > OPERATION_LOG_LIMIT:
+                children[-1].destroy()
+            card.show_all()
+        else:
+            self.log_list.pack_start(card, False, False, 0)
+        return card
+
+    def _operation_log_text(self) -> str:
+        return "\n\n".join(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(entry.timestamp))}] "
+            f"{entry.summary}\n{entry.details}"
+            for entry in reversed(self.operation_logs.get(self.workspace_path, []))
+        )
+
+    def on_copy_operation_log(self, _button) -> None:
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(self._operation_log_text(), -1)
+
+    def on_history_selection_changed(self, selection: Gtk.TreeSelection) -> None:
+        if self.updating_history_selection:
+            return
+        _model, paths = selection.get_selected_rows()
+        selected = [path.get_indices()[0] for path in paths]
+        order = [index for index in self.history_selection_order if index in selected]
+        order.extend(index for index in selected if index not in order)
+        self.history_selection_order = order[-2:]
+        self.updating_history_selection = True
+        try:
+            for index in order[:-2]:
+                selection.unselect_path(Gtk.TreePath.new_from_indices([index]))
+        finally:
+            self.updating_history_selection = False
+        self._update_history_actions()
+
+    def _update_history_actions(self) -> None:
+        count = len(self.selected_history())
+        available = self.repository is not None and not self.busy
+        self.compare_button.set_label("比较所选版本" if count == 2 else "所选版本与当前")
+        self.compare_button.set_sensitive(available and count in (1, 2))
+        self.compare_button.set_tooltip_text(
+            "比较所选的两个版本" if count == 2 else "比较所选版本与当前工作空间；Ctrl 可选择两个版本"
+        )
+        self.selection_count_label.set_text(f"已选 {count} / 2")
+        for button in (self.delete_button, self.export_button, self.edit_message_button):
+            button.set_sensitive(available and count == 1)
+
+    def on_compare_selected(self, button) -> None:
+        if not self.repository or self.busy:
+            return
+        if len(self.selected_history()) == 1:
+            self.on_compare_current(button)
+        elif len(self.selected_history()) == 2:
+            self.on_compare_versions(button)
 
     @staticmethod
     def _add_maximize_button(dialog: Gtk.Dialog) -> Gtk.Button:
@@ -4304,6 +4602,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         root.get_style_context().add_class("app-shell")
         self.add(root)
+        root.pack_start(self.workspace_bar, False, False, 0)
 
         self.info_bar = Gtk.InfoBar()
         self.info_bar.set_message_type(Gtk.MessageType.WARNING)
@@ -4320,16 +4619,15 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.save_button = self._command_button("发布版本", "document-save-symbolic", self.on_save_version)
         self.save_button.get_style_context().add_class("primary-action")
         self.save_button.set_tooltip_text("仅在本地创建版本，不上传到远程仓库")
-        self.compare_button = self._command_button("比较所选版本", "edit-copy-symbolic", self.on_compare_versions)
-        self.current_button = self._command_button(
-            "所选版本与当前", "document-open-recent-symbolic", self.on_compare_current
+        self.compare_button = self._command_button(
+            "所选版本与当前", "edit-copy-symbolic", self.on_compare_selected
         )
         self.export_button = self._command_button("下载版本", "document-save-symbolic", self.on_download_version)
         self.edit_message_button = self._command_button(
             "修改说明", "document-edit-symbolic", self.on_edit_version_message
         )
-        self.delete_button = self._icon_button(
-            "edit-delete-symbolic", "删除所选版本", self.on_delete_version
+        self.delete_button = self._command_button(
+            "删除版本", "edit-delete-symbolic", self.on_delete_version
         )
         self.delete_button.get_style_context().add_class("destructive-action")
         self.changelog_button = self._command_button(
@@ -4338,26 +4636,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.download_changelog_button = self._command_button(
             "下载 CHANGELOG", "document-save-symbolic", self.on_download_changelog
         )
-        buttons = (
-            self.save_button,
-            self.compare_button,
-            self.current_button,
-            self.export_button,
-            self.edit_message_button,
-            self.delete_button,
-            self.changelog_button,
-            self.download_changelog_button,
-        )
-        for index, button in enumerate(buttons):
-            if index in (1, 3, 5, 7):
-                separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-                separator.get_style_context().add_class("command-separator")
-                toolbar.pack_start(separator, False, False, 4)
-            toolbar.pack_start(button, False, False, 0)
-        root.pack_start(toolbar, False, False, 0)
-
-        self.branch_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
-                                  margin_start=16, margin_end=16, margin_top=8)
+        self.main_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.main_actions.get_style_context().add_class("command-bar")
+        self.main_actions.pack_start(self.save_button, False, False, 0)
+        separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        self.main_actions.pack_start(separator, False, False, 4)
+        self.branch_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.branch_bar.pack_start(Gtk.Label(label="分支"), False, False, 0)
         self.branch_model = Gtk.ListStore(str, str, str, bool)
         self.branch_combo = Gtk.ComboBox.new_with_model(self.branch_model)
@@ -4369,6 +4653,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.branch_combo.add_attribute(branch_renderer, "text", 1)
         self.branch_combo.add_attribute(branch_renderer, "foreground", 2)
         self.branch_combo.add_attribute(branch_renderer, "foreground-set", 3)
+        self.branch_combo.set_size_request(210, -1)
         self.branch_combo.connect("changed", self.on_branch_selected)
         self.branch_bar.pack_start(self.branch_combo, False, False, 0)
         self.new_branch_button = self._command_button("新建分支", "list-add-symbolic", self.on_create_branch)
@@ -4376,10 +4661,17 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.delete_branch_button = self._command_button("删除分支", "edit-delete-symbolic", self.on_delete_branch)
         for button in (self.new_branch_button, self.merge_button, self.delete_branch_button):
             self.branch_bar.pack_start(button, False, False, 0)
-        self.branch_status_label = Gtk.Label(xalign=0, ellipsize=3)
-        self.branch_status_label.set_hexpand(True)
-        self.branch_bar.pack_start(self.branch_status_label, True, True, 0)
-        root.pack_start(self.branch_bar, False, False, 0)
+        self.main_actions.pack_start(self.branch_bar, False, False, 0)
+        self.remote_summary_label = self._single_line_label()
+        self.remote_summary_label.get_style_context().add_class("remote-summary")
+        self.main_actions.pack_start(self.remote_summary_label, True, True, 8)
+        self.sync_local_button = self._command_button("同步本地", "go-down-symbolic", self.on_sync_local)
+        self.sync_remote_button = self._command_button("同步远程", "go-up-symbolic", self.on_sync_remote)
+        for button in (self.sync_local_button, self.sync_remote_button):
+            button.get_style_context().add_class("sync-action")
+            button.set_sensitive(False)
+            self.main_actions.pack_start(button, False, False, 0)
+        root.pack_start(self.main_actions, False, False, 0)
 
         self.merge_bar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
                                  margin_start=16, margin_end=16, margin_top=8)
@@ -4396,27 +4688,31 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.merge_bar.pack_start(merge_actions, False, False, 0)
         root.pack_start(self.merge_bar, False, False, 0)
 
-        self.remote_summary_label = Gtk.Label(xalign=0, margin_start=16, margin_end=16, margin_top=8)
-        self.remote_summary_label.set_line_wrap(True)
-        self.remote_summary_label.set_max_width_chars(100)
-        self.remote_summary_label.get_style_context().add_class("remote-summary")
-        root.pack_start(self.remote_summary_label, False, False, 0)
-
         self.notebook = Gtk.Notebook()
-        history_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        history_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         filters = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
-                          margin_start=16, margin_end=16, margin_top=8)
+                          margin_end=12)
         self.history_scope_combo = Gtk.ComboBoxText()
         self.history_scope_combo.append("current", "本分支相关版本")
         self.history_scope_combo.append("all", "全部分支版本")
         self.history_scope_combo.set_active_id("current")
         self.history_scope_combo.connect("changed", self.on_history_scope_changed)
-        filters.pack_start(self.history_scope_combo, False, False, 0)
-        hint = Gtk.Label(
-            label="本分支相关版本包含当前分支版本和继承的正式版本；全部分支版本包含仓库内所有分支版本。",
-            xalign=0,
+        self.history_scope_combo.set_tooltip_text(
+            "本分支相关版本包含当前分支版本和继承的正式版本；全部分支版本包含仓库内所有分支版本。"
         )
-        filters.pack_start(hint, False, False, 0)
+        for widget in (self.history_scope_combo, self.compare_button, self.delete_button,
+                       self.export_button, self.edit_message_button, self.changelog_button,
+                       self.download_changelog_button):
+            toolbar.pack_start(widget, False, False, 0)
+        self.history_action_scroll = Gtk.ScrolledWindow()
+        self.history_action_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        self.history_action_scroll.set_propagate_natural_height(True)
+        self.history_action_scroll.add(toolbar)
+        filters.pack_start(self.history_action_scroll, True, True, 0)
+        self.selection_count_label = Gtk.Label(label="已选 0 / 2")
+        self.selection_count_label.get_style_context().add_class("storage-status")
+        self.selection_count_label.set_tooltip_text("Ctrl 多选或 Shift 范围选择；最多保留最近选中的两个版本")
+        filters.pack_start(self.selection_count_label, False, False, 0)
         history_panel.pack_start(filters, False, False, 0)
         history_panel.pack_start(self._build_history_view(), True, True, 0)
         self.notebook.append_page(history_panel, Gtk.Label(label="版本历史"))
@@ -4425,7 +4721,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         footer.get_style_context().add_class("footer")
-        self.repo_label = Gtk.Label(xalign=0, ellipsize=3)
+        self.repo_label = self._single_line_label()
+        self.repo_label.set_max_width_chars(32)
+        self.repo_label.set_hexpand(False)
         self.repo_label.get_style_context().add_class("workspace-status")
         self.storage_label = Gtk.Label(xalign=1)
         self.storage_label.get_style_context().add_class("storage-status")
@@ -4435,12 +4733,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.clear_recovery_button = Gtk.Button(label="清空恢复文件")
         self.clear_recovery_button.connect("clicked", self.on_clear_recovery_files)
         self.clear_recovery_button.set_sensitive(False)
-        self.status_label = Gtk.Label(xalign=1)
+        self.status_label = self._single_line_label()
         self.status_label.get_style_context().add_class("operation-status")
-        footer.pack_start(self.repo_label, True, True, 0)
-        footer.pack_end(self.status_label, False, False, 0)
-        footer.pack_end(self.storage_label, False, False, 0)
-        footer.pack_end(self.clear_recovery_button, False, False, 0)
+        self.log_button = self._command_button("日志", "text-x-generic-symbolic", self.on_operation_log)
+        footer.pack_start(self.repo_label, False, True, 0)
+        footer.pack_start(self.status_label, True, True, 0)
+        footer.pack_start(self.storage_label, False, False, 0)
+        footer.pack_start(self.clear_recovery_button, False, False, 0)
+        footer.pack_start(self.log_button, False, False, 0)
         root.pack_end(footer, False, False, 0)
 
     def _build_history_view(self) -> Gtk.Widget:
@@ -4449,7 +4749,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.history_tree.set_headers_clickable(True)
         self.history_tree.get_style_context().add_class("data-table")
         self.history_tree.set_rules_hint(True)
-        self.history_tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        selection = self.history_tree.get_selection()
+        selection.set_mode(Gtk.SelectionMode.MULTIPLE)
+        selection.connect("changed", self.on_history_selection_changed)
         self.history_tree.connect("row-activated", self.on_history_activated)
         columns = (
             ("版本", 0, 150),
@@ -4511,8 +4813,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         headerbar.app-header button:disabled {
             color: #89959d; background-color: #f3f5f6;
         }
-        headerbar.app-header button.sync-action {
-            min-width: 112px; padding: 4px 10px; font-weight: bold;
+        .command-bar button.sync-action {
+            padding: 3px 8px; font-weight: bold;
         }
         headerbar.app-header button.titlebutton.close:hover {
             background-color: #bb3030; border-color: #982727; color: white;
@@ -4521,10 +4823,18 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             padding: 9px 12px; background-color: #f8fafb;
             border-bottom: 1px solid #d9e0e5;
         }
-        .command-bar button {
-            min-height: 32px; padding: 3px 9px; border-radius: 4px;
+        .workspace-bar {
+            padding: 8px 12px; background-color: #ffffff;
+            border-bottom: 1px solid #d9e0e5;
+        }
+        .command-bar button, .workspace-bar button {
+            min-height: 28px; padding: 3px 8px; border-radius: 4px;
             border: 1px solid #d4dce2; background-image: none;
             background-color: #ffffff; color: #26343e;
+        }
+        .command-bar button label, .command-bar button image,
+        .workspace-bar button label, .workspace-bar button image {
+            color: inherit; -gtk-icon-shadow: none;
         }
         .command-bar button:hover { background-color: #edf3f5; border-color: #9eafb9; }
         .command-bar button:disabled { color: #89959d; background-color: #f3f5f6; }
@@ -4567,7 +4877,19 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         .workspace-status { color: #43525c; }
         .storage-status { color: #687780; }
         .operation-status { color: #126d76; font-weight: bold; }
+        .operation-status.warning, .log-heading.warning { color: #936110; }
+        .operation-status.error, .log-heading.error { color: #a73232; }
+        .log-heading { color: #126d76; font-weight: bold; }
+        .log-card {
+            padding: 12px 14px; background-color: #ffffff;
+            border: 1px solid #d9e0e5; border-radius: 6px;
+        }
+        textview.log-details, textview.log-details text {
+            background-color: #ffffff; color: #43525c;
+        }
         .remote-summary { color: #43525c; }
+        .remote-summary.synced { color: #32804f; }
+        .remote-summary.pending { color: #a73232; }
         .sync-summary {
             padding: 12px; border: 1px solid #cbdde0; border-radius: 6px;
             background-color: #eaf4f5; color: #234a50;
@@ -4592,19 +4914,19 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog button { min-height: 30px; padding: 3px 10px; border-radius: 4px; }
         dialog scrolledwindow { border: 1px solid #d9e0e5; }
         infobar.warning { background-color: #fff3dc; color: #654d1b; }
-        headerbar.app-header button.sync-pending,
-        headerbar.app-header button.sync-pending:disabled {
+        .command-bar button.sync-pending,
+        .command-bar button.sync-pending:disabled {
             background-image: none; background-color: #bb3030; color: white;
             border-color: #982727; text-shadow: none; box-shadow: none; opacity: 1;
         }
-        headerbar.app-header button.sync-pending:hover { background-color: #a32929; }
-        headerbar.app-header button.sync-synced,
-        headerbar.app-header button.sync-synced:disabled {
+        .command-bar button.sync-pending:hover { background-color: #a32929; }
+        .command-bar button.sync-synced,
+        .command-bar button.sync-synced:disabled {
             background-image: none; background-color: #32804f; color: white;
             border-color: #286b41; text-shadow: none; box-shadow: none; opacity: 1;
         }
-        headerbar.app-header button.sync-unavailable,
-        headerbar.app-header button.sync-unavailable:disabled {
+        .command-bar button.sync-unavailable,
+        .command-bar button.sync-unavailable:disabled {
             background-image: none; background-color: #f1f4f5; color: #89959d;
             border-color: #d5dde2; text-shadow: none; box-shadow: none; opacity: 1;
         }
@@ -4635,11 +4957,17 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.history_scope_combo.set_active_id("current")
         self.updating_history_scope = False
         self._save_repository_path(self.workspace_path)
+        self.workspace_name_label.set_text(self.workspace_path.name)
+        self.workspace_name_label.set_tooltip_text(str(self.workspace_path))
+        if self.log_window is not None:
+            self._refresh_operation_log()
         self.refresh()
 
     def _invalidate_requests(self) -> None:
         self.branch_generation += 1
         self._invalidate_remote_status()
+        if self.log_window is not None:
+            self.log_window.destroy()
 
     def _refresh_branch_choices(self) -> None:
         self.updating_branch_choices = True
@@ -4650,7 +4978,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 self.branch_model.append(["none", "未启用版本管理", None, False])
                 self.branch_combo.set_active_id("none")
                 self.branch_bar.set_sensitive(False)
-                self.branch_status_label.set_text("请先发布首个版本")
+                self.branch_bar.set_tooltip_text("请先发布首个版本")
                 self.merge_bar.hide()
                 self.merge_bar.set_no_show_all(True)
                 return
@@ -4685,7 +5013,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.delete_branch_button.set_sensitive(any(
                 branch.name != "main" for branch in [*branches, *self.remote_branch_choices]
             ))
-            self.branch_status_label.set_text("main 发正式版；开发分支发自己的预发布版")
+            self.branch_bar.set_tooltip_text("main 发正式版；开发分支发自己的预发布版")
             self._refresh_merge_controls(state)
         finally:
             self.updating_branch_choices = False
@@ -4827,7 +5155,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def _background_comparison_ready(self, result: MergeComparisonResult) -> bool:
         self._end_background()
         self.refresh()
-        self.status_label.set_text(f"对比工具已关闭，共 {len(result.changes)} 项文件变更；请选择完成合并或取消合并。")
+        self._set_operation_status(f"对比工具已关闭，共 {len(result.changes)} 项文件变更；请选择完成合并或取消合并。")
         return False
 
     def on_complete_merge(self, _button) -> None:
@@ -4942,6 +5270,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def refresh(self, check_remote: bool = True, update_remote: bool = True) -> None:
         self._refresh_recovery_cleanup_button()
+        self.history_selection_order = []
+        self.history_tree.get_selection().unselect_all()
         if not self.repository:
             self._refresh_branch_choices()
             self.history_entries = []
@@ -4957,15 +5287,16 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self._invalidate_remote_status()
             self._set_remote_status(RemoteSyncStatus("unavailable", "请先启用版本管理并发布本地版本。"))
             self.compare_button.set_sensitive(False)
-            self.current_button.set_sensitive(False)
             self.export_button.set_sensitive(False)
             self.edit_message_button.set_sensitive(False)
             self.delete_button.set_sensitive(False)
             self.changelog_button.set_sensitive(False)
             self.download_changelog_button.set_sensitive(False)
             self.repo_label.set_text(f"{self.workspace_path}  ·  未启用版本管理")
+            self.repo_label.set_tooltip_text(str(self.workspace_path))
             self.storage_label.set_text("版本存储 0 B")
-            self.status_label.set_text("尚无版本")
+            self._set_operation_status("尚无版本", record=False)
+            self._update_history_actions()
             return
         try:
             self._refresh_branch_choices()
@@ -5005,17 +5336,13 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 self.save_button.set_sensitive(False)
                 branch_label = f"历史版本 {self.repository.head_label()}"
             self.repo_label.set_text(f"{self.repository.path}  ·  {branch_label}")
+            self.repo_label.set_tooltip_text(f"{self.repository.path}  ·  {branch_label}")
             self.storage_label.set_text(
                 f"版本存储 {format_storage_size(self.repository.storage_size())}"
             )
             status = "工作区干净" if not changes else f"{len(changes)} 项修改"
-            self.status_label.set_text(status)
-            has_versions = bool(self.history_entries)
-            self.current_button.set_sensitive(has_versions)
-            self.compare_button.set_sensitive(len(self.history_entries) >= 2)
-            self.export_button.set_sensitive(has_versions)
-            self.edit_message_button.set_sensitive(has_versions)
-            self.delete_button.set_sensitive(has_versions)
+            self._set_operation_status(status, record=False)
+            self._update_history_actions()
             self.changelog_button.set_sensitive(True)
             self.download_changelog_button.set_sensitive(True)
             if not update_remote:
@@ -5048,9 +5375,22 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 for ref, oid in status.remote_refs if ref.startswith("refs/heads/")
             ], key=lambda branch: branch.name)
             self._refresh_branch_choices()
-        self.remote_summary_label.set_text(status.message.splitlines()[0][:200])
-        self.remote_summary_label.set_tooltip_text(status.message)
-        pending = bool(status.local_changes or status.remote_changes or status.state == "pending")
+        has_differences = bool(status.local_changes or status.remote_changes or status.state == "pending")
+        self.remote_summary_label.set_text({
+            "synced": "与远程一致", "pending": "当前分支有差异",
+            "checking": "正在检查远程…", "unavailable": "检查远程失败",
+        }.get(status.state, "尚未检查远程"))
+        tooltip = status.message
+        if has_differences and status.local_changes:
+            tooltip += "\n\n以远程为准：\n" + (status.local_message or "当前操作暂不可用。")
+        if has_differences and status.remote_changes:
+            tooltip += "\n\n以本地为准：\n" + (status.remote_message or "当前操作暂不可用。")
+        self.remote_summary_label.set_tooltip_text(tooltip)
+        context = self.remote_summary_label.get_style_context()
+        for state in ("synced", "pending", "checking", "unavailable"):
+            context.remove_class(state)
+        context.add_class(status.state)
+        pending = has_differences
         self._set_sync_button(
             self.sync_local_button,
             status.can_sync_local,
@@ -5058,12 +5398,20 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             status.message + "\n" + (status.local_message or "以远程为准覆盖当前分支及所属版本标签，包括回退和删除。"),
             status.local_message or status.message,
         )
+        self.sync_local_button.set_tooltip_text(
+            "以远程为准覆盖当前分支及所属版本标签，包括回退和删除。\n" +
+            (status.local_message or status.message)
+        )
         self._set_sync_button(
             self.sync_remote_button,
             status.can_sync_remote,
             pending,
             status.message + "\n" + (status.remote_message or "以本地为准覆盖当前分支及所属版本标签，包括回退和删除。"),
             status.remote_message or status.message,
+        )
+        self.sync_remote_button.set_tooltip_text(
+            "以本地为准覆盖当前分支及所属版本标签，包括回退和删除。\n" +
+            (status.remote_message or status.message)
         )
 
     def _set_sync_button(
@@ -5209,7 +5557,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         try:
             remove_recent_workspace(path)
             self.on_recent_popover_show(self.recent_popover)
-            self.status_label.set_text(f"已从最近列表移除：{path}")
+            self._set_operation_status(f"已从最近列表移除：{path}")
         except OSError as error:
             self.show_error(str(error))
 
@@ -5234,7 +5582,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             return
         try:
             clear_recent_workspaces()
-            self.status_label.set_text("最近打开的工作空间已清空")
+            self._set_operation_status("最近打开的工作空间已清空")
         except OSError as error:
             self.show_error(str(error))
 
@@ -5330,9 +5678,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 )
                 if self.repository:
                     self.repository.configure_compare_tool(combo.get_active_id())
-                    self.status_label.set_text("应用和工作空间设置已保存")
+                    self._set_operation_status("应用和工作空间设置已保存")
                 else:
-                    self.status_label.set_text("Git 默认设置已保存")
+                    self._set_operation_status("Git 默认设置已保存")
             except (GitError, OSError, ValueError) as error:
                 dialog.destroy()
                 self.show_error(str(error))
@@ -5489,7 +5837,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                     "远程验证完成。", show_result=True,
                 )
             else:
-                self.status_label.set_text("SSH 配置已保存，尚未验证连接；可重新打开“Git 账号”进行验证。")
+                self._set_operation_status("SSH 配置已保存，尚未验证连接；可重新打开“Git 账号”进行验证。")
             return
 
     def open_github_repository_creation(self, dialog, remote_entry) -> None:
@@ -6353,8 +6701,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self._end_background()
         self.refresh(update_remote=False)
         self._set_remote_status(RemoteSyncStatus("unavailable", "恢复文件检查或清理已结束；点击“刷新”重新检查远程状态。"))
-        self.status_label.set_text(message.splitlines()[0])
-        self.status_label.set_tooltip_text(message)
+        failed = message.startswith("恢复文件清理结果") and "失败 0 个" not in message
+        self._set_operation_status(message, level="warning" if failed else "info")
         if message.startswith("恢复文件清理结果"):
             dialog = Gtk.MessageDialog(
                 transient_for=self, modal=True,
@@ -6454,20 +6802,22 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self._invalidate_remote_status()
         self._set_remote_status(RemoteSyncStatus("checking", "操作进行中，完成后重新检查远程状态。"))
         self.header.set_sensitive(False)
+        self.workspace_bar.set_sensitive(False)
+        self.main_actions.set_sensitive(False)
         self.toolbar.set_sensitive(False)
         self.branch_bar.set_sensitive(False)
         self.merge_bar.set_sensitive(False)
         self.notebook.set_sensitive(False)
         self.info_action_button.set_sensitive(False)
         self.clear_recovery_button.set_sensitive(False)
-        self.status_label.set_text(busy)
+        self._set_operation_status(busy, record=False)
         started = time.monotonic()
 
         def update_elapsed() -> bool:
             if not self.busy:
                 return False
             elapsed = int(time.monotonic() - started)
-            self.status_label.set_text(f"{busy} · 已等待 {elapsed} 秒")
+            self._set_operation_status(f"{busy} · 已等待 {elapsed} 秒", record=False)
             return True
 
         self.background_timer = GLib.timeout_add_seconds(1, update_elapsed)
@@ -6502,7 +6852,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.load_workspace(self.workspace_path)
         else:
             self.refresh()
-        self.status_label.set_text(message)
+        self._set_operation_status(
+            message, level="warning" if "结果待确认" in message else "info",
+        )
         if "本地已删除，远程删除结果待确认" in message:
             dialog = Gtk.MessageDialog(
                 transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
@@ -6531,7 +6883,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 try:
                     restored = self.repository.restore_local_sync_changes()
                     self.refresh()
-                    self.status_label.set_text(restored)
+                    self._set_operation_status(restored)
                 except GitError as error:
                     self.show_error(str(error))
             return False
@@ -6563,14 +6915,18 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             GLib.source_remove(self.background_timer)
             self.background_timer = None
         self.header.set_sensitive(True)
+        self.workspace_bar.set_sensitive(True)
+        self.main_actions.set_sensitive(True)
         self.toolbar.set_sensitive(True)
         self.branch_bar.set_sensitive(True)
         self.merge_bar.set_sensitive(True)
         self.notebook.set_sensitive(True)
         self.info_action_button.set_sensitive(True)
         self._refresh_recovery_cleanup_button()
+        self._update_history_actions()
 
     def show_error(self, message: str) -> None:
+        self._set_operation_status(message, summary="操作未完成", level="error")
         dialog = Gtk.MessageDialog(
             transient_for=self,
             modal=True,

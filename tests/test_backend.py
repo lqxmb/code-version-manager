@@ -2323,7 +2323,7 @@ class BackgroundProgressTest(unittest.TestCase):
             self.assertTrue(callback())
 
         self.assertEqual(42, window.background_timer)
-        window.status_label.set_text.assert_called_with("正在同步远程仓库... · 已等待 5 秒")
+        window._set_operation_status.assert_called_with("正在同步远程仓库... · 已等待 5 秒", record=False)
         thread.return_value.start.assert_called_once_with()
         operation.assert_not_called()
         with mock.patch.object(MODULE.GLib, "source_remove") as remove_timer:
