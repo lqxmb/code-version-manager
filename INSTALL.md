@@ -134,6 +134,14 @@ sudo apt install ./dist/code-version-manager_$(cat VERSION)_all.deb
 
 实际 Git 目录的 code-version-manager/recovery 保存配置、清单、CHANGELOG 和忽略文件备份；refs/code-version-manager/recovery 保存旧 Git 引用及工作区 stash。末尾版本撤回使用 delete-version-commit 恢复点，额外保存原始 index 及 version-deletion.json，记录原 index 是否存在。恢复同步前暂存内容使用 stash apply --index。恢复冲突时保留恢复点，不要直接清理 Git 私有目录。
 
+### 如何清理历史恢复备份
+
+点击主窗口底部“版本存储”旁的“清空恢复文件”。程序自动定位当前工作空间实际 Git 目录下的 `code-version-manager/recovery/`，先后台统计，再显示目录、可清理数量、备份占用和保留数量供确认；linked worktree 使用其自己的元数据目录。确认后清理备份及对应应用恢复引用，已删除的恢复点不能再用于恢复。
+
+含工作区 stash 或 `ignored-worktree` 的恢复点可能仍有未恢复修改，会保守保留，重启后也有效。链接、特殊文件和未知名称不会清理；仅有 Git 恢复引用而没有本地备份目录的旧记录也不参与。没有可清理内容时显示原因。清理不改当前代码、暂存区、分支、版本标签、正常版本清单或用户 stash，不要求工作区干净；未完成的 Git／手动合并操作须先处理。
+
+清理完成会刷新版本存储占用，并显示成功、保留、失败和未处理数量。失败时部分备份文件可能已删除，按结果中的残留位置检查，重新扫描后再试。备份占用不包含 Git 对象空间，不自动执行对象回收或连接远程。
+
 本地 manifest 不上传。远程版本没有清单时按完整 Git 快照导出；整仓同步上传完整提交历史，不只是所选封装文件或 ZIP。
 
 ### 如何验证升级

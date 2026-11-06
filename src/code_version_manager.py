@@ -300,6 +300,26 @@ class VersionDeletionPlan:
 
 
 @dataclass(frozen=True)
+class RecoveryCleanupEntry:
+    name: str
+    signature: str
+    size: int
+    refs: Tuple[Tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class RecoveryCleanupPlan:
+    root: Path
+    root_identity: Tuple[int, ...]
+    entries: Tuple[RecoveryCleanupEntry, ...]
+    preserved: Tuple[Tuple[str, str], ...]
+
+    @property
+    def size(self) -> int:
+        return sum(entry.size for entry in self.entries)
+
+
+@dataclass(frozen=True)
 class BranchMergePlan:
     source: str
     source_tag: str
@@ -1492,6 +1512,196 @@ class GitRepository:
             "tracking_refs": self._origin_tracking_refs(),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         return recovery_path
+
+    @contextmanager
+    def _open_recovery_root(self):
+        """Pin the Git, metadata and recovery directories without following links."""
+        descriptors = []
+        identity = []
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            for name in (str(self.metadata_path.parent), METADATA_DIRECTORY, "recovery"):
+                try:
+                    descriptor = os.open(name, flags, **({"dir_fd": descriptors[-1]} if descriptors else {}))
+                except FileNotFoundError:
+                    yield None, ()
+                    return
+                descriptors.append(descriptor)
+                info = os.fstat(descriptor)
+                identity.extend((info.st_dev, info.st_ino))
+            yield descriptors[-1], tuple(identity)
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def _recovery_cleanup_refs(self) -> Dict[str, str]:
+        refs = {}
+        for line in self.run([
+            "for-each-ref", "--format=%(refname) %(objectname) %(symref)",
+            "refs/code-version-manager/recovery/",
+        ]).splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                raise GitError("恢复引用包含符号引用或无效记录，请先检查 Git 恢复目录。")
+            refs[fields[0]] = fields[1]
+        return refs
+
+    @staticmethod
+    def _recovery_tree_snapshot(parent_fd: int, name: str) -> Tuple[str, int]:
+        rows, seen = [], set()
+        size = 0
+
+        def visit(directory_fd: int, child: str, relative: str) -> None:
+            nonlocal size
+            info = os.stat(child, dir_fd=directory_fd, follow_symlinks=False)
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise GitError("包含符号链接或特殊文件，已保留")
+            row = (relative, info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                   info.st_mtime_ns, info.st_ctime_ns)
+            rows.append(row)
+            inode = (info.st_dev, info.st_ino)
+            if inode not in seen:
+                seen.add(inode)
+                size += info.st_blocks * 512 if hasattr(info, "st_blocks") else info.st_size
+            if stat.S_ISDIR(info.st_mode):
+                descriptor = os.open(child, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    actual = os.fstat(descriptor)
+                    if (actual.st_dev, actual.st_ino) != inode:
+                        raise GitError("恢复目录在读取时变化，请重新确认")
+                    for nested in sorted(os.listdir(descriptor)):
+                        visit(descriptor, nested, relative + "/" + nested)
+                    after = os.fstat(descriptor)
+                    if (after.st_mtime_ns, after.st_ctime_ns) != (info.st_mtime_ns, info.st_ctime_ns):
+                        raise GitError("恢复目录在读取时变化，请重新确认")
+                finally:
+                    os.close(descriptor)
+
+        visit(parent_fd, name, name)
+        return hashlib.sha256(repr(rows).encode("utf-8", "surrogateescape")).hexdigest(), size
+
+    def _recovery_cleanup_entry(
+        self, root_fd: int, name: str, refs: Dict[str, str],
+    ) -> RecoveryCleanupEntry:
+        if re.fullmatch(r"[0-9]+-[0-9a-f]{8}", name) is None:
+            raise GitError("名称不是应用生成的恢复点，已保留")
+        prefix = f"refs/code-version-manager/recovery/{name}/"
+        selected = tuple(sorted((ref, oid) for ref, oid in refs.items() if ref.startswith(prefix)))
+        if any(ref.endswith("/before/worktree") for ref, _oid in selected):
+            raise GitError("含工作区 stash，可能有尚未恢复的修改")
+        if self.last_local_sync_stash_ref and self.last_local_sync_stash_ref.startswith(prefix):
+            raise GitError("仍用于恢复同步前修改")
+        info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise GitError("不是普通恢复目录，已保留")
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            if "ignored-worktree" in os.listdir(descriptor):
+                raise GitError("含被移走的忽略文件，可能尚未恢复")
+        finally:
+            os.close(descriptor)
+        signature, size = self._recovery_tree_snapshot(root_fd, name)
+        return RecoveryCleanupEntry(name, signature, size, selected)
+
+    def plan_recovery_cleanup(self) -> RecoveryCleanupPlan:
+        self._assert_no_operation()
+        root = self.metadata_path / "recovery"
+        try:
+            with self._open_recovery_root() as (root_fd, identity):
+                if root_fd is None:
+                    return RecoveryCleanupPlan(root, (), (), ())
+                refs = self._recovery_cleanup_refs()
+                entries, preserved = [], []
+                for name in sorted(os.listdir(root_fd)):
+                    try:
+                        entries.append(self._recovery_cleanup_entry(root_fd, name, refs))
+                    except (GitError, OSError) as error:
+                        preserved.append((name, str(error)))
+                return RecoveryCleanupPlan(root, identity, tuple(entries), tuple(preserved))
+        except OSError as error:
+            raise GitError(f"无法读取恢复文件目录（必须是普通目录）：{root}\n{error}") from error
+
+    @staticmethod
+    def _remove_recovery_tree(parent_fd: int, name: str) -> None:
+        """Delete relative to pinned descriptors; links are unlinked, never followed."""
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise GitError("清理期间恢复目录被替换，已停止删除")
+                for child in os.listdir(descriptor):
+                    GitRepository._remove_recovery_tree(descriptor, child)
+            finally:
+                os.close(descriptor)
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                raise GitError("清理期间恢复目录被替换，已停止删除")
+            os.rmdir(name, dir_fd=parent_fd)
+        else:
+            os.unlink(name, dir_fd=parent_fd)
+
+    def clear_recovery_files(self, expected: RecoveryCleanupPlan) -> str:
+        self._assert_no_operation()
+        current = self.plan_recovery_cleanup()
+        selected = {entry.name: entry for entry in current.entries}
+        if (expected.root != current.root or expected.root_identity != current.root_identity
+                or any(selected.get(entry.name) != entry for entry in expected.entries)):
+            raise GitError("确认后恢复目录、文件或引用已变化，请重新检查并确认清理。")
+        completed, failures = 0, []
+        unprocessed = len(expected.entries)
+        try:
+            with self._open_recovery_root() as (root_fd, identity):
+                if identity != expected.root_identity:
+                    raise GitError("恢复文件根目录已变化，请重新确认。")
+                for entry in expected.entries:
+                    try:
+                        self._assert_no_operation()
+                        with self._open_recovery_root() as (_current_fd, live_identity):
+                            if live_identity != identity:
+                                raise GitError("恢复文件根目录已变化，停止清理")
+                        if self._recovery_cleanup_entry(root_fd, entry.name, self._recovery_cleanup_refs()) != entry:
+                            raise GitError("恢复文件或引用已变化，停止清理")
+                    except (GitError, OSError) as error:
+                        failures.append(f"{entry.name}：{error}")
+                        unprocessed -= 1
+                        break
+                    unprocessed -= 1
+                    refs_deleted = False
+                    try:
+                        if entry.refs:
+                            self.run(["update-ref", "--stdin"], input="option no-deref\n" + "".join(
+                                f"delete {ref} {oid}\n" for ref, oid in entry.refs))
+                            refs_deleted = True
+                        with self._open_recovery_root() as (_current_fd, live_identity):
+                            if live_identity != identity:
+                                raise GitError("恢复文件根目录已变化，停止清理")
+                        prefix = f"refs/code-version-manager/recovery/{entry.name}/"
+                        if any(ref.startswith(prefix) for ref in self._recovery_cleanup_refs()):
+                            raise GitError("此恢复点出现新的引用，停止清理并保留文件")
+                        if self._recovery_tree_snapshot(root_fd, entry.name)[0] != entry.signature:
+                            raise GitError("此恢复点文件已变化，停止清理")
+                        self._remove_recovery_tree(root_fd, entry.name)
+                        completed += 1
+                    except (GitError, OSError) as error:
+                        detail = str(error)
+                        if refs_deleted:
+                            try:
+                                self.run(["update-ref", "--stdin"], input="option no-deref\n" + "".join(
+                                    f"create {ref} {oid}\n" for ref, oid in entry.refs))
+                            except GitError as restore_error:
+                                detail += f"；恢复引用未还原：{restore_error}"
+                        failures.append(f"{entry.name}：{detail}；剩余文件位置：{current.root / entry.name}")
+                        break
+        except OSError as error:
+            raise GitError(f"清理恢复文件未全部完成，已清理 {completed} 个；剩余文件：{current.root}\n{error}") from error
+        preserved = len(current.preserved) + len(current.entries) - len(expected.entries)
+        message = (f"恢复文件清理结果：成功 {completed} 个，保留 {preserved} 项，失败 {len(failures)} 个，"
+                   f"未处理 {unprocessed} 个。目录：{current.root}。")
+        if failures:
+            message += "\n部分文件可能已删除，尚存文件已保留；请核对后重新扫描。\n" + "\n".join(failures)
+        return message
 
     def _ignored_path_conflicts(self, target_ref: str) -> List[str]:
         ignored_paths = self.run([
@@ -4222,11 +4432,15 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.storage_label.set_tooltip_text(
             "当前工作空间 Git 增量版本历史实际占用的磁盘空间，不包含工作空间源文件"
         )
+        self.clear_recovery_button = Gtk.Button(label="清空恢复文件")
+        self.clear_recovery_button.connect("clicked", self.on_clear_recovery_files)
+        self.clear_recovery_button.set_sensitive(False)
         self.status_label = Gtk.Label(xalign=1)
         self.status_label.get_style_context().add_class("operation-status")
         footer.pack_start(self.repo_label, True, True, 0)
         footer.pack_end(self.status_label, False, False, 0)
         footer.pack_end(self.storage_label, False, False, 0)
+        footer.pack_end(self.clear_recovery_button, False, False, 0)
         root.pack_end(footer, False, False, 0)
 
     def _build_history_view(self) -> Gtk.Widget:
@@ -4727,6 +4941,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.refresh(update_remote=False)
 
     def refresh(self, check_remote: bool = True, update_remote: bool = True) -> None:
+        self._refresh_recovery_cleanup_button()
         if not self.repository:
             self._refresh_branch_choices()
             self.history_entries = []
@@ -6058,6 +6273,108 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.run_background(busy, operation, success)
         return False
 
+    def _refresh_recovery_cleanup_button(self) -> None:
+        reason = ""
+        if not self.repository:
+            reason = "请先打开已启用版本管理的工作空间。"
+        elif self.busy:
+            reason = "操作进行中，请等待完成后再清理。"
+        else:
+            try:
+                self.repository._assert_no_operation()
+            except GitError as error:
+                reason = str(error)
+        self.clear_recovery_button.set_sensitive(not reason)
+        self.clear_recovery_button.set_tooltip_text(reason or "清理当前工作空间的历史恢复备份；保留可能含未恢复修改的恢复点。")
+
+    def on_clear_recovery_files(self, _button) -> None:
+        if not self.repository or self.busy:
+            return
+        repository = self.repository
+        generation = self.branch_generation + 1
+        self.run_background(
+            "正在检查恢复文件…", repository.plan_recovery_cleanup, "",
+            result_callback=lambda plan: self._background_recovery_cleanup_ready(repository, generation, plan),
+            error_callback=lambda message: self._background_recovery_cleanup_failed(repository, generation, message),
+        )
+
+    def _background_recovery_cleanup_ready(
+        self, repository: GitRepository, generation: int, plan: RecoveryCleanupPlan,
+    ) -> bool:
+        if repository is not self.repository or generation != self.branch_generation:
+            return False
+        self._end_background()
+        description = (
+            f"目录：{plan.root}\n"
+            f"可清理 {len(plan.entries)} 个恢复点，备份文件占用 {format_storage_size(plan.size)}。\n"
+            f"保留 {len(plan.preserved)} 项：含工作区 stash、被移走的忽略文件或无法安全清理的目录。\n"
+            "清理包括对应的应用恢复引用，之后无法再使用这些历史恢复点。\n"
+            "统计仅包含备份文件，不包含 Git 对象空间。"
+        )
+        if not plan.entries:
+            description = f"目录：{plan.root}\n没有可清理的恢复文件。"
+            if plan.preserved:
+                description += f"\n已保留 {len(plan.preserved)} 项：\n" + "\n".join(
+                    f"{name}：{reason}" for name, reason in plan.preserved)
+        dialog = Gtk.MessageDialog(
+            transient_for=self, modal=True,
+            message_type=Gtk.MessageType.WARNING if plan.entries else Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.NONE,
+            text="清空历史恢复文件？" if plan.entries else "没有可清理的恢复文件",
+        )
+        dialog.format_secondary_text(description)
+        dialog.add_button("取消" if plan.entries else "关闭", Gtk.ResponseType.CANCEL)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        if plan.entries:
+            button = dialog.add_button("清空恢复文件", Gtk.ResponseType.OK)
+            button.get_style_context().add_class("destructive-action")
+        response = dialog.run()
+        dialog.destroy()
+        if repository is not self.repository or generation != self.branch_generation:
+            return False
+        if response == Gtk.ResponseType.OK and plan.entries:
+            next_generation = self.branch_generation + 1
+            self.run_background(
+                "正在清理恢复文件…", lambda: repository.clear_recovery_files(plan), "",
+                result_callback=lambda message: self._background_recovery_cleanup_complete(
+                    repository, next_generation, message),
+                error_callback=lambda message: self._background_recovery_cleanup_failed(
+                    repository, next_generation, message),
+            )
+        else:
+            self._background_recovery_cleanup_complete(repository, generation, "已取消恢复文件清理。" if plan.entries else "没有可清理的恢复文件。")
+        return False
+
+    def _background_recovery_cleanup_complete(
+        self, repository: GitRepository, generation: int, message: str,
+    ) -> bool:
+        if repository is not self.repository or generation != self.branch_generation:
+            return False
+        self._end_background()
+        self.refresh(update_remote=False)
+        self._set_remote_status(RemoteSyncStatus("unavailable", "恢复文件检查或清理已结束；点击“刷新”重新检查远程状态。"))
+        self.status_label.set_text(message.splitlines()[0])
+        self.status_label.set_tooltip_text(message)
+        if message.startswith("恢复文件清理结果"):
+            dialog = Gtk.MessageDialog(
+                transient_for=self, modal=True,
+                message_type=Gtk.MessageType.INFO if "失败 0 个" in message else Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.CLOSE, text="恢复文件清理结果",
+            )
+            dialog.format_secondary_text(message)
+            dialog.run()
+            dialog.destroy()
+        return False
+
+    def _background_recovery_cleanup_failed(
+        self, repository: GitRepository, generation: int, message: str,
+    ) -> bool:
+        if repository is not self.repository or generation != self.branch_generation:
+            return False
+        self._background_recovery_cleanup_complete(repository, generation, "恢复文件操作未完成。")
+        self.show_error(message)
+        return False
+
     def on_view_changelog(self, _button) -> None:
         if not self.repository:
             return
@@ -6128,7 +6445,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def run_background(
         self, busy: str, operation, success: str, reload_workspace: bool = False,
         show_result: bool = False, remote_sync: bool = False,
-        merge_preview: bool = False, result_callback=None,
+        merge_preview: bool = False, result_callback=None, error_callback=None,
     ) -> None:
         if self.busy:
             return
@@ -6142,6 +6459,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.merge_bar.set_sensitive(False)
         self.notebook.set_sensitive(False)
         self.info_action_button.set_sensitive(False)
+        self.clear_recovery_button.set_sensitive(False)
         self.status_label.set_text(busy)
         started = time.monotonic()
 
@@ -6167,7 +6485,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 else:
                     GLib.idle_add(self._background_complete, message, reload_workspace)
             except Exception as error:  # GTK must receive subprocess errors on the main thread.
-                if remote_sync:
+                if error_callback is not None:
+                    GLib.idle_add(error_callback, str(error))
+                elif remote_sync:
                     GLib.idle_add(self._background_failed, str(error), True)
                 else:
                     GLib.idle_add(self._background_failed, str(error))
@@ -6248,6 +6568,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.merge_bar.set_sensitive(True)
         self.notebook.set_sensitive(True)
         self.info_action_button.set_sensitive(True)
+        self._refresh_recovery_cleanup_button()
 
     def show_error(self, message: str) -> None:
         dialog = Gtk.MessageDialog(

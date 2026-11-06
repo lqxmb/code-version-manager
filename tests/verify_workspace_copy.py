@@ -93,6 +93,35 @@ def verify_tip_withdrawal(repo, root, remote):
             'source_files_preserved': True, 'explicit_branch_upload': 'passed'}
 
 
+def verify_recovery_cleanup(repo, remote):
+    """Remove copied recovery files and verify everything outside that scope."""
+    plan = repo.plan_recovery_cleanup()
+    files = fingerprint(repo.path, ('.git',))
+    metadata = fingerprint(repo.metadata_path, ('recovery',))
+    index = repo._git_path('index').read_bytes()
+    config = repo._git_path('config').read_bytes()
+    refs_before = dict(line.split() for line in git(repo.path, 'for-each-ref',
+                       '--format=%(refname) %(objectname)').splitlines())
+    removed_refs = {ref for entry in plan.entries for ref, _oid in entry.refs}
+    expected_refs = {ref: oid for ref, oid in refs_before.items() if ref not in removed_refs}
+    preserved = {name: fingerprint(plan.root / name) for name, _reason in plan.preserved}
+    remote_before = managed_refs(remote)
+    with mock.patch.object(repo, '_run_remote', side_effect=AssertionError('cleanup must be local')):
+        result = repo.clear_recovery_files(plan)
+    assert '失败 0 个' in result, result
+    assert all(not (plan.root / entry.name).exists() for entry in plan.entries)
+    assert all(fingerprint(plan.root / name) == signature for name, signature in preserved.items())
+    assert expected_refs == dict(line.split() for line in git(repo.path, 'for-each-ref',
+                                 '--format=%(refname) %(objectname)').splitlines())
+    assert fingerprint(repo.path, ('.git',)) == files
+    assert fingerprint(repo.metadata_path, ('recovery',)) == metadata
+    assert repo._git_path('index').read_bytes() == index
+    assert repo._git_path('config').read_bytes() == config
+    assert managed_refs(remote) == remote_before
+    return {'state': 'passed', 'removed': len(plan.entries), 'preserved': len(plan.preserved),
+            'source_files_index_refs_and_metadata_preserved': True}
+
+
 def verify(workspace):
     source = MODULE.GitRepository(workspace)
     before = fingerprint(source.path)
@@ -208,6 +237,7 @@ def verify(workspace):
         assert git(copy, 'rev-parse', 'cvm-verification-kept-local') == kept_local
         assert not git(copy, 'for-each-ref', 'refs/heads/cvm-verification-kept-remote')
         report['current_branch_push_and_pull_preserve_other_branches'] = 'passed'
+        report['recovery_cleanup'] = verify_recovery_cleanup(repo, remote)
     after = fingerprint(source.path)
     report['source_unchanged'] = after == before
     if after != before:

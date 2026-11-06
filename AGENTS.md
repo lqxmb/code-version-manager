@@ -12,6 +12,7 @@
 | `tests/test_generated_files.py` | 生成文件、旧仓库迁移、文件安全、忽略模板及 CHANGELOG 下载测试 |
 | `tests/test_merge_comparison.py` | 手动合并隔离副本、忽略规则、提交及取消测试 |
 | `tests/test_version_deletion.py` | 末尾版本撤回、暂存保护、固定基线、确认快照、恢复及 GTK 删除回调测试 |
+| `tests/test_recovery_cleanup.py` | 恢复文件清理、stash 保护、文件安全、并发变化、失败报告及 GTK 清理回调测试 |
 | `tests/verify_workspace_copy.py` | 仅在工作区隔离副本和临时远程中验证，不改来源和真实 origin |
 | `README.md` / `INSTALL.md` | 用户说明与 Ubuntu 安装、故障排查 |
 | `README_ai.md`（若存在） | 历史讨论，不作为当前业务规则依据 |
@@ -40,6 +41,7 @@
 | 比较、导出和 CHANGELOG | `materialize()`、`compare()`、`export()`、`changelog_text()`、`download_changelog()` |
 | 手动合并 | `plan_merge()`、`merge_to_main()`、`prepare_merge_comparison()`、`complete_merge()`、`abort_merge()` |
 | 版本删除与提交撤回 | `preview_version_deletion()`、`delete_version()`、`delete_latest_version_commit()`；GTK 的 `on_delete_version()`、`_background_version_deletion_ready()` |
+| 恢复文件清理 | `plan_recovery_cleanup()`、`clear_recovery_files(expected)`；GTK 的 `on_clear_recovery_files()` 及清理结果回调 |
 
 - 用户 settings.ini 中 `[repository] path` 记录上次工作空间，`[recent_workspaces] paths` 保存 JSON 数组；路径会展开、去重并过滤不存在目录。删除最近记录只改列表，不删除工作空间或改写上次启动路径。
 - 对比工具默认 Beyond Compare，通过“设置”保存到仓库本地配置；只接受预设 Beyond Compare、Meld、KDiff3。GitHub 创建入口仅打开网页，默认建议私有仓库，不代用户创建或授权远程。
@@ -89,6 +91,16 @@
 - 撤回开发分支最后一个 beta 时，分支继续存在，保留固定正式基线；导入分支缺缓存时补存原基线，再刷新 VERSION 与 CHANGELOG。不存在 manifest 也能删除；其他版本的 manifest 不清理。
 - GTK 先经 `run_background()` 做预检查，回主线程确认实际分支及回退 OID；执行仍在后台。确认回调和确认结束后都校验仓库实例，取消操作只刷新界面。
 - 删除及撤回只改变本地；之后在该分支选择“同步远程”，才按现有原子推送及精确租约规则回退远程同名分支、删除所属版本标签。日常同步不会传播其他分支的删除。
+
+## 恢复文件清理
+
+- 主窗口底部“版本存储”旁的“清空恢复文件”只清理当前工作空间实际 Git 目录下 `code-version-manager/recovery/` 中的历史恢复点及对应的 `refs/code-version-manager/recovery/<id>/` 引用。使用实际 Git 路径，兼容 linked worktree；不接受用户输入任意清理路径。
+- 后台 `plan_recovery_cleanup()` 返回不可变 `RecoveryCleanupPlan`，包含根路径及目录身份、可清理项快照、备份占用和保留原因。确认框显示目录、数量和备份文件占用；清理后这些历史恢复点无法再用于恢复。空间估算只包含备份文件，不承诺 Git 对象空间立即释放，不运行 gc、prune、reflog expire 或远程命令。
+- 仅处理名称为“时间戳-8 位小写十六进制”的普通恢复点目录；有 `/before/worktree` 引用、仍用于当前同步恢复、或有 `ignored-worktree` 的恢复点保守保留。保护依据来自持久化引用及磁盘，即使重启或已恢复但无法确认也保留。未知名称、符号链接和特殊文件保留并说明原因；仅有引用而无本地备份目录的旧记录不清理。
+- `clear_recovery_files(expected)` 重新检查所选目录、文件元信息及引用 OID；变化后要求重新确认，确认后新增的恢复点留待下次。通过 `O_NOFOLLOW` 和目录文件描述符固定根路径及子目录，拒绝根路径替换，递归删除不跟随链接。
+- 每个恢复点的引用用旧 OID 和 `option no-deref` 事务删除，再删除备份文件；文件删除失败尝试以 create 事务恢复原引用，保留尚存文件并报告残留位置。部分删除不可声称已完整回滚；结果报告成功、保留、失败及未处理数量，失败后停止继续清理。
+- 不更改工作树、index、正常分支、版本标签、版本清单、内部 CHANGELOG 或用户 stash；允许普通未提交修改，存在未完成 Git／手动合并操作时拒绝清理。操作忙碌或无仓库时禁用按钮；无可清理项时说明保留原因。
+- 预检查、执行及错误回调校验仓库实例和 generation；后台线程只进行后端操作，主线程确认和刷新存储。清理后的 UI 刷新不启动远程检查。`run_background()` 的可选 `error_callback` 用于此流程，避免旧错误影响新工作空间。
 
 ## 手动合并
 
@@ -158,7 +170,7 @@
 
 ## 测试、兼容与打包
 
-- `tests/test_backend.py` 覆盖解析、仓库后端、发布、身份配置、远程验证、GTK 回调和文件安全；`tests/test_workflow.py` 使用临时工作仓库与 bare origin 覆盖当前分支同步、显式远程删除、高级整仓覆盖及并发变化；`tests/test_generated_files.py` 覆盖生成文件、旧仓库迁移、分支范围、文件安全和独立忽略模板；`tests/test_merge_comparison.py` 覆盖隔离目录合并；`tests/test_version_deletion.py` 覆盖版本撤回和故障恢复；`tests/verify_workspace_copy.py` 只操作验证副本和临时 origin。
+- `tests/test_backend.py` 覆盖解析、仓库后端、发布、身份配置、远程验证、GTK 回调和文件安全；`tests/test_workflow.py` 使用临时工作仓库与 bare origin 覆盖当前分支同步、显式远程删除、高级整仓覆盖及并发变化；`tests/test_generated_files.py` 覆盖生成文件、旧仓库迁移、分支范围、文件安全和独立忽略模板；`tests/test_merge_comparison.py` 覆盖隔离目录合并；`tests/test_version_deletion.py` 覆盖版本撤回和故障恢复；`tests/test_recovery_cleanup.py` 覆盖恢复清理及受保护备份；`tests/verify_workspace_copy.py` 只操作验证副本和临时 origin，包括清理副本中的恢复目录并核对来源未变。
 - `legacy_test_*` 是历史流程用例，不会被 unittest 自动发现，不作为当前合并规则或验证通过的依据；新增用例应使用 `test_*`。配置相关测试应指向临时 settings.ini，避免依赖实际用户设置。
 - 常规验证运行完整 unittest、源码 `py_compile` 和 `git diff --check`。实仓验证必须先复制 Git 数据与元数据，不得对来源目录或真实 origin 执行覆盖。
 - `VERSION`（项目根目录）是 Debian 软件包版本；`<工作空间>/VERSION` 是被管理仓库的本地生成标签显示号，两者不能混用。`build_deb.sh` 从项目根 VERSION 命名 deb 并复制源码、README、INSTALL、图标、桌面入口、Beyond Compare 默认会话及 `data/workspace.gitignore`。模板安装到 `/usr/lib/code-version-manager/workspace.gitignore`，可在打包前直接修改，不改 Python 源码。
