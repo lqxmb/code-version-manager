@@ -284,6 +284,22 @@ class BranchDeletionPreview:
 
 
 @dataclass(frozen=True)
+class VersionDeletionPlan:
+    version: str
+    branch: str
+    tag_oid: str
+    head_oid: str
+    parent_oid: str = ""
+    base_version: str = ""
+    base_oid: str = ""
+    commit_error: str = ""
+
+    @property
+    def can_delete_commit(self) -> bool:
+        return bool(self.parent_oid and not self.commit_error)
+
+
+@dataclass(frozen=True)
 class BranchMergePlan:
     source: str
     source_tag: str
@@ -3242,35 +3258,147 @@ class GitRepository:
     def switch_main(self) -> None:
         self.switch_branch("main")
 
-    def delete_version(self, version: str) -> None:
+    def preview_version_deletion(self, version: str) -> VersionDeletionPlan:
+        """Check tag ownership and explain whether its tip commit can be removed."""
         self._validate_generated_files()
         version = self._assert_version_editable(version)
-        self.run(["tag", "--delete", version])
+        branch = self.current_branch()
+        if not branch:
+            raise GitError("当前正在查看历史版本，请返回工作分支后重新确认删除。")
+        tag_oid = self.run(["rev-parse", "--verify", f"refs/tags/{version}"]).strip()
+        head = self.run(["rev-parse", "--verify", "HEAD^{commit}"]).strip()
+        plan = VersionDeletionPlan(version, branch, tag_oid, head)
+        try:
+            self._ensure_full_history()
+            self._assert_branch_not_in_other_worktree(branch)
+            if self.run(["ls-files", "--unmerged", "-z"]):
+                raise GitError("暂存区存在尚未解决的冲突，不能删除版本提交。")
+            commit = self.run(["rev-parse", "--verify", f"{tag_oid}^{{commit}}"]).strip()
+            if commit != head:
+                raise GitError(f"所选版本不是 {branch} 的末尾提交；不能删除历史中间提交。")
+            if self.run(["tag", "--points-at", head]).splitlines() != [version]:
+                raise GitError("该提交还有其他标签，不能直接删除。")
+            parents = self.run(["rev-list", "--parents", "-n", "1", head]).split()[1:]
+            if not parents:
+                raise GitError("首个 Git 提交不能用此方式删除。")
+            if len(parents) != 1:
+                raise GitError("该提交有多个父提交，不能用此方式删除。")
+            parent = parents[0]
+            self._validate_generated_files(parent)
+            if branch != "main":
+                base = self.branch_base(branch)
+                base_oid = self.run(["rev-parse", "--verify", f"refs/tags/{base}"]).strip()
+                base_commit = self.run(["rev-parse", "--verify", f"{base_oid}^{{commit}}"]).strip()
+                if not self._contains_commit(base_commit, parent):
+                    raise GitError("回退目标不包含分支的固定正式基线，不能删除该提交。")
+                plan = replace(plan, base_version=base, base_oid=base_oid)
+            return replace(plan, parent_oid=parent)
+        except GitError as error:
+            return replace(plan, commit_error=str(error))
+
+    def delete_version(
+        self, version: str, expected: Optional[VersionDeletionPlan] = None,
+    ) -> None:
+        self._validate_generated_files()
+        version = self._assert_version_editable(version)
+        if expected is not None and self.preview_version_deletion(version) != expected:
+            raise GitError("删除确认后分支或版本标签已变化，请重新确认。")
+        tag_oid = expected.tag_oid if expected is not None else self.run([
+            "rev-parse", "--verify", f"refs/tags/{version}",
+        ]).strip()
+        self.run(["update-ref", "-d", f"refs/tags/{version}", tag_oid])
         self._remove_version_metadata(version)
 
-    def delete_latest_version_commit(self, version: str) -> None:
-        self._validate_generated_files()
-        version = self._assert_version_editable(version)
-        if not parse_version_tag(version) or version not in self.tags():
-            raise GitError(f"版本 {version} 不存在或已经删除。")
-        if self.current_branch() != "main":
-            raise GitError("只能在 main 分支上删除最新版本的 Git 提交。")
-        commit = self.run(["rev-list", "-n", "1", version]).strip()
-        head = self.run(["rev-parse", "HEAD"]).strip()
-        if commit != head:
-            raise GitError("所选版本不是 main 的最新提交。为避免改写后续历史，不能删除该提交。")
-        tags_at_head = self.run(["tag", "--points-at", commit]).splitlines()
-        if tags_at_head != [version]:
-            raise GitError("该提交还有其他标签，不能直接删除。")
-        parent = self.run(["rev-parse", f"{commit}^"], check=False).strip()
-        if not parent:
-            raise GitError("首个 Git 提交不能用此方式删除。")
-        # A soft reset preserves existing staged content, including partial edits.
-        # Without staged changes, keep the removed commit's changes unstaged.
-        staged = self.run(["diff", "--cached", "--name-only", "-z"])
-        self.run(["reset", "--soft" if staged else "--mixed", parent])
-        self.run(["tag", "--delete", version])
-        self._remove_version_metadata(version)
+    def delete_latest_version_commit(
+        self, version: str, expected: Optional[VersionDeletionPlan] = None,
+    ) -> str:
+        plan = self.preview_version_deletion(version)
+        if expected is not None and plan != expected:
+            raise GitError("删除确认后分支、版本标签或正式基线已变化，请重新确认。")
+        if not plan.can_delete_commit:
+            raise GitError(plan.commit_error)
+        before = {f"refs/heads/{plan.branch}": plan.head_oid,
+                  f"refs/tags/{plan.version}": plan.tag_oid}
+        after = {f"refs/heads/{plan.branch}": plan.parent_oid}
+        if plan.base_version:
+            # Verify the dependency in the same transaction without rewriting it.
+            before[f"refs/tags/{plan.base_version}"] = plan.base_oid
+            after[f"refs/tags/{plan.base_version}"] = plan.base_oid
+        index = self._git_path("index")
+        index_lock = index.with_name(index.name + ".lock")
+        try:
+            descriptor = os.open(str(index_lock), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as error:
+            raise GitError(f"无法锁定 Git 暂存区，请检查是否有其他 Git 操作：{error}") from error
+        namespace = self._recovery_namespace("delete-version-commit")
+        backup = None
+        applied = False
+        owns_index_lock = True
+        try:
+            # Holding index.lock prevents Git add/switch from changing the index
+            # between deciding soft/mixed semantics and publishing the result.
+            with os.fdopen(descriptor, "wb") as locked:
+                original_index = index.read_bytes() if index.exists() else None
+                backup = self._save_metadata_recovery(namespace)
+                if original_index is not None:
+                    (backup / "index").write_bytes(original_index)
+                (backup / "version-deletion.json").write_text(json.dumps({
+                    "version": plan.version, "branch": plan.branch,
+                    "tag_oid": plan.tag_oid, "head_oid": plan.head_oid,
+                    "parent_oid": plan.parent_oid, "base_version": plan.base_version,
+                    "index_exists": original_index is not None,
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+                self._save_recovery_refs(namespace, before, "before")
+                if self.preview_version_deletion(plan.version) != plan:
+                    raise GitError("准备恢复点期间分支、标签或基线已变化，请重新确认。")
+                staged = self.run(["diff", "--cached", "--name-only", "-z", plan.head_oid])
+                if not staged:
+                    # Prepare a replacement index independently; never check out
+                    # files or run reset after the checked ref transaction.
+                    with tempfile.TemporaryDirectory(prefix="delete-version-", dir=self.metadata_path) as temporary:
+                        next_index = Path(temporary) / "index"
+                        environment = dict(os.environ, GIT_INDEX_FILE=str(next_index))
+                        self.run(["read-tree", "--reset", plan.parent_oid], env=environment)
+                        locked.write(next_index.read_bytes())
+                    locked.flush()
+                    os.fsync(locked.fileno())
+                    os.fchmod(locked.fileno(), stat.S_IMODE(index.stat().st_mode) if index.exists() else 0o644)
+            self._replace_managed_refs(before, after)
+            applied = True
+            if not staged:
+                os.replace(index_lock, index)
+                owns_index_lock = False
+        except (GitError, OSError) as error:
+            rollback_error = ""
+            if applied:
+                try:
+                    self._replace_managed_refs(after, before)
+                except GitError as failure:
+                    rollback_error = f"\n引用回滚未完成（可能有并发修改），请按恢复点核对：{failure}"
+            location = f"\n引用恢复点：{namespace}/before；恢复资料：{backup}。" if backup else ""
+            raise GitError(f"删除版本及提交未完成：{error}{rollback_error}{location}") from error
+        finally:
+            if owns_index_lock:
+                index_lock.unlink(missing_ok=True)
+        try:
+            if plan.base_version:
+                # Imported branches may not have a cache. Keep the original base
+                # even when deleting their last beta, before regenerating files.
+                key = f"branch.{plan.branch}.codeVersionManagerBase"
+                cached = self.run(["config", "--local", "--get", key], check=False).strip()
+                if cached and cached != plan.base_version:
+                    raise GitError("分支基线配置已变化，请检查恢复资料。")
+                if not cached:
+                    self.run(["config", "--local", key, plan.base_version])
+            self._remove_version_metadata(plan.version)
+        except (GitError, OSError) as error:
+            raise GitError(
+                f"版本 {display_version(plan.version)} 及其分支末尾提交已删除，当前文件和原有暂存内容已保留；"
+                f"元数据或生成文件刷新未完成：{error}\n恢复资料：{backup}；引用恢复点：{namespace}/before。"
+                "请修复后重新切换当前分支刷新生成文件，无需重复删除。"
+            ) from error
+        return (f"版本 {display_version(plan.version)} 及其分支末尾提交已删除；{plan.branch} 已退回 {plan.parent_oid[:12]}。"
+                f"当前文件和原有暂存内容已保留。恢复资料：{backup}；引用恢复点：{namespace}/before。")
 
     def _remove_version_metadata(self, version: str) -> None:
         manifest_path = (
@@ -5853,7 +5981,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             )
 
     def on_delete_version(self, _button) -> None:
-        if not self.repository:
+        if not self.repository or self.busy:
             return
         selected = self.selected_history()
         if len(selected) != 1:
@@ -5868,6 +5996,19 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.show_error("所选记录没有唯一的版本标签，无法删除。")
             return
         version = versions[0]
+        repository = self.repository
+        self.run_background(
+            "正在检查版本删除条件…", lambda: repository.preview_version_deletion(version), "",
+            result_callback=lambda plan: self._background_version_deletion_ready(repository, plan),
+        )
+
+    def _background_version_deletion_ready(
+        self, repository: GitRepository, plan: VersionDeletionPlan,
+    ) -> bool:
+        if repository is not self.repository:
+            return False
+        self._end_background()
+        version = plan.version
         label = display_version(version)
 
         dialog = Gtk.MessageDialog(
@@ -5877,33 +6018,45 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             buttons=Gtk.ButtonsType.NONE,
             text=f"确定删除版本 {label}？",
         )
-        dialog.format_secondary_text(
-            "“仅删除版本”保留 Git 提交。\n"
-            "“删除版本及提交”仅适用于 main 的最新版本；"
-            "main 将退回上一提交，当前文件保留为未提交修改。\n"
-            "已有暂存内容会保留；此时被删除提交的改动也会成为暂存中的修改。"
-        )
+        description = f"当前分支：{plan.branch}。\n“仅删除版本”保留 Git 提交。\n"
+        if plan.can_delete_commit:
+            description += (
+                f"“删除版本及提交”将使 {plan.branch} 从 {plan.head_oid[:12]} 退回 {plan.parent_oid[:12]}，"
+                "当前文件保留为未提交修改。\n"
+                "已有暂存内容会保留；此时被删除提交的改动也会成为暂存中的修改。\n"
+                "操作前保存本地恢复点；远程由之后的“同步远程”更新。"
+            )
+        else:
+            description += "无法删除该版本的提交：" + plan.commit_error
+        dialog.format_secondary_text(description)
         dialog.add_button("取消", Gtk.ResponseType.CANCEL)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
         delete_tag_button = dialog.add_button("仅删除版本", DELETE_TAG_RESPONSE)
         delete_tag_button.get_style_context().add_class("destructive-action")
         delete_commit_button = dialog.add_button(
             "删除版本及提交", DELETE_COMMIT_RESPONSE
         )
         delete_commit_button.get_style_context().add_class("destructive-action")
-        delete_commit_button.set_sensitive(self.repository.current_branch() == "main" and VERSION_PATTERN.fullmatch(version) is not None)
+        delete_commit_button.set_sensitive(plan.can_delete_commit)
+        if plan.commit_error:
+            delete_commit_button.set_tooltip_text(plan.commit_error)
         response = dialog.run()
         dialog.destroy()
+        if repository is not self.repository:
+            return False
         if response == DELETE_TAG_RESPONSE:
-            operation = lambda: self.repository.delete_version(version)
+            operation = lambda: repository.delete_version(version, expected=plan)
             busy = "正在删除版本..."
             success = f"版本 {label} 已删除，Git 提交已保留。"
-        elif response == DELETE_COMMIT_RESPONSE:
-            operation = lambda: self.repository.delete_latest_version_commit(version)
+        elif response == DELETE_COMMIT_RESPONSE and plan.can_delete_commit:
+            operation = lambda: repository.delete_latest_version_commit(version, expected=plan)
             busy = "正在删除版本及提交..."
             success = f"版本 {label} 及其 Git 提交已删除，当前文件和原有暂存内容已保留。"
         else:
-            return
+            self.refresh()
+            return False
         self.run_background(busy, operation, success)
+        return False
 
     def on_view_changelog(self, _button) -> None:
         if not self.repository:

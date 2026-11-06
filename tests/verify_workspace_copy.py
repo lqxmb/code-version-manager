@@ -25,9 +25,12 @@ def git(path, *args):
     return result.stdout.strip()
 
 
-def fingerprint(root):
+def fingerprint(root, exclude_root=()):
     digest = hashlib.sha256()
     for directory, directories, filenames in os.walk(root, followlinks=False):
+        if Path(directory) == root:
+            directories[:] = [name for name in directories if name not in exclude_root]
+            filenames = [name for name in filenames if name not in exclude_root]
         directories.sort()
         for name in sorted(directories + filenames):
             path = Path(directory) / name
@@ -46,6 +49,48 @@ def managed_refs(path):
     output = git(path, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/', 'refs/tags/')
     return {ref: oid for ref, oid in (line.split() for line in output.splitlines())
             if MODULE.GitRepository._managed_ref(ref)}
+
+
+def verify_tip_withdrawal(repo, root, remote):
+    """Withdraw the copied branch's tip using a second independent checkout."""
+    version = repo.current_version_tag()
+    if not version:
+        return {'state': 'skipped', 'reason': '当前分支没有已发布版本'}
+    plan = repo.preview_version_deletion(version)
+    if not plan.can_delete_commit:
+        return {'state': 'skipped', 'reason': plan.commit_error}
+    path = root / 'tip-withdrawal-workspace'
+    git(root, 'clone', '--no-local', '--no-hardlinks', '--branch', plan.branch,
+        '-q', str(repo.path), str(path))
+    withdrawal = MODULE.GitRepository(path)
+    withdrawal.configure_remote(str(remote), 'Isolated Verification', 'verification@example.invalid')
+    # A normal clone checks out one branch; recreate the other copied local
+    # heads so the baseline dependency and complete preservation can be checked.
+    before_refs = repo._local_refs()
+    for ref, oid in before_refs.items():
+        git(path, 'update-ref', ref, oid)
+    assert withdrawal._sync_target() == str(remote)
+    assert withdrawal._local_refs() == before_refs
+    withdrawal.refresh_workspace_generated_files()
+    before_files = fingerprint(path, ('.git', *MODULE.WORKSPACE_GENERATED_FILES))
+    before_remote = managed_refs(remote)
+    checked = withdrawal.preview_version_deletion(version)
+    withdrawal.delete_latest_version_commit(version, expected=checked)
+    desired = dict(before_refs)
+    desired[f'refs/heads/{plan.branch}'] = checked.parent_oid
+    del desired[f'refs/tags/{version}']
+    assert withdrawal._local_refs() == desired
+    assert fingerprint(path, ('.git', *MODULE.WORKSPACE_GENERATED_FILES)) == before_files
+    assert managed_refs(remote) == before_remote
+    withdrawal.sync_remote()
+    assert managed_refs(remote) == desired
+    assert (withdrawal.metadata_path / 'recovery').is_dir()
+    # The other verification scenarios continue from the original copied refs.
+    repo.sync_remote(scope='all')
+    assert managed_refs(remote) == before_remote
+    return {'state': 'passed', 'branch': plan.branch, 'version': MODULE.display_version(version),
+            'before': checked.head_oid, 'after': checked.parent_oid,
+            'source_files_preserved': True, 'explicit_branch_upload': 'passed'}
 
 
 def verify(workspace):
@@ -119,6 +164,7 @@ def verify(workspace):
         repo.sync_remote(scope="all")
         assert managed_refs(remote) == original_refs
         report['initial_whole_push'] = 'passed'
+        report['tip_version_withdrawal'] = verify_tip_withdrawal(repo, root, remote)
         main = original_refs['refs/heads/main']
         git(remote, 'update-ref', 'refs/heads/cvm-verification-remote-only', main)
         git(remote, 'update-ref', 'refs/tags/cvm-verification-note', main)

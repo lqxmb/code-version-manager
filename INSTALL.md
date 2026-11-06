@@ -56,6 +56,16 @@ python3 src/code_version_manager.py
 
 旧标签仍可查看。多套 beta 基线、与 main 无共同历史或浅克隆会阻止继续发布/合并，应先检查、选准本整仓同步，或从 main 正式版本创建新分支，不要手动强制移动旧标签。
 
+### 删除版本与撤回末尾提交
+
+版本历史的删除确认框提供两种操作：“仅删除版本”保留 Git 提交；“删除版本及提交”允许撤回 main 的正式版或当前开发分支自己的 beta，所选标签必须指向当前 HEAD。确认框显示当前分支和回退提交，按钮禁用时说明具体原因。
+
+撤回保留当前源文件和未跟踪文件。有暂存修改时完整保留原 index；无暂存修改时把 index 更新到父提交，原提交的内容保留为未暂存修改或未跟踪文件。删除最后一个 beta 不删除分支，固定正式基线继续保留，VERSION 与 CHANGELOG 自动刷新。远程导入版本没有本地 manifest 也能撤回。
+
+历史中间版本、首个或多父提交、同提交多个标签、浅克隆、未解决冲突、未完成操作及其他 worktree 占用不能撤回。继承或其他分支版本只读，共享正式版本仍受保护。确认后分支、标签或基线变化时，需要重新确认。
+
+操作前备份引用、配置、版本清单、内部 CHANGELOG 和原始 index。index 安装失败时尝试按旧 OID 回滚引用；若提示版本及提交已删除但刷新失败，修复文件问题后重新切换当前分支刷新，无需重复删除。删除仅影响本地；远程须在该分支通过“同步远程”确认回退及标签删除。
+
 ## 4. 配置 SSH 与分支同步
 
 “设置”可以保存应用级 GitHub 账号（用户名或组织名）、默认提交姓名和默认提交邮箱，之后新启用版本管理的工作空间会继承这些值。打开已有仓库的“Git 账号”时，非空默认姓名和邮箱会分别预填；只有保存该窗口时才写入仓库，单独保存“设置”不会改变已有仓库。留空的姓名或邮箱沿用当前有效 Git 配置，再缺失时使用本机默认身份。
@@ -122,7 +132,7 @@ sudo apt install ./dist/code-version-manager_$(cat VERSION)_all.deb
 
 ### 恢复点在哪里
 
-实际 Git 目录的 code-version-manager/recovery 保存配置、清单、CHANGELOG 和忽略文件备份；refs/code-version-manager/recovery 保存旧 Git 引用及工作区 stash。恢复暂存内容使用 stash apply --index。恢复冲突时保留恢复点，不要直接清理 Git 私有目录。
+实际 Git 目录的 code-version-manager/recovery 保存配置、清单、CHANGELOG 和忽略文件备份；refs/code-version-manager/recovery 保存旧 Git 引用及工作区 stash。末尾版本撤回使用 delete-version-commit 恢复点，额外保存原始 index 及 version-deletion.json，记录原 index 是否存在。恢复同步前暂存内容使用 stash apply --index。恢复冲突时保留恢复点，不要直接清理 Git 私有目录。
 
 本地 manifest 不上传。远程版本没有清单时按完整 Git 快照导出；整仓同步上传完整提交历史，不只是所选封装文件或 ZIP。
 
@@ -134,7 +144,7 @@ python3 -m py_compile src/code_version_manager.py
 python3 tests/verify_workspace_copy.py ~/branch_testing
 ```
 
-最后一条命令只在隔离副本及临时 bare 远程中执行覆盖验证，检查来源在验证前后未变化，不操作真实 origin。
+最后一条命令只在隔离副本及临时 bare 远程中执行覆盖验证；当前分支末尾版本满足条件时，额外验证撤回、源文件保留及显式同步远程。它检查来源在验证前后未变化，不操作真实 origin。
 
 ## 6. 卸载
 
