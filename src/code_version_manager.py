@@ -1513,7 +1513,7 @@ class GitRepository:
         self._ensure_full_history()
         branch = self.current_branch()
         if not branch:
-            raise GitError("查看历史版本时不能同步远程，请先返回工作分支。")
+            raise GitError("查看历史版本时不能执行覆盖操作，请先返回工作分支。")
         remote_url = self._sync_target()
         refs = tuple(sorted(self._local_refs().items()))
         if require_versions and not any(ref.startswith("refs/tags/") for ref, _oid in refs):
@@ -2189,7 +2189,7 @@ class GitRepository:
                     self.run(["symbolic-ref", "HEAD", snapshot.branch_ref])
                 except GitError:
                     pass  # Never overwrite concurrent changes to force a rollback.
-                raise GitError(f"同步本地未完成：{error}\n引用恢复点：{namespace}/before\n配置和元数据：{backup}\n工作区恢复点：{stash_ref or '无'}") from error
+                raise GitError(f"远程覆盖本地未完成：{error}\n引用恢复点：{namespace}/before\n配置和元数据：{backup}\n工作区恢复点：{stash_ref or '无'}") from error
         for ref in sorted(set(selected_before) | set(selected_after)):
             if ref.startswith("refs/heads/") and ref not in desired:
                 self.run(["config", "--local", "--remove-section", "branch." + ref[len("refs/heads/"):]], check=False)
@@ -5055,8 +5055,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.remote_summary_label = self._single_line_label()
         self.remote_summary_label.get_style_context().add_class("remote-summary")
         self.main_actions.pack_start(self.remote_summary_label, True, True, 8)
-        self.sync_local_button = self._command_button("同步本地", "go-down-symbolic", self.on_sync_local)
-        self.sync_remote_button = self._command_button("同步远程", "go-up-symbolic", self.on_sync_remote)
+        self.sync_local_button = self._command_button("覆盖本地", "go-down-symbolic", self.on_sync_local)
+        self.sync_remote_button = self._command_button("覆盖远程", "go-up-symbolic", self.on_sync_remote)
         for button in (self.sync_local_button, self.sync_remote_button):
             button.get_style_context().add_class("sync-action")
             button.set_sensitive(False)
@@ -5813,22 +5813,22 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.sync_local_button,
             status.can_sync_local,
             pending,
-            status.message + "\n" + (status.local_message or "以远程为准覆盖当前分支及所属版本标签，包括回退和删除。"),
+            status.message + "\n" + (status.local_message or "以远程为准覆盖本地，仅作用于当前分支及所属版本标签、备注，包括回退和删除；其他分支不受影响。"),
             status.local_message or status.message,
         )
         self.sync_local_button.set_tooltip_text(
-            "以远程为准覆盖当前分支及所属版本标签，包括回退和删除。\n" +
+            "以远程为准覆盖本地，仅作用于当前分支及所属版本标签、备注，包括回退和删除；其他分支不受影响。\n" +
             (status.local_message or status.message)
         )
         self._set_sync_button(
             self.sync_remote_button,
             status.can_sync_remote,
             pending,
-            status.message + "\n" + (status.remote_message or "以本地为准覆盖当前分支及所属版本标签，包括回退和删除。"),
+            status.message + "\n" + (status.remote_message or "以本地为准覆盖远程，仅作用于当前分支及所属版本标签、备注，包括回退和删除；其他分支不受影响。"),
             status.remote_message or status.message,
         )
         self.sync_remote_button.set_tooltip_text(
-            "以本地为准覆盖当前分支及所属版本标签，包括回退和删除。\n" +
+            "以本地为准覆盖远程，仅作用于当前分支及所属版本标签、备注，包括回退和删除；其他分支不受影响。\n" +
             (status.remote_message or status.message)
         )
 
@@ -6599,7 +6599,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 "本地独有提交和标签会保存在恢复点；未提交修改和未跟踪文件会先保存，"
                 "完成后可恢复。会把可能被远程目标覆盖的被忽略文件移到恢复点。共享正式标签也将被统一，非版本标签不参与同步。"
             )
-            action = "以远程为准，更新本地"
+            action = "覆盖本地"
             differences = status.local_changes
         else:
             title = "确认以本地覆盖远程" + label + "？"
@@ -6608,7 +6608,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 "远程旧引用会先下载并保存在本机恢复点；远程协作者可能需要重新同步。"
                 "共享正式标签也将被统一。非版本标签不参与整仓同步。"
             )
-            action = "以本地为准，覆盖远程"
+            action = "覆盖远程"
             differences = status.remote_changes
         if scoped:
             description = (
@@ -6717,12 +6717,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             return
         if direction == "local":
             operation = lambda: repository.sync_local_from_remote(snapshot, status)
-            busy = "正在以远程状态更新本地..."
+            busy = "正在以远程覆盖本地..."
         else:
             operation = lambda: repository.sync_remote_from_local(snapshot, status)
-            busy = "正在以本地状态覆盖远程..."
+            busy = "正在以本地覆盖远程..."
         self.remote_sync_error = None
-        self.run_background(busy, operation, "当前分支和所属版本标签已同步。", remote_sync=True)
+        self.run_background(busy, operation, "当前分支及所属版本标签、备注已按所选方向覆盖。", remote_sync=True)
 
     def on_sync_local(self, _button) -> None:
         self._sync_direction("local")
@@ -6837,7 +6837,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             lambda: repository.save_version(
                 version, message, selected, selected_scopes=selected_entries,
             ),
-            f"版本 {version} 已发布到本地。需要上传时请单独点击“同步远程”。",
+            f"版本 {version} 已发布到本地。需要上传时请单独点击“覆盖远程”。",
         )
 
     def on_enable_versioning(self) -> None:
@@ -7124,7 +7124,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 f"“删除版本及提交”将使 {plan.branch} 从 {plan.head_oid[:12]} 退回 {plan.parent_oid[:12]}，"
                 "当前文件保留为未提交修改。\n"
                 "已有暂存内容会保留；此时被删除提交的改动也会成为暂存中的修改。\n"
-                "操作前保存本地恢复点；远程由之后的“同步远程”更新。"
+                "操作前保存本地恢复点；远程由之后的“覆盖远程”更新。"
             )
         else:
             description += "无法删除该版本的提交：" + plan.commit_error
@@ -7359,7 +7359,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
     def _remark_operation_complete(self, repository: GitRepository) -> bool:
         if repository is not self.repository:
             return False
-        return self._background_complete("版本备注已保存到本地，可通过“同步远程”上传。")
+        return self._background_complete("版本备注已保存到本地，可通过“覆盖远程”上传。")
 
     def _remark_operation_failed(self, repository: GitRepository, error: str) -> bool:
         if repository is not self.repository:
@@ -7386,7 +7386,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         content.pack_start(scroll, True, True, 0)
         content.pack_start(Gtk.Label(
             label="此版本备注只读，请切换到所属分支后编辑。" if read_only else
-                  "可留空；保存后点击“同步远程”上传备注。", xalign=0,
+                  "可留空；保存后点击“覆盖远程”上传备注。", xalign=0,
         ), False, False, 0)
         dialog.get_content_area().add(content)
         dialog.show_all()
