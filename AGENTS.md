@@ -14,6 +14,7 @@
 | `tests/test_version_deletion.py` | 末尾版本撤回、暂存保护、固定基线、确认快照、恢复及 GTK 删除回调测试 |
 | `tests/test_recovery_cleanup.py` | 恢复文件清理、stash 保护、文件安全、并发变化、失败报告及 GTK 清理回调测试 |
 | `tests/test_ui_layout.py` | 工具栏顺序、最近两项选择、动态比较、独立日志、窗口尺寸记忆及忙碌状态回归 |
+| `tests/test_version_remarks.py` | 独立版本备注、编辑快照、定向同步、分支隔离、删除恢复及 GTK 备注入口 |
 | `tests/verify_workspace_copy.py` | 仅在工作区隔离副本和临时远程中验证，不改来源和真实 origin |
 | `README.md` / `INSTALL.md` | 用户说明与 Ubuntu 安装、故障排查 |
 | `README_ai.md`（若存在） | 历史讨论，不作为当前业务规则依据 |
@@ -45,6 +46,7 @@
 | 版本删除与提交撤回 | `preview_version_deletion()`、`delete_version()`、`delete_latest_version_commit()`；GTK 的 `on_delete_version()`、`_background_version_deletion_ready()` |
 | 恢复文件清理 | `plan_recovery_cleanup()`、`clear_recovery_files(expected)`；GTK 的 `on_clear_recovery_files()` 及清理结果回调 |
 | 主窗口布局与版本选择 | `_build_header()`、`_build_content()`、`on_history_selection_changed()`、`_update_history_actions()`、`on_compare_selected()` |
+| 版本备注 | `version_remark()`、`preview_version_remark()`、`update_version_remark()`；GTK 的 `prompt_version_remark()` 及备注后台回调 |
 | 主窗口尺寸记忆 | `window_settings()`、`save_window_settings()`；GTK 的 `_on_window_configure()`、`_on_window_state()`、`_flush_window_settings()` |
 | 操作状态与独立日志 | `_set_operation_status()`、`on_operation_log()`、`_refresh_operation_log()`、`_operation_log_text()` |
 
@@ -66,6 +68,18 @@
 | 清单、内部 CHANGELOG、恢复资料、手动合并会话 | 实际 Git 目录下 `code-version-manager/` | 使用 `metadata_path` / `_git_path()`，不假定工作空间 `.git` 一定是目录 |
 | 工作空间 `VERSION`、`CHANGELOG.rst` | 工作树根目录，按当前分支重新生成 | 不进入新发布提交或导出；普通界面刷新不隐式写入 |
 | 操作日志 | 主窗口 `operation_logs` 内存，按工作空间路径分组 | 每组最多 200 条；关闭日志窗口保留，退出应用丢弃 |
+| 版本备注 | `refs/notes/code-version-manager/remarks/<完整规范版本标签>`，独立 Git notes 树 | 显式参与所属分支同步；不进入工作树或代码发布提交 |
+
+## 版本备注
+
+- `HistoryEntry.remark` 默认为空；“提交”右侧的“备注”列双击编辑，支持多行自由文字、快捷填入和清空。列表压为单行、悬停显示全文；其他分支或继承版本双击只读查看。
+- main 可编辑全部正式版备注，包括共享正式基线；开发分支仅可编辑自己的 beta。备注校验不复用禁止共享正式标签改写的 `_assert_version_editable()`。
+- `VersionRemarkSnapshot` 固定仓库路径、分支、完整标签及对象 OID、代码提交 OID、备注引用 OID 和原文字；执行重新校验，并用旧 OID 事务更新。通过 HEAD.lock 保护编辑最后阶段的当前分支，不改工作树或 index，允许普通未提交修改。
+- 每版本有独立引用，notes 树将文字关联代码提交。同一提交的多个标签分别记录；标签说明变化不丢备注，指向其他提交时不读取旧备注。写入使用固定的应用身份和时间构造无父 notes 提交，使相同版本、提交及文字得到相同 OID；这些提交不进入任何代码分支。
+- `_managed_ref()` 仅额外接纳上述命名空间内可解析版本的备注；`_owned_ref()` 仍只判断版本标签，备注使用 `_owned_remark_ref()`。其他 notes、恢复引用、stash 不参与同步。日常 scope 仅同步本分支备注，all 同步全部；恢复引用保留 notes 原命名路径。
+- 仅备注变化时同步本地直接使用旧 OID 事务更新引用，不切换、stash 或重新生成文件；同步远程仍使用原子 push 和逐引用精确租约。备注差异有独立比较项，展示两端文字及新增、覆盖或清空，不以 notes 提交判断代码新旧。
+- 导入远程分支同时获取对应版本备注；删除版本、撤回提交、删除本地/远程分支及手动合并清理来源时处理所属备注，引用恢复点包含已删除备注。清空备注删除整个该版本备注引用；清空也参与同步。
+- 旧仓库无引用时视为空，不迁移；不写 CHANGELOG、manifest、ZIP 或根目录生成文件。默认 clone/push 不传 notes，由应用显式 fetch/push，两端需要新版应用。
 
 ## 分支、标签与发布
 
@@ -168,7 +182,7 @@
 - 开发分支要求两端有 main，正式基线标签对象一致且属于分支和 main 历史。远程空仓库必须先同步 main；缺基线或基线冲突提示先处理 main，不隐式上传 main 或替换正式标签。无 beta 时从创建缓存或第一父链唯一正式版本恢复基线，不猜测多标签创建点。
 - 远程缺少当前开发分支时，同步本地会明确确认删除本地该分支及远程不存在的所属 beta，并返回本地 main；main 的内容和正式标签不随这次同步更新，且须可安全切换。
 - 高级“整仓覆盖”保留旧功能：全部受管分支和版本标签以所选来源为准，来源独有项新增，目标独有项删除。必须有有效 main，展示完整覆盖清单，不与日常按钮共用隐含的整仓默认值。
-- 仅管理 `refs/heads/*` 和可解析版本标签；非版本标签、其他 remote、stash、恢复引用均不参与覆盖。禁止 `git push --mirror` 或无范围的引用删除。
+- 仅管理 `refs/heads/*`、可解析版本标签及上述版本备注引用；非版本标签、其他 notes、其他 remote、stash、恢复引用均不参与覆盖。禁止 `git push --mirror` 或无范围的引用删除。
 - origin 用非交互 SSH。连接/权限检查 120 秒，传输默认 900 秒，可在仓库本地配置为 60–3600 秒。推送使用 `--atomic`、逐引用精确 `--force-with-lease`，refspec 不得带 `+`；不支持原子更新的服务端直接报错，不退回逐项修改。
 - 本地引用通过带旧 OID 的 `update-ref --stdin` 事务更新。下载当前分支时，其他本地分支及 tracking、基线缓存和 manifest 保持原值；返回 main 时仅验证其 OID，不将远程 main 写入。
 - 同步本地先记录忽略文件冲突，再 stash 暂存、未暂存和未跟踪文件；可能被覆盖的忽略文件移至恢复目录。恢复使用 `stash apply --index`，冲突不删除恢复点。只检查本次会更新或检出的分支是否被其他 worktree 占用。

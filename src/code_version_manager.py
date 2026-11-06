@@ -56,6 +56,7 @@ PRERELEASE_PATTERN = re.compile(
 METADATA_DIRECTORY = "code-version-manager"
 MANIFEST_DIRECTORY = "versions"
 MANIFEST_SUFFIX = ".manifest"
+REMARK_REF_PREFIX = "refs/notes/code-version-manager/remarks/"
 MANAGER_CHANGELOG = "CHANGELOG.rst"
 WORKSPACE_CHANGELOG = "CHANGELOG.rst"
 WORKSPACE_VERSION = "VERSION"
@@ -149,6 +150,14 @@ def canonical_version(value: str, branch: Optional[str] = None) -> str:
     if len(parts) == 2 and parts[0] and PRERELEASE_PATTERN.fullmatch(parts[1]):
         return version_tag_name(*parts)
     return value
+
+
+def remark_version(ref: str) -> Optional[str]:
+    if ref.startswith(REMARK_REF_PREFIX):
+        version = ref[len(REMARK_REF_PREFIX):]
+        if parse_version_tag(version):
+            return version
+    return None
 
 
 def version_sort_key(name: str):
@@ -295,10 +304,22 @@ class VersionDeletionPlan:
     base_version: str = ""
     base_oid: str = ""
     commit_error: str = ""
+    remark_oid: Optional[str] = None
 
     @property
     def can_delete_commit(self) -> bool:
         return bool(self.parent_oid and not self.commit_error)
+
+
+@dataclass(frozen=True)
+class VersionRemarkSnapshot:
+    repository: Path
+    version: str
+    branch: str
+    tag_oid: str
+    commit_oid: str
+    remark_oid: Optional[str]
+    text: str
 
 
 @dataclass(frozen=True)
@@ -369,6 +390,9 @@ class RefComparison:
     @property
     def name(self) -> str:
         ref = self.difference.ref
+        version = remark_version(ref)
+        if version is not None:
+            return "版本备注 " + display_version(version)
         if ref.startswith("refs/heads/"):
             return "分支 " + ref[len("refs/heads/"):]
         return "版本 " + display_version(ref[len("refs/tags/"):])
@@ -378,6 +402,7 @@ class RefComparison:
         return {
             "same": "两边指向同一提交",
             "tag_changed": "代码提交相同，标签信息不同",
+            "remark_changed": "版本备注不同",
             "local_ahead": f"本地较新，领先远程 {self.local_count} 个提交",
             "remote_ahead": f"远程较新，领先本地 {self.remote_count} 个提交",
             "diverged": (
@@ -396,6 +421,11 @@ class RefComparison:
         target_oid = self.difference.local_oid if direction == "local" else self.difference.remote_oid
         if source_oid == target_oid:
             return "保持一致，无需修改"
+        if remark_version(self.difference.ref) is not None:
+            source = self.remote if direction == "local" else self.local
+            if source is None or not source.version_note:
+                return f"将清空{target}的此版本备注"
+            return f"将{'新增' if not target_oid else '覆盖'}{target}的此版本备注"
         if not source_oid:
             if self.difference.ref.startswith("refs/heads/"):
                 return f"将删除{target}的此分支"
@@ -677,6 +707,7 @@ class HistoryEntry:
     subject: str
     tags: Sequence[str]
     read_only: bool = False
+    remark: str = ""
 
     @property
     def reference(self) -> str:
@@ -1128,7 +1159,7 @@ class GitRepository:
     def _managed_ref(ref: str) -> bool:
         return ref.startswith("refs/heads/") or (
             ref.startswith("refs/tags/") and parse_version_tag(ref) is not None
-        )
+        ) or remark_version(ref) is not None
 
     @staticmethod
     def _owned_ref(ref: str, branch: str) -> bool:
@@ -1138,6 +1169,11 @@ class GitRepository:
         )
 
     @classmethod
+    def _owned_remark_ref(cls, ref: str, branch: str) -> bool:
+        version = remark_version(ref)
+        return version is not None and cls._owned_ref("refs/tags/" + version, branch)
+
+    @classmethod
     def _sync_refs(cls, snapshot: RemoteSyncSnapshot, refs: Dict[str, str]) -> Dict[str, str]:
         if snapshot.scope == "all":
             return dict(refs)
@@ -1145,13 +1181,14 @@ class GitRepository:
             raise GitError("未知同步范围，请重新检查同步状态。")
         branch = snapshot.branch_ref[len("refs/heads/"):]
         return {ref: oid for ref, oid in refs.items()
-                if ref == snapshot.branch_ref or cls._owned_ref(ref, branch)}
+                if ref == snapshot.branch_ref or cls._owned_ref(ref, branch)
+                or cls._owned_remark_ref(ref, branch)}
 
     @staticmethod
     def _sync_scope_label(snapshot: RemoteSyncSnapshot) -> str:
         if snapshot.scope == "all":
-            return "全部分支和版本标签"
-        return "分支 " + snapshot.branch_ref[len("refs/heads/"):] + " 及所属版本标签"
+            return "全部分支、版本标签及备注"
+        return "分支 " + snapshot.branch_ref[len("refs/heads/"):] + " 及所属版本标签和备注"
 
     def _sync_branch_base(self, snapshot: RemoteSyncSnapshot, refs: Dict[str, str]) -> Optional[str]:
         branch = snapshot.branch_ref[len("refs/heads/"):]
@@ -1209,9 +1246,12 @@ class GitRepository:
     def _local_refs(self) -> Dict[str, str]:
         refs = {}
         for line in self.run([
-            "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/", "refs/tags/",
+            "for-each-ref", "--format=%(refname) %(objectname) %(symref)",
+            "refs/heads/", "refs/tags/", REMARK_REF_PREFIX,
         ]).splitlines():
-            ref, oid = line.split()
+            ref, oid, *symref = line.split()
+            if remark_version(ref) is not None and symref:
+                raise GitError("版本备注引用不能是符号引用，请修复后重试。")
             if self._managed_ref(ref):
                 refs[ref] = oid
         return refs
@@ -1313,6 +1353,8 @@ class GitRepository:
                 self._validate_branch_name(ref[len("refs/heads/"):])
                 if commit != oid:
                     raise GitError(f"{side}分支 {ref} 没有直接指向提交，已停止同步。")
+            if remark_version(ref) is not None:
+                self._remark_contents(oid)
             self.run(["rev-list", "--count", commit])
 
     def _assert_sync_worktrees(self, snapshot: RemoteSyncSnapshot, desired: Dict[str, str]) -> str:
@@ -1353,7 +1395,8 @@ class GitRepository:
                 self._validate_sync_source(snapshot, remote, local, "远程")
                 desired = {ref: oid for ref, oid in local.items() if ref not in self._sync_refs(snapshot, local)}
                 desired.update(self._sync_refs(snapshot, remote))
-                self._assert_sync_worktrees(snapshot, desired)
+                if not self._remarks_only(snapshot, local, remote):
+                    self._assert_sync_worktrees(snapshot, desired)
                 local_message = "以远程为准覆盖" + label + "，包括回退和删除范围内的本地独有项。"
             except GitError as error:
                 local_available = False
@@ -1406,7 +1449,9 @@ class GitRepository:
                     comparison_error = f"获取远程提交详情失败：{error}"
 
         commits = {}
-        for object_id in sorted(set(local_refs.values()) | set(remote_refs.values())):
+        code_objects = {oid for refs in (local_refs, remote_refs) for ref, oid in refs.items()
+                        if remark_version(ref) is None}
+        for object_id in sorted(code_objects):
             try:
                 commit_id = self.run(["rev-parse", "--verify", f"{object_id}^{{commit}}"]).strip()
                 details = self.run([
@@ -1477,7 +1522,29 @@ class GitRepository:
                 RefDifference(ref, local_oid, remote_oid), local, remote,
                 relationship, local_count, remote_count,
             ))
+        for ref in sorted(ref for ref in all_refs if remark_version(ref) is not None):
+            local_oid, remote_oid = local_refs.get(ref), remote_refs.get(ref)
+            if local_oid == remote_oid:
+                continue
+            version = remark_version(ref)
+            sides = []
+            try:
+                for oid, side_refs in ((local_oid, local_refs), (remote_oid, remote_refs)):
+                    tag = side_refs.get("refs/tags/" + version)
+                    commit = self.run(["rev-parse", "--verify", f"{tag}^{{commit}}"]).strip() if tag else ""
+                    text = self._remark_contents(oid).get(commit, "") if oid else ""
+                    sides.append(SyncCommit(commit, "", "", version_note=text) if oid else None)
+                comparisons.append(RefComparison(
+                    RefDifference(ref, local_oid, remote_oid), *sides, "remark_changed",
+                ))
+            except GitError as error:
+                comparison_error = f"读取版本备注失败：{error}"
         return tuple(comparisons), comparison_error
+
+    @classmethod
+    def _remarks_only(cls, snapshot: RemoteSyncSnapshot, local: Dict[str, str], remote: Dict[str, str]) -> bool:
+        differences = cls._ref_differences(cls._sync_refs(snapshot, local), cls._sync_refs(snapshot, remote))
+        return bool(differences) and all(remark_version(item.ref) is not None for item in differences)
 
     @staticmethod
     def _ref_differences(
@@ -1530,14 +1597,18 @@ class GitRepository:
         return f"refs/code-version-manager/recovery/{int(time.time())}-{uuid.uuid4().hex[:8]}/{direction}"
 
     def _save_recovery_refs(
-        self, namespace: str, refs: Dict[str, str], prefix: str,
+        self, namespace: str, refs: Dict[str, Optional[str]], prefix: str,
     ) -> List[str]:
         saved = []
         for ref, object_id in sorted(refs.items()):
+            if object_id is None:
+                continue
             if ref.startswith("refs/heads/"):
                 suffix = "heads/" + ref[len("refs/heads/"):]
             elif ref.startswith("refs/tags/"):
                 suffix = "tags/" + ref[len("refs/tags/"):]
+            elif remark_version(ref) is not None:
+                suffix = ref[len("refs/"):]
             else:
                 continue
             recovery_ref = f"{namespace}/{prefix}/{suffix}"
@@ -1841,11 +1912,14 @@ class GitRepository:
         if "main" in heads:
             self.run(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"])
 
-    def _replace_managed_refs(self, before: Dict[str, str], after: Dict[str, str]) -> None:
-        commands = []
+    def _replace_managed_refs(self, before: Dict[str, Optional[str]], after: Dict[str, Optional[str]]) -> None:
+        commands = ["option no-deref"]
+        oid_length = next((len(oid) for refs in (before, after) for oid in refs.values() if oid), 40)
         for ref in sorted(set(before) | set(after)):
             old, new = before.get(ref), after.get(ref)
-            if new is None:
+            if old is None and new is None:
+                commands.append(f"verify {ref} {'0' * oid_length}")
+            elif new is None:
                 commands.append(f"delete {ref} {old}")
             elif old is None:
                 commands.append(f"create {ref} {new}")
@@ -1853,7 +1927,7 @@ class GitRepository:
                 commands.append(f"verify {ref} {old}")
             else:
                 commands.append(f"update {ref} {new} {old}")
-        if commands:
+        if len(commands) > 1:
             self.run(["update-ref", "--stdin"], input="\n".join(commands) + "\n")
 
     def sync_local_from_remote(
@@ -1861,7 +1935,6 @@ class GitRepository:
     ) -> str:
         if not status.can_sync_local:
             raise GitError(status.local_message or "远程覆盖预检查未通过，请刷新。")
-        self._validate_generated_files()
         self._validate_sync_confirmation(snapshot, status)
         before = self._local_refs()
         remote = self._remote_refs(snapshot.remote_url)
@@ -1870,6 +1943,19 @@ class GitRepository:
         selected_after = self._sync_refs(snapshot, remote)
         desired = {ref: oid for ref, oid in before.items() if ref not in selected_before}
         desired.update(selected_after)
+        if self._remarks_only(snapshot, before, remote):
+            namespace = self._recovery_namespace("pull")
+            incoming = {ref: oid for ref, oid in selected_after.items() if remark_version(ref) is not None}
+            self._fetch_remote_refs(snapshot, incoming, namespace + "/incoming")
+            self._save_recovery_refs(namespace, {
+                ref: oid for ref, oid in selected_before.items() if remark_version(ref) is not None
+            }, "before")
+            backup = self._save_metadata_recovery(namespace)
+            self._validate_sync_confirmation(snapshot, status)
+            self._replace_managed_refs(selected_before, selected_after)
+            self._delete_fetched_refs(snapshot, incoming, namespace + "/incoming")
+            return f"本地版本备注已按远程覆盖。引用恢复点：{namespace}/before；恢复资料：{backup}。"
+        self._validate_generated_files()
         current_snapshot = RemoteSyncSnapshot(snapshot.remote_url, snapshot.branch_ref, tuple(sorted(before.items())), snapshot.scope)
         target = self._assert_sync_worktrees(current_snapshot, desired)
         namespace = self._recovery_namespace("pull")
@@ -1958,10 +2044,12 @@ class GitRepository:
     ) -> str:
         if not status.can_sync_remote:
             raise GitError(status.remote_message or "远程覆盖预检查未通过，请刷新状态并检查权限或仓库规则。")
-        self._validate_generated_files()
         self._validate_sync_confirmation(snapshot, status)
         remote = self._remote_refs(snapshot.remote_url)
         local = self._local_refs()
+        remarks_only = self._remarks_only(snapshot, local, remote)
+        if not remarks_only:
+            self._validate_generated_files()
         desired = self._sync_refs(snapshot, local)
         self._validate_sync_source(snapshot, local, remote, "本地")
         namespace = self._recovery_namespace("push")
@@ -1974,8 +2062,11 @@ class GitRepository:
         actual = self._remote_refs(snapshot.remote_url)
         if self._sync_refs(snapshot, actual) != desired:
             raise GitError(f"推送后远程状态又发生变化，请刷新；远程旧引用恢复点：{namespace}/before。")
-        self._refresh_tracking_refs(actual, snapshot=snapshot)
+        if not remarks_only:
+            self._refresh_tracking_refs(actual, snapshot=snapshot)
         self._delete_fetched_refs(snapshot, selected_remote, namespace + "/incoming")
+        if remarks_only:
+            return f"远程版本备注已按本地覆盖。远程旧引用：{namespace}/before；恢复资料：{backup}。"
         self.refresh_workspace_generated_files()
         return f"远程{self._sync_scope_label(snapshot)}已按本地覆盖。远程旧引用：{namespace}/before；本地配置备份：{backup}。"
 
@@ -2143,6 +2234,12 @@ class GitRepository:
                         self.run(["rev-parse", "--verify", f"{tag_oid}^{{commit}}"]).strip(), oid,
                     )
                 }
+                remarks = {ref: note_oid for ref, note_oid in remote_refs.items()
+                           if self._owned_remark_ref(ref, name)
+                           and "refs/tags/" + remark_version(ref) in baselines}
+                self._ensure_objects(remote_url, remarks)
+                for note_oid in remarks.values():
+                    self._remark_contents(note_oid)
                 local_refs = self._local_refs()
                 for ref, tag_oid in baselines.items():
                     if ref in local_refs and local_refs[ref] != tag_oid:
@@ -2151,7 +2248,7 @@ class GitRepository:
                 if self._sync_target() != remote_url or self._remote_refs(remote_url) != remote_refs:
                     raise GitError("远程分支或正式标签在读取期间发生变化，请刷新后重试。")
                 self._assert_clean(oid)
-                for ref, tag_oid in baselines.items():
+                for ref, tag_oid in {**baselines, **remarks}.items():
                     if ref not in local_refs:
                         self.run(["update-ref", ref, tag_oid, "0" * len(tag_oid)])
                 self._switch_generated(["switch", "--no-overwrite-ignore", "--no-track", "-c", name, oid], oid)
@@ -2307,7 +2404,8 @@ class GitRepository:
         deleted = {}
         if delete_source:
             deleted = {ref: oid for ref, oid in before_refs.items()
-                       if ref == f"refs/heads/{record['source']}" or self._owned_ref(ref, record["source"])}
+                       if ref == f"refs/heads/{record['source']}" or self._owned_ref(ref, record["source"])
+                       or self._owned_remark_ref(ref, record["source"])}
             desired = {ref: oid for ref, oid in desired.items() if ref not in deleted}
         original_branch = record["original_branch"]
         before_files, written = {}, {}
@@ -2802,7 +2900,8 @@ class GitRepository:
         if f"refs/heads/{name}" not in refs:
             raise GitError(f"origin/{name} 已不存在，请刷新分支列表。")
         selected = {ref: oid for ref, oid in refs.items()
-                    if ref == f"refs/heads/{name}" or self._owned_ref(ref, name)}
+                    if ref == f"refs/heads/{name}" or self._owned_ref(ref, name)
+                    or self._owned_remark_ref(ref, name)}
         return RemoteBranchDeletionPlan(remote_url, name, tuple(sorted(selected.items())))
 
     def preview_branch_deletion(self, name: str) -> BranchDeletionPreview:
@@ -2878,7 +2977,8 @@ class GitRepository:
             raise GitError("删除确认后本地引用已变化，请重新查看删除清单。")
         before = dict(plan.local_refs)
         deleted = {ref: oid for ref, oid in before.items()
-                   if ref == f"refs/heads/{name}" or self._owned_ref(ref, name)}
+                   if ref == f"refs/heads/{name}" or self._owned_ref(ref, name)
+                   or self._owned_remark_ref(ref, name)}
         namespace = self._recovery_namespace("delete-branch")
         self._save_recovery_refs(namespace, deleted, "before")
         self._save_metadata_recovery(namespace)
@@ -3028,6 +3128,101 @@ class GitRepository:
             return self.branch_base(branch)
         return None
 
+    def _remark_contents(self, oid: str) -> Dict[str, str]:
+        """Read the dedicated notes tree, including Git's optional fanout folders."""
+        contents = {}
+        for entry in self.run_bytes(["ls-tree", "-r", "-z", oid]).split(b"\0"):
+            if not entry:
+                continue
+            try:
+                header, path = entry.split(b"\t", 1)
+                mode, kind, blob = header.decode("ascii").split()
+                key = path.decode("ascii").replace("/", "")
+                if mode != "100644" or kind != "blob" or not re.fullmatch(r"[0-9a-f]{%d}" % len(oid), key):
+                    raise ValueError("invalid notes tree")
+                text = self.run_bytes(["cat-file", "blob", blob]).decode("utf-8")
+                if "\0" in text or key in contents:
+                    raise ValueError("invalid note")
+                contents[key] = text
+            except (ValueError, UnicodeError) as error:
+                raise GitError("版本备注格式无效，已停止操作。") from error
+        return contents
+
+    def version_remark(self, version: str) -> str:
+        version = canonical_version(version)
+        if not parse_version_tag(version):
+            raise GitError("版本标签无效。")
+        refs = self._local_refs()
+        tag = refs.get("refs/tags/" + version)
+        if not tag:
+            raise GitError(f"版本 {display_version(version)} 不存在。")
+        commit = self.run(["rev-parse", "--verify", f"{tag}^{{commit}}"]).strip()
+        oid = refs.get(REMARK_REF_PREFIX + version)
+        return self._remark_contents(oid).get(commit, "") if oid else ""
+
+    def preview_version_remark(self, version: str) -> VersionRemarkSnapshot:
+        self._assert_no_operation()
+        version = canonical_version(version)
+        if not parse_version_tag(version):
+            raise GitError("版本标签无效。")
+        branch = self.current_branch()
+        if not branch or not self._owned_ref("refs/tags/" + version, branch):
+            raise GitError("此版本的备注只读，请切换到版本所属分支后编辑。")
+        refs = self._local_refs()
+        tag = refs.get("refs/tags/" + version)
+        if not tag:
+            raise GitError(f"版本 {display_version(version)} 不存在。")
+        commit = self.run(["rev-parse", "--verify", f"{tag}^{{commit}}"]).strip()
+        oid = refs.get(REMARK_REF_PREFIX + version)
+        text = self._remark_contents(oid).get(commit, "") if oid else ""
+        return VersionRemarkSnapshot(self.path, version, branch, tag, commit, oid, text)
+
+    def update_version_remark(
+        self, version: str, text: str, *, expected: Optional[VersionRemarkSnapshot] = None,
+    ) -> None:
+        snapshot = self.preview_version_remark(version)
+        if expected is not None and snapshot != expected:
+            raise GitError("分支、版本标签或备注已变化，请重新打开备注编辑框。")
+        text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if "\0" in text:
+            raise GitError("备注不能包含空字符。")
+        new_oid = None
+        if text:
+            # A native notes tree with one entry. Fixed metadata makes equal
+            # text for the same version/commit produce the same reference OID.
+            blob = self.run_bytes(["hash-object", "-w", "--stdin"], input=text.encode("utf-8")).decode().strip()
+            tree = self.run(["mktree"], input=f"100644 blob {blob}\t{snapshot.commit_oid}\n").strip()
+            environment = dict(os.environ, GIT_AUTHOR_NAME="Code Version Manager",
+                               GIT_AUTHOR_EMAIL="code-version-manager@local",
+                               GIT_COMMITTER_NAME="Code Version Manager",
+                               GIT_COMMITTER_EMAIL="code-version-manager@local",
+                               GIT_AUTHOR_DATE="2000-01-01T00:00:00+0000",
+                               GIT_COMMITTER_DATE="2000-01-01T00:00:00+0000")
+            new_oid = self.run(["-c", "commit.gpgsign=false", "commit-tree", tree,
+                                "-m", "Version remark: " + snapshot.version], env=environment).strip()
+        # Serialize branch switches while checking ownership and publishing the
+        # independent note; the real HEAD and index are never rewritten.
+        lock = self._git_path("HEAD.lock")
+        try:
+            descriptor = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except OSError as error:
+            raise GitError(f"无法锁定当前分支，请稍后重试：{error}") from error
+        try:
+            os.close(descriptor)
+            if self.preview_version_remark(snapshot.version) != snapshot:
+                raise GitError("分支、版本标签或备注已变化，请重新打开备注编辑框。")
+            ref = REMARK_REF_PREFIX + snapshot.version
+            commands = ["option no-deref", f"verify refs/tags/{snapshot.version} {snapshot.tag_oid}"]
+            if new_oid is not None:
+                commands.append(f"update {ref} {new_oid} {snapshot.remark_oid or '0' * len(new_oid)}")
+            elif snapshot.remark_oid is not None:
+                commands.append(f"delete {ref} {snapshot.remark_oid}")
+            else:
+                commands.append(f"verify {ref} {'0' * len(snapshot.tag_oid)}")
+            self.run(["update-ref", "--stdin"], input="\n".join(commands) + "\n")
+        finally:
+            lock.unlink()
+
     def _assert_version_editable(self, version: str) -> str:
         self._assert_no_operation()
         version = canonical_version(version)
@@ -3072,6 +3267,7 @@ class GitRepository:
 
     def history(self, limit: int = 500, all_versions: bool = False) -> List[HistoryEntry]:
         entries: List[HistoryEntry] = []
+        refs = self._local_refs()
         for tag in self.version_tags(all_versions=all_versions)[:limit]:
             commit, short_commit, day, subject = self.run([
                 "show", "--no-patch", "--date=short", "--format=%H%x1f%h%x1f%ad%x1f%s", tag.commit,
@@ -3081,7 +3277,9 @@ class GitRepository:
                 subject = changes[0]
             if tag.read_only:
                 subject = ("[继承的正式版本 · 只读] " if tag.owner is None else "[其他分支 · 只读] ") + subject
-            entries.append(HistoryEntry(commit, short_commit, day, subject, (tag.name,), tag.read_only))
+            remark_oid = refs.get(REMARK_REF_PREFIX + tag.name)
+            remark = self._remark_contents(remark_oid).get(commit, "") if remark_oid else ""
+            entries.append(HistoryEntry(commit, short_commit, day, subject, (tag.name,), tag.read_only, remark))
         return entries
 
     def next_version(self) -> str:
@@ -3530,7 +3728,8 @@ class GitRepository:
             raise GitError("当前正在查看历史版本，请返回工作分支后重新确认删除。")
         tag_oid = self.run(["rev-parse", "--verify", f"refs/tags/{version}"]).strip()
         head = self.run(["rev-parse", "--verify", "HEAD^{commit}"]).strip()
-        plan = VersionDeletionPlan(version, branch, tag_oid, head)
+        remark_oid = self._local_refs().get(REMARK_REF_PREFIX + version)
+        plan = VersionDeletionPlan(version, branch, tag_oid, head, remark_oid=remark_oid)
         try:
             self._ensure_full_history()
             self._assert_branch_not_in_other_worktree(branch)
@@ -3569,7 +3768,12 @@ class GitRepository:
         tag_oid = expected.tag_oid if expected is not None else self.run([
             "rev-parse", "--verify", f"refs/tags/{version}",
         ]).strip()
-        self.run(["update-ref", "-d", f"refs/tags/{version}", tag_oid])
+        remark_ref = REMARK_REF_PREFIX + version
+        remark_oid = expected.remark_oid if expected is not None else self._local_refs().get(remark_ref)
+        commands = ["option no-deref", f"delete refs/tags/{version} {tag_oid}"]
+        commands.append(f"delete {remark_ref} {remark_oid}" if remark_oid else
+                        f"verify {remark_ref} {'0' * len(tag_oid)}")
+        self.run(["update-ref", "--stdin"], input="\n".join(commands) + "\n")
         self._remove_version_metadata(version)
 
     def delete_latest_version_commit(
@@ -3583,6 +3787,7 @@ class GitRepository:
         before = {f"refs/heads/{plan.branch}": plan.head_oid,
                   f"refs/tags/{plan.version}": plan.tag_oid}
         after = {f"refs/heads/{plan.branch}": plan.parent_oid}
+        before[REMARK_REF_PREFIX + plan.version] = plan.remark_oid
         if plan.base_version:
             # Verify the dependency in the same transaction without rewriting it.
             before[f"refs/tags/{plan.base_version}"] = plan.base_oid
@@ -3609,6 +3814,7 @@ class GitRepository:
                     "version": plan.version, "branch": plan.branch,
                     "tag_oid": plan.tag_oid, "head_oid": plan.head_oid,
                     "parent_oid": plan.parent_oid, "base_version": plan.base_version,
+                    "remark_oid": plan.remark_oid,
                     "index_exists": original_index is not None,
                 }, ensure_ascii=False, indent=2), encoding="utf-8")
                 self._save_recovery_refs(namespace, before, "before")
@@ -4744,7 +4950,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         root.pack_end(footer, False, False, 0)
 
     def _build_history_view(self) -> Gtk.Widget:
-        self.history_store = Gtk.ListStore(str, str, str, str, str)
+        self.history_store = Gtk.ListStore(str, str, str, str, str, str)
         self.history_tree = Gtk.TreeView(model=self.history_store)
         self.history_tree.set_headers_clickable(True)
         self.history_tree.get_style_context().add_class("data-table")
@@ -4753,6 +4959,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         selection.set_mode(Gtk.SelectionMode.MULTIPLE)
         selection.connect("changed", self.on_history_selection_changed)
         self.history_tree.connect("row-activated", self.on_history_activated)
+        self.history_tree.set_has_tooltip(True)
+        self.history_tree.connect("query-tooltip", self._history_remark_tooltip)
         columns = (
             ("版本", 0, 150),
             ("日期", 1, 110),
@@ -4766,10 +4974,35 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             column.set_min_width(width)
             column.set_resizable(True)
             self.history_tree.append_column(column)
+        renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        self.remark_column = Gtk.TreeViewColumn("备注", renderer, text=5)
+        self.remark_column.set_min_width(180)
+        self.remark_column.set_resizable(True)
+        self.remark_column.set_expand(True)
+        self.history_tree.append_column(self.remark_column)
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         scroll.add(self.history_tree)
         return scroll
+
+    def _history_remark_tooltip(self, tree, x, y, keyboard, tooltip) -> bool:
+        if keyboard:
+            path, column = tree.get_cursor()
+        else:
+            coordinates = tree.convert_widget_to_bin_window_coords(x, y)
+            row = tree.get_path_at_pos(*coordinates)
+            if row is None:
+                return False
+            path, column = row[:2]
+        if path is None or column != self.remark_column:
+            return False
+        index = path.get_indices()[0]
+        if index >= len(self.history_entries):
+            return False
+        entry = self.history_entries[index]
+        tooltip.set_text(entry.remark or ("双击编辑备注" if not entry.read_only else "此版本备注只读"))
+        tree.set_tooltip_cell(tooltip, path, column, None)
+        return True
 
     def _build_changes_view(self) -> Gtk.Widget:
         self.change_store = Gtk.ListStore(str, str)
@@ -5306,7 +5539,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             for entry in self.history_entries:
                 version = ", ".join(display_version(tag) for tag in entry.tags)
                 self.history_store.append(
-                    [version, entry.date, entry.subject, entry.short_commit, entry.commit]
+                    [version, entry.date, entry.subject, entry.short_commit, entry.commit,
+                     " ".join(entry.remark.splitlines())]
                 )
             self.change_store.clear()
             for change in changes:
@@ -6086,6 +6320,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 description += "未提交修改和未跟踪文件会先保存；可能冲突的忽略文件移至恢复目录。"
                 if snapshot.branch_ref not in dict(status.remote_refs):
                     description += "远程已不存在当前分支：将删除本地当前分支，返回本地 main；main 不随此次同步更新。"
+        remarks_only = bool(differences) and all(remark_version(item.ref) is not None for item in differences)
+        if remarks_only:
+            description = "本次只同步版本备注，以所选来源覆盖，包含清空备注；覆盖前保留本机恢复点。"
         dialog = Gtk.Dialog(title=title, transient_for=self, modal=True)
         dialog.add_button("取消", Gtk.ResponseType.CANCEL)
         confirm = dialog.add_button(action, Gtk.ResponseType.OK)
@@ -6108,6 +6345,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         ), False, False, 0)
         content.pack_start(summary, False, False, 0)
         content.pack_start(self._sync_label(
+            "请核对两端备注，选择要保留的内容。" if remarks_only else
             "新旧依据提交的先后关系判断；提交时间和版本号供核对。未提交的工作区修改不参与新旧判断。",
             "sync-note",
         ), False, False, 0)
@@ -6127,12 +6365,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             remote_title = "远程（来源）" if direction == "local" else "远程（将被覆盖）"
             sides.attach(self._sync_label(local_title, "sync-heading"), 0, 0, 1, 1)
             sides.attach(self._sync_label(remote_title, "sync-heading"), 1, 0, 1, 1)
-            sides.attach(self._sync_label(self._sync_commit_text(
-                comparison.local, comparison.difference.local_oid,
-            )), 0, 1, 1, 1)
-            sides.attach(self._sync_label(self._sync_commit_text(
-                comparison.remote, comparison.difference.remote_oid,
-            )), 1, 1, 1, 1)
+            for column, commit, oid in ((0, comparison.local, comparison.difference.local_oid),
+                                        (1, comparison.remote, comparison.difference.remote_oid)):
+                text = ((commit.version_note if commit else "") or "（空）") if (
+                    remark_version(comparison.difference.ref) is not None
+                ) else self._sync_commit_text(commit, oid)
+                sides.attach(self._sync_label(text), column, 1, 1, 1)
             row.pack_start(sides, False, False, 0)
             row.pack_start(self._sync_label(comparison.effect(direction), "sync-effect"), False, False, 0)
             rows.pack_start(row, False, False, 0)
@@ -6769,9 +7007,20 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
     def on_history_activated(self, _tree, path, _column) -> None:
         index = path.get_indices()[0]
-        if not self.repository or index >= len(self.history_entries):
+        if not self.repository or self.busy or index >= len(self.history_entries):
             return
         entry = self.history_entries[index]
+        if _column is self.remark_column:
+            if entry.read_only:
+                self.prompt_version_remark(display_version(entry.reference), entry.remark, read_only=True)
+                return
+            repository = self.repository
+            self.run_background(
+                "正在读取版本备注…", lambda: repository.preview_version_remark(entry.reference), "",
+                result_callback=lambda snapshot: self._background_remark_ready(repository, snapshot),
+                error_callback=lambda error: self._remark_operation_failed(repository, error),
+            )
+            return
         try:
             details = self.repository.commit_details(entry.reference)
         except GitError as error:
@@ -6789,6 +7038,65 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.show_all()
         dialog.run()
         dialog.destroy()
+
+    def _background_remark_ready(self, repository: GitRepository, snapshot: VersionRemarkSnapshot) -> bool:
+        if repository is not self.repository:
+            return False
+        self._end_background()
+        text = self.prompt_version_remark(display_version(snapshot.version), snapshot.text)
+        if repository is not self.repository:
+            return False
+        if text is None or text == snapshot.text:
+            self.refresh()
+            return False
+        self.run_background(
+            "正在保存版本备注…",
+            lambda: repository.update_version_remark(snapshot.version, text, expected=snapshot), "",
+            result_callback=lambda _result: self._remark_operation_complete(repository),
+            error_callback=lambda error: self._remark_operation_failed(repository, error),
+        )
+        return False
+
+    def _remark_operation_complete(self, repository: GitRepository) -> bool:
+        if repository is not self.repository:
+            return False
+        return self._background_complete("版本备注已保存到本地，可通过“同步远程”上传。")
+
+    def _remark_operation_failed(self, repository: GitRepository, error: str) -> bool:
+        if repository is not self.repository:
+            return False
+        return self._background_failed(error)
+
+    def prompt_version_remark(self, version: str, initial: str, read_only: bool = False) -> Optional[str]:
+        dialog = Gtk.Dialog(title=f"{'查看' if read_only else '编辑'}备注 · {version}", transient_for=self, modal=True)
+        dialog.add_button("关闭" if read_only else "取消", Gtk.ResponseType.CANCEL)
+        if not read_only:
+            dialog.add_button("保存", Gtk.ResponseType.OK)
+        dialog.set_default_size(540, 340)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=14)
+        view, scroll = self._build_changes_editor(initial)
+        view.set_editable(not read_only)
+        scroll.set_min_content_height(160)
+        shortcuts = Gtk.Box(spacing=8)
+        for label, text in (("测试中", "测试中"), ("已更新现场", "已更新现场"), ("清空", "")):
+            button = Gtk.Button(label=label)
+            button.connect("clicked", lambda _button, value=text: view.get_buffer().set_text(value))
+            shortcuts.pack_start(button, False, False, 0)
+        if not read_only:
+            content.pack_start(shortcuts, False, False, 0)
+        content.pack_start(scroll, True, True, 0)
+        content.pack_start(Gtk.Label(
+            label="此版本备注只读，请切换到所属分支后编辑。" if read_only else
+                  "可留空；保存后点击“同步远程”上传备注。", xalign=0,
+        ), False, False, 0)
+        dialog.get_content_area().add(content)
+        dialog.show_all()
+        view.grab_focus()
+        response = dialog.run()
+        buffer = view.get_buffer()
+        text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True).strip()
+        dialog.destroy()
+        return text if response == Gtk.ResponseType.OK else None
 
     def run_background(
         self, busy: str, operation, success: str, reload_workspace: bool = False,

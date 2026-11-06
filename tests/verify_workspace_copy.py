@@ -46,7 +46,8 @@ def fingerprint(root, exclude_root=()):
 
 
 def managed_refs(path):
-    output = git(path, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/', 'refs/tags/')
+    output = git(path, 'for-each-ref', '--format=%(refname) %(objectname)',
+                 'refs/heads/', 'refs/tags/', MODULE.REMARK_REF_PREFIX)
     return {ref: oid for ref, oid in (line.split() for line in output.splitlines())
             if MODULE.GitRepository._managed_ref(ref)}
 
@@ -67,6 +68,9 @@ def verify_tip_withdrawal(repo, root, remote):
     # A normal clone checks out one branch; recreate the other copied local
     # heads so the baseline dependency and complete preservation can be checked.
     before_refs = repo._local_refs()
+    notes = [ref for ref in before_refs if MODULE.remark_version(ref) is not None]
+    if notes:
+        git(path, 'fetch', '--no-tags', '--refmap=', str(repo.path), *[f'{ref}:{ref}' for ref in notes])
     for ref, oid in before_refs.items():
         git(path, 'update-ref', ref, oid)
     assert withdrawal._sync_target() == str(remote)
@@ -79,6 +83,7 @@ def verify_tip_withdrawal(repo, root, remote):
     desired = dict(before_refs)
     desired[f'refs/heads/{plan.branch}'] = checked.parent_oid
     del desired[f'refs/tags/{version}']
+    desired.pop(MODULE.REMARK_REF_PREFIX + version, None)
     assert withdrawal._local_refs() == desired
     assert fingerprint(path, ('.git', *MODULE.WORKSPACE_GENERATED_FILES)) == before_files
     assert managed_refs(remote) == before_remote

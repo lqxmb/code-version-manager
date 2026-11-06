@@ -117,6 +117,11 @@ class MergeComparisonTest(unittest.TestCase):
         self.assertFalse(self.repo.merge_state().active)
 
     def test_complete_defaults_to_deleting_source_and_all_beta_tags(self):
+        self.repo.update_version_remark("v0.0.3", "已更新现场")
+        self.repo.switch_branch("branch1")
+        beta = MODULE.canonical_version("branch1/v0.0.3-beta.0.0.1")
+        self.repo.update_version_remark(beta, "测试中")
+        note_oid = self.repo._local_refs()[MODULE.REMARK_REF_PREFIX + beta]
         session, directory, _data = self.begin("branch1")
         (directory / "main" / "shared.txt").write_text("selected\n")
         self.launch(session)
@@ -126,6 +131,10 @@ class MergeComparisonTest(unittest.TestCase):
         self.assertFalse(any("/branches/branch1/" in ref for ref in refs))
         self.assertIn("refs/tags/v0.0.3", refs)
         self.assertIn("refs/tags/v0.0.6", refs)
+        self.assertEqual("已更新现场", self.repo.version_remark("v0.0.3"))
+        recovery = self.repo.run(["for-each-ref", "--format=%(refname) %(objectname)",
+                                  "refs/code-version-manager/recovery/"])
+        self.assertIn("/before/notes/code-version-manager/remarks/" + beta + " " + note_oid, recovery)
         self.assertEqual("selected\n", (self.path / "shared.txt").read_text())
         self.assertEqual("0.0.6\n", (self.path / "VERSION").read_text())
         self.assertNotIn("beta", (self.path / "CHANGELOG.rst").read_text())

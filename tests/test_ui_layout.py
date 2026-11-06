@@ -171,7 +171,7 @@ class WindowLayoutTest(unittest.TestCase):
         self.window.history_entries = self.entries
         for entry in self.entries:
             self.window.history_store.append([
-                entry.tags[0], entry.date, entry.subject, entry.short_commit, entry.commit,
+                entry.tags[0], entry.date, entry.subject, entry.short_commit, entry.commit, entry.remark,
             ])
         self.selection = self.window.history_tree.get_selection()
         self.window._update_history_actions()
