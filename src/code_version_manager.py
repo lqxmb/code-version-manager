@@ -70,6 +70,10 @@ PUSH_TIMEOUT = 900
 MAX_PUSH_TIMEOUT = 3600
 GIT_DEFAULTS_SECTION = "git_defaults"
 GITHUB_ACCOUNT_PLACEHOLDER = "<你的GitHub账号>"
+GIT_PROVIDER_GITHUB = "github"
+GIT_PROVIDER_GITLAB = "gitlab"
+GITLAB_DEFAULT_HOST = "https://gitlab.com"
+GITLAB_NAMESPACE_PLACEHOLDER = "<GitLab用户或组路径>"
 DEFAULT_EXCLUDED_DIRECTORIES = {
     ".git",
     ".cache",
@@ -624,6 +628,135 @@ def github_ssh_example(account: str, repository_name: str) -> str:
     return f"git@github.com:{account}/{repository_name}.git"
 
 
+def validate_git_provider(value: str) -> str:
+    value = value.strip().lower()
+    if value not in (GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB):
+        raise GitError("Git 服务商无效，请选择 GitHub 或 GitLab。")
+    return value
+
+
+def validate_gitlab_host(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return GITLAB_DEFAULT_HOST
+    candidate = value if "://" in value else "https://" + value
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError:
+        raise GitError("GitLab 实例地址无效，请填写 HTTPS 主机地址。") from None
+    hostname = parsed.hostname or ""
+    if (parsed.scheme != "https" or not hostname
+            or not re.fullmatch(r"[A-Za-z0-9.-]+", hostname)
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.path not in ("", "/") or (port is not None and not 1 <= port <= 65535)):
+        raise GitError("GitLab 实例地址只接受 HTTPS 主机地址，不含路径、账号或查询参数。")
+    authority = hostname.lower() + (f":{port}" if port else "")
+    return "https://" + authority
+
+
+def remote_host_and_path(remote_url: str) -> Optional[Tuple[str, str]]:
+    try:
+        remote_url = validate_remote_url(remote_url, allow_https=True)
+        if "://" in remote_url:
+            parsed = urlsplit(remote_url)
+            if parsed.scheme not in ("https", "ssh"):
+                return None
+            host, path = parsed.hostname or "", parsed.path
+        else:
+            match = re.fullmatch(r"[^@/:\s]+@([^:/\s]+):(.+)", remote_url)
+            if not match:
+                return None
+            host, path = match.groups()
+    except (GitError, ValueError):
+        return None
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if (not host or not parts or len(parts) < 2 or any(
+            not part or part in (".", "..") or any(ord(char) < 32 for char in part)
+            for part in parts)):
+        return None
+    return host.lower(), path
+
+
+def infer_git_provider(remote_url: str) -> Optional[str]:
+    coordinates = remote_host_and_path(remote_url)
+    if not coordinates:
+        return None
+    host, _path = coordinates
+    if host == "github.com":
+        return GIT_PROVIDER_GITHUB
+    if host == "gitlab.com":
+        return GIT_PROVIDER_GITLAB
+    return None
+
+
+def provider_for_remote(
+    remote_url: str, gitlab_host: str = GITLAB_DEFAULT_HOST,
+) -> Optional[str]:
+    provider = infer_git_provider(remote_url)
+    if provider is not None:
+        return provider
+    coordinates = remote_host_and_path(remote_url)
+    if not coordinates:
+        return None
+    configured_host = urlsplit(validate_gitlab_host(gitlab_host)).hostname
+    return GIT_PROVIDER_GITLAB if coordinates[0] == configured_host else None
+
+
+def provider_ssh_example(
+    provider: str, repository_name: str, account: str = "", gitlab_host: str = GITLAB_DEFAULT_HOST,
+) -> str:
+    provider = validate_git_provider(provider)
+    if provider == GIT_PROVIDER_GITHUB:
+        return github_ssh_example(account, repository_name)
+    host = urlsplit(validate_gitlab_host(gitlab_host)).hostname
+    return f"git@{host}:{GITLAB_NAMESPACE_PLACEHOLDER}/{repository_name}.git"
+
+
+def provider_suggested_ssh_remote(
+    remote_url: str, provider: str, gitlab_host: str = GITLAB_DEFAULT_HOST,
+) -> str:
+    provider = validate_git_provider(provider)
+    try:
+        return validate_remote_url(remote_url)
+    except (GitError, ValueError):
+        coordinates = remote_host_and_path(remote_url)
+        if not coordinates:
+            return ""
+        host, path = coordinates
+        expected_host = "github.com" if provider == GIT_PROVIDER_GITHUB else urlsplit(
+            validate_gitlab_host(gitlab_host)
+        ).hostname
+        if host != expected_host:
+            return ""
+        if provider == GIT_PROVIDER_GITHUB:
+            github_coordinates = github_repository_coordinates(remote_url)
+            if not github_coordinates:
+                return ""
+        return f"git@{host}:{path}.git"
+
+
+def provider_repository_creation_url(
+    provider: str, remote_url: str, workspace_name: str,
+    gitlab_host: str = GITLAB_DEFAULT_HOST,
+) -> str:
+    provider = validate_git_provider(provider)
+    if provider == GIT_PROVIDER_GITHUB:
+        return github_repository_creation_url(remote_url, workspace_name)
+    host = urlsplit(validate_gitlab_host(gitlab_host)).netloc
+    return f"https://{host}/projects/new"
+
+
+def provider_ssh_key_url(provider: str, gitlab_host: str = GITLAB_DEFAULT_HOST) -> str:
+    provider = validate_git_provider(provider)
+    if provider == GIT_PROVIDER_GITHUB:
+        return "https://github.com/settings/ssh/new"
+    return validate_gitlab_host(gitlab_host) + "/-/user_settings/ssh_keys"
+
+
 def recent_workspaces(config_file: Optional[Path] = None) -> List[Path]:
     config_file = config_file or settings_file_path()
     parser = _read_settings(config_file)
@@ -989,6 +1122,22 @@ class GitRepository:
     def remote_url(self) -> str:
         return self.run(["config", "--get", "remote.origin.url"], check=False).strip()
 
+    def git_provider(self) -> str:
+        configured = self.run(["config", "--get", "codeversionmanager.gitProvider"], check=False).strip()
+        if configured:
+            try:
+                return validate_git_provider(configured)
+            except GitError:
+                pass
+        return provider_for_remote(self.remote_url()) or GIT_PROVIDER_GITHUB
+
+    def gitlab_host(self) -> str:
+        configured = self.run(["config", "--get", "codeversionmanager.gitlabHost"], check=False).strip()
+        try:
+            return validate_gitlab_host(configured)
+        except GitError:
+            return GITLAB_DEFAULT_HOST
+
     def push_timeout_seconds(self) -> int:
         configured = self.run(
             ["config", "--get", "codeversionmanager.pushTimeout"], check=False
@@ -1024,9 +1173,13 @@ class GitRepository:
         email: str,
         push_timeout: Optional[int] = None,
         compare_tool: Optional[str] = None,
+        git_provider: Optional[str] = None,
+        gitlab_host: Optional[str] = None,
     ) -> None:
         remote_url = validate_remote_url(remote_url)
         validate_git_identity(name, email)
+        git_provider = validate_git_provider(git_provider or self.git_provider())
+        gitlab_host = validate_gitlab_host(gitlab_host if gitlab_host is not None else self.gitlab_host())
         if compare_tool is not None:
             compare_tool = validate_compare_tool(compare_tool)
         if push_timeout is not None and (
@@ -1040,6 +1193,8 @@ class GitRepository:
             self.run(["config", "--local", "--unset-all", "remote.origin.pushurl"], check=False)
         self.run(["config", "--local", "user.name", name.strip()])
         self.run(["config", "--local", "user.email", email.strip()])
+        self.run(["config", "--local", "codeversionmanager.gitProvider", git_provider])
+        self.run(["config", "--local", "codeversionmanager.gitlabHost", gitlab_host])
         self.run(["config", "--local", "--unset-all", "codeversionmanager.username"], check=False)
         self.run(["config", "--local", "--unset-all", "codeversionmanager.autoSync"], check=False)
         if push_timeout is not None:
@@ -1102,7 +1257,12 @@ class GitRepository:
             )
             if re.search(r"(?:connection|operation|connect) timed out|connection timeout", message, re.IGNORECASE):
                 raise RemoteTimeoutError("远程连接或传输超时，结果待确认。\n" + message)
-            if github_repository_coordinates(remote_url):
+            try:
+                gitlab_host = self.gitlab_host()
+            except (AttributeError, GitError, TypeError):
+                gitlab_host = GITLAB_DEFAULT_HOST
+            remote_provider = provider_for_remote(remote_url, gitlab_host)
+            if remote_provider == GIT_PROVIDER_GITHUB:
                 if re.search(r"Permission denied \(publickey(?:,[^)]*)?\)", message, re.IGNORECASE):
                     raise GitError(
                         "GitHub 尚未接受本机 SSH 密钥。\n"
@@ -1121,6 +1281,24 @@ class GitRepository:
                     raise GitError(
                         "GitHub 拒绝当前 SSH 账号写入仓库。请检查密钥所属账号的仓库写权限，"
                         "以及分支保护规则和组织授权要求。\n"
+                        "本地提交和版本标签均已保留，无需再次发布。\n\nGit 原始错误：\n" + message
+                    )
+            elif remote_provider == GIT_PROVIDER_GITLAB:
+                ssh_host = remote_host_and_path(remote_url)[0]
+                if re.search(r"Permission denied \(publickey(?:,[^)]*)?\)", message, re.IGNORECASE):
+                    raise GitError(
+                        f"GitLab（{ssh_host}）尚未接受本机 SSH 密钥。请使用“GitLab SSH 公钥设置”"
+                        "添加 .pub 公钥，并检查密钥所属账号的仓库权限。\n"
+                        "不要上传或发送私钥。本地提交和版本标签均已保留。\n\nGit 原始错误：\n" + message
+                    )
+                if "Host key verification failed" in message:
+                    raise GitError(
+                        f"尚未建立可信的 GitLab（{ssh_host}）SSH 主机连接。请核对实例管理员公布的主机指纹；"
+                        "不要关闭主机密钥检查。\n本地提交和版本标签均已保留。\n\nGit 原始错误：\n" + message
+                    )
+                if re.search(r"permission to .+ denied to|not allowed to push|You are not allowed to push", message, re.IGNORECASE):
+                    raise GitError(
+                        f"GitLab（{ssh_host}）拒绝当前账号写入仓库。请检查项目成员权限及分支保护规则。\n"
                         "本地提交和版本标签均已保留，无需再次发布。\n\nGit 原始错误：\n" + message
                     )
             raise GitError(message)
@@ -4458,6 +4636,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.connect("destroy", self._flush_window_settings)
 
         self._build_header()
+        self._install_workspace_drop_target()
         self._build_content()
         self._apply_style()
         self.load_workspace(initial_path)
@@ -4566,6 +4745,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         menu.show_all()
         self.advanced_button.set_popup(menu)
         self.workspace_bar.pack_start(self.advanced_button, False, False, 0)
+
+    def _install_workspace_drop_target(self) -> None:
+        target = Gtk.TargetEntry.new("text/uri-list", Gtk.TargetFlags.OTHER_APP, 0)
+        self.drag_dest_set(Gtk.DestDefaults.ALL, [target], Gdk.DragAction.COPY)
+        self.connect("drag-data-received", self.on_workspace_drop)
 
     @staticmethod
     def _single_line_label() -> Gtk.Label:
@@ -5741,6 +5925,27 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if response == Gtk.ResponseType.OK and filename:
             self.load_workspace(Path(filename))
 
+    def on_workspace_drop(self, _widget, context, _x, _y, selection, _info, timestamp) -> None:
+        accepted = False
+        try:
+            uris = list(selection.get_uris() or []) if selection is not None else []
+            if self.busy:
+                raise GitError("操作进行中，暂时不能切换工作空间。")
+            if len(uris) != 1:
+                raise GitError("一次只能拖入一个工作空间文件夹。")
+            dropped = Gio.File.new_for_uri(uris[0])
+            if dropped.get_uri_scheme() != "file":
+                raise GitError("只支持从本机拖入文件夹。")
+            path = dropped.get_path()
+            if not path or not Path(path).is_dir():
+                raise GitError("拖入的路径不是有效文件夹。")
+            self.load_workspace(Path(path))
+            accepted = True
+        except (GitError, OSError, GLib.Error, TypeError) as error:
+            self.show_error(str(error))
+        finally:
+            Gtk.drag_finish(context, accepted, False, timestamp)
+
     def on_recent_popover_show(self, popover: Gtk.Popover) -> None:
         child = popover.get_child()
         if child:
@@ -5939,10 +6144,12 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=18)
         grid = Gtk.Grid(column_spacing=14, row_spacing=12)
         configured_remote = repository.remote_url() if repository else ""
-        suggested_remote = suggested_ssh_remote(configured_remote)
+        provider = repository.git_provider() if repository else GIT_PROVIDER_GITHUB
+        gitlab_host = repository.gitlab_host() if repository else GITLAB_DEFAULT_HOST
+        suggested_remote = provider_suggested_ssh_remote(configured_remote, provider, gitlab_host)
         configured_account, _configured_name, _configured_email = git_default_settings()
-        remote_placeholder = github_ssh_example(
-            configured_account, workspace_repository_name(self.workspace_path.name),
+        remote_placeholder = provider_ssh_example(
+            provider, workspace_repository_name(self.workspace_path.name), configured_account, gitlab_host,
         )
         default_name, default_email = git_account_identity(repository)
         values = [
@@ -6002,36 +6209,106 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         push_timeout.set_value(configured_timeout / 60)
         push_timeout.set_tooltip_text("仅限制推送传输时长，连接验证仍为 120 秒；超时不删除本地版本")
         advanced_grid = Gtk.Grid(column_spacing=14, row_spacing=8, margin_top=8)
-        advanced_grid.attach(Gtk.Label(label="推送超时（分钟）", xalign=0), 0, 0, 1, 1)
-        advanced_grid.attach(push_timeout, 1, 0, 1, 1)
+        provider_combo = Gtk.ComboBoxText()
+        provider_combo.append(GIT_PROVIDER_GITHUB, "GitHub")
+        provider_combo.append(GIT_PROVIDER_GITLAB, "GitLab")
+        provider_combo.set_active_id(provider)
+        provider_combo.set_hexpand(True)
+        advanced_grid.attach(Gtk.Label(label="Git 服务商", xalign=0), 0, 0, 1, 1)
+        advanced_grid.attach(provider_combo, 1, 0, 1, 1)
+        gitlab_host_entry = Gtk.Entry(text=gitlab_host)
+        gitlab_host_entry.set_placeholder_text("https://gitlab.com")
+        gitlab_host_entry.set_hexpand(True)
+        gitlab_host_label = Gtk.Label(label="GitLab 实例", xalign=0)
+        advanced_grid.attach(gitlab_host_label, 0, 1, 1, 1)
+        advanced_grid.attach(gitlab_host_entry, 1, 1, 1, 1)
+        advanced_grid.attach(Gtk.Label(label="推送超时（分钟）", xalign=0), 0, 2, 1, 1)
+        advanced_grid.attach(push_timeout, 1, 2, 1, 1)
         timeout_notice = Gtk.Label(
             label="推送超时默认 15 分钟，范围 1–60 分钟，仅用于实际上传。连接和推送预检查的时限为 120 秒。",
             xalign=0,
         )
         timeout_notice.set_line_wrap(True)
         timeout_notice.set_max_width_chars(68)
-        advanced_grid.attach(timeout_notice, 0, 1, 2, 1)
-        advanced = Gtk.Expander(label="高级设置：推送超时")
+        advanced_grid.attach(timeout_notice, 0, 3, 2, 1)
+        advanced = Gtk.Expander(label="高级设置：服务商和推送超时")
         advanced.add(advanced_grid)
+        gitlab_host_row = [gitlab_host_label, gitlab_host_entry]
+        def update_provider_controls(*_args) -> None:
+            selected_provider = provider_combo.get_active_id() or GIT_PROVIDER_GITHUB
+            is_gitlab = selected_provider == GIT_PROVIDER_GITLAB
+            for widget in gitlab_host_row:
+                widget.set_visible(is_gitlab)
+            host = gitlab_host_entry.get_text() or GITLAB_DEFAULT_HOST
+            try:
+                placeholder = provider_ssh_example(
+                    selected_provider, workspace_repository_name(self.workspace_path.name),
+                    configured_account, host,
+                )
+                entries[0].set_placeholder_text(placeholder)
+            except GitError:
+                pass
+            try:
+                normalized_gitlab_host = validate_gitlab_host(host)
+            except GitError:
+                normalized_gitlab_host = GITLAB_DEFAULT_HOST
+            try:
+                current_origin_provider = provider_for_remote(configured_remote, host)
+            except GitError:
+                current_origin_provider = infer_git_provider(configured_remote)
+            origin_coordinates = remote_host_and_path(configured_remote)
+            if configured_remote and current_origin_provider and current_origin_provider != selected_provider:
+                origin_label = "GitLab" if current_origin_provider == GIT_PROVIDER_GITLAB else "GitHub"
+                selected_label = "GitLab" if selected_provider == GIT_PROVIDER_GITLAB else "GitHub"
+                text = (
+                    f"当前 origin 可识别为 {origin_label}，所选服务商为 {selected_label}。"
+                    "已保留原地址；如需切换仓库，请手动填写目标仓库 SSH 地址。"
+                )
+            elif (configured_remote and selected_provider == GIT_PROVIDER_GITLAB and origin_coordinates
+                  and origin_coordinates[0] != urlsplit(normalized_gitlab_host).hostname):
+                text = "当前 origin 主机与所选 GitLab 实例不同。已保留原地址；如需切换仓库，请手动填写目标 SSH 地址。"
+            elif suggested_remote and suggested_remote != configured_remote.strip():
+                text = "已根据当前 origin 转换为 SSH 地址；保存后生效。"
+            elif configured_remote:
+                text = "已读取当前工作空间的 origin 地址；切换服务商不会自动改写它。"
+            elif selected_provider == GIT_PROVIDER_GITLAB:
+                text = f"SSH 地址示例：{entries[0].get_placeholder_text()}；可在地址中填写用户或嵌套组路径。"
+            elif configured_account:
+                text = f"SSH 地址示例：{entries[0].get_placeholder_text()}；GitHub 账号来自“设置”。"
+            else:
+                text = f"SSH 地址示例：{entries[0].get_placeholder_text()}；GitHub 账号来自“设置”。"
+            address_hint.set_text(text)
+            provider_label = "GitLab" if is_gitlab else "GitHub"
+            create_remote.set_label(f"创建 {provider_label} 仓库（网页）")
+            create_remote.set_tooltip_text(
+                f"打开 {provider_label} 的仓库创建页面；登录并确认后才会创建"
+            )
+            ssh_settings.set_label(f"{provider_label} SSH 公钥设置")
+        provider_combo.connect("changed", update_provider_controls)
+        gitlab_host_entry.connect("changed", update_provider_controls)
         remote_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         create_remote = Gtk.Button(label="创建远程仓库（网页）")
         create_remote.set_tooltip_text("打开 GitHub 创建页面；登录并确认后才会创建，已有仓库无需重复创建")
         create_remote.connect(
-            "clicked", lambda _button: self.open_github_repository_creation(dialog, entries[0])
+            "clicked", lambda _button: self.open_github_repository_creation(
+                dialog, entries[0], provider_combo.get_active_id() or GIT_PROVIDER_GITHUB,
+                gitlab_host_entry.get_text(),
+            )
         )
         ssh_settings = Gtk.Button(label="SSH 公钥设置")
-        ssh_settings.connect("clicked", lambda _button: self.show_ssh_public_keys(dialog, entries[2].get_text()))
+        ssh_settings.connect("clicked", lambda _button: self.show_ssh_public_keys(
+            dialog, entries[2].get_text(), provider_combo.get_active_id() or GIT_PROVIDER_GITHUB,
+            gitlab_host_entry.get_text(),
+        ))
         remote_actions.pack_start(create_remote, False, False, 0)
         remote_actions.pack_start(ssh_settings, False, False, 0)
         notice = Gtk.Label(
-            label="先在“SSH 公钥设置”中生成或复制公钥，再添加到 GitHub。"
-            "提交姓名和邮箱用于记录作者，SSH 密钥决定登录身份。\n"
-            "网页创建仓库时请勿初始化 README、.gitignore 或许可证，以免与本地历史冲突。"
-            "创建后确认上方 SSH 地址。\n"
+            label="提交姓名和邮箱用于记录作者，SSH 密钥决定登录身份。服务商选择只保存在当前工作空间，"
+            "不会自动修改已有 origin；请核对地址后保存。\n"
+            "创建仓库会打开服务商网页，需自行登录并确认；创建后填写完整 SSH 地址。\n"
             "“保存配置”：仅保存到当前工作空间，不连接远程。\n"
-            "“保存并验证连接”：保存后检查连接和推送权限，弹窗显示结果，不上传版本。\n"
-            "发布版本只保存到本地。主窗口“同步本地”仅对当前分支及所属标签以远程为准；"
-            "“同步远程”仅对当前分支及所属标签以本地为准，执行前会显示差异并要求确认。",
+            "“保存并验证连接”：保存后检查连接和推送权限，不上传版本。\n"
+            "发布版本只保存到本地；两个同步按钮按当前分支范围显示差异，确认后覆盖。",
             xalign=0,
         )
         notice.set_line_wrap(True)
@@ -6043,6 +6320,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         content.pack_start(notice, False, False, 0)
         dialog.get_content_area().add(content)
         dialog.show_all()
+        update_provider_controls()
         while True:
             response = dialog.run()
             if response not in (Gtk.ResponseType.OK, Gtk.ResponseType.APPLY):
@@ -6052,12 +6330,20 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             try:
                 remote_url = validate_remote_url(remote_url)
                 validate_git_identity(name, email)
+                selected_provider = provider_combo.get_active_id() or GIT_PROVIDER_GITHUB
+                selected_gitlab_host = (
+                    validate_gitlab_host(gitlab_host_entry.get_text())
+                    if selected_provider == GIT_PROVIDER_GITLAB
+                    else repository.gitlab_host() if repository else GITLAB_DEFAULT_HOST
+                )
                 if repository is None:
                     repository = create_repository(self.workspace_path)
                     self.repository = repository
                 repository.configure_remote(
                     remote_url, name, email,
                     push_timeout=push_timeout.get_value_as_int() * 60,
+                    git_provider=selected_provider,
+                    gitlab_host=selected_gitlab_host,
                 )
             except (GitError, OSError, ValueError) as error:
                 self.show_error(str(error))
@@ -6074,9 +6360,14 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 self._set_operation_status("SSH 配置已保存，尚未验证连接；可重新打开“Git 账号”进行验证。")
             return
 
-    def open_github_repository_creation(self, dialog, remote_entry) -> None:
+    def open_github_repository_creation(
+        self, dialog, remote_entry, provider: str = GIT_PROVIDER_GITHUB,
+        gitlab_host: str = GITLAB_DEFAULT_HOST,
+    ) -> None:
         try:
-            url = github_repository_creation_url(remote_entry.get_text(), self.workspace_path.name)
+            url = provider_repository_creation_url(
+                provider, remote_entry.get_text(), self.workspace_path.name, gitlab_host,
+            )
             Gtk.show_uri_on_window(dialog, url, Gdk.CURRENT_TIME)
         except (GitError, GLib.Error, OSError) as error:
             self.show_error(str(error))
@@ -6090,16 +6381,24 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self.show_error(str(error))
 
 
-    def show_ssh_public_keys(self, parent, email: str = "") -> None:
-        dialog = Gtk.Dialog(title="GitHub SSH 公钥设置", transient_for=parent, modal=True)
+    def show_ssh_public_keys(
+        self, parent, email: str = "", provider: str = GIT_PROVIDER_GITHUB,
+        gitlab_host: str = GITLAB_DEFAULT_HOST,
+    ) -> None:
+        provider = validate_git_provider(provider)
+        gitlab_host = validate_gitlab_host(gitlab_host)
+        provider_label = "GitHub" if provider == GIT_PROVIDER_GITHUB else "GitLab"
+        ssh_host = "github.com" if provider == GIT_PROVIDER_GITHUB else urlsplit(gitlab_host).hostname
+        key_url = provider_ssh_key_url(provider, gitlab_host)
+        dialog = Gtk.Dialog(title=f"{provider_label} SSH 公钥设置", transient_for=parent, modal=True)
         dialog.add_buttons("关闭", Gtk.ResponseType.CLOSE)
         dialog.set_default_size(720, 640)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=18)
         notice = Gtk.Label(
-            label="1. 已有密钥可直接复制公钥；没有时填写邮箱并生成。\n"
-            "2. 打开 GitHub 页面，选择 Authentication Key，粘贴公钥并保存。\n"
-            "3. 返回“Git 账号”，点击“保存并验证连接”。仅将 .pub 公钥添加到 GitHub。\n"
-            "首次连接请在终端运行 ssh -T git@github.com，核对官方主机指纹。"
+            label=f"1. 已有密钥可直接复制公钥；没有时填写邮箱并生成。\n"
+            f"2. 打开 {provider_label} 页面添加公钥，再返回“Git 账号”验证连接。"
+            "仅将 .pub 公钥添加到服务商。\n"
+            f"首次连接请在终端运行 ssh -T git@{ssh_host}，核对官方主机指纹。"
             "加密私钥请先用 ssh-add 解锁。",
             xalign=0,
         )
@@ -6244,7 +6543,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         content.pack_start(scroll, True, True, 0)
         content.pack_start(copy_button, False, False, 0)
         reload_keys()
-        link = Gtk.LinkButton.new_with_label("https://github.com/settings/ssh/new", "打开 GitHub 添加 SSH 公钥")
+        link = Gtk.LinkButton.new_with_label(key_url, f"打开 {provider_label} 添加 SSH 公钥")
         link.set_halign(Gtk.Align.START)
         content.pack_start(link, False, False, 0)
         page_scroll = Gtk.ScrolledWindow()

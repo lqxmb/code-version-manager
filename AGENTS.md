@@ -15,6 +15,7 @@
 | `tests/test_recovery_cleanup.py` | 恢复文件清理、stash 保护、文件安全、并发变化、失败报告及 GTK 清理回调测试 |
 | `tests/test_ui_layout.py` | 工具栏顺序、最近两项选择、动态比较、独立日志、窗口尺寸记忆及忙碌状态回归 |
 | `tests/test_version_remarks.py` | 独立版本备注、编辑快照、定向同步、分支隔离、删除恢复及 GTK 备注入口 |
+| `tests/test_provider_and_drop.py` | 工作空间文件夹拖放、GitHub/GitLab 地址与主机校验、仓库隔离配置及 GTK 服务商切换 |
 | `tests/verify_workspace_copy.py` | 仅在工作区隔离副本和临时远程中验证，不改来源和真实 origin |
 | `README.md` / `INSTALL.md` | 用户说明与 Ubuntu 安装、故障排查 |
 | `README_ai.md`（若存在） | 历史讨论，不作为当前业务规则依据 |
@@ -23,13 +24,14 @@
 
 入口为 `main()`，应用 ID 为 `cn.local.CodeVersionManager`。安装启动器 `/usr/bin/code-version-manager` 加载 `/usr/lib/code-version-manager/code_version_manager.py`。启动工作空间依次读取 `CODE_VERSION_MANAGER_REPOSITORY`、GTK 用户配置 `code-version-manager/settings.ini`、`~/catkin_ws`。最近工作空间最多保存 10 个。GTK 初始化、窗口、对话框及主线程事件回调均位于同一源码文件；后端操作由 `GitRepository` 负责。
 
-所选目录必须是独立 Git 根目录。初始化用 `git init`，默认分支为 main。已管理仓库的 Git 身份、唯一 origin、推送超时、比较工具和分支基线都保存在仓库本地配置。用户级 `code-version-manager/settings.ini` 另存 GitHub 账号、默认提交姓名和邮箱，作为新启用工作空间的默认值；打开已有仓库的“Git 账号”时，非空默认姓名和邮箱逐项预填，只有保存该窗口才写入仓库本地配置，单独保存设置不会修改已有仓库。应用元数据保存在实际 Git 目录下 `code-version-manager/`，不进入用户工作树或远程同步。
+所选目录必须是独立 Git 根目录。初始化用 `git init`，默认分支为 main。已管理仓库的 Git 身份、唯一 origin、服务商、自建 GitLab 主机、推送超时、比较工具和分支基线都保存在仓库本地配置。用户级 `code-version-manager/settings.ini` 另存 GitHub 账号、默认提交姓名和邮箱，作为新启用工作空间的默认值；打开已有仓库的“Git 账号”时，非空默认姓名和邮箱逐项预填，只有保存该窗口才写入仓库本地配置，单独保存设置不会修改已有仓库。应用元数据保存在实际 Git 目录下 `code-version-manager/`，不进入用户工作树或远程同步。
 
 ## 源码导航与配置
 
 - 源码依次组织为标签解析与数据类型、用户配置及 SSH 辅助函数、`GitRepository`、发布文件准备及打包选择辅助函数、`FileSelectionDialog`、`VersionManagerWindow` 和应用入口。优先在相应现有方法中扩展业务，不拆分服务或引入包管理框架。
 - Git 交互统一经过 `GitRepository.run()` / `run_bytes()`；远程操作用 `_run_remote()` 和 `run_remote_process()` 管理非交互 SSH、超时及传输子进程组清理。
 - 用户配置中的 `[git_defaults]` 保存 `github_account`、`user_name` 和 `user_email`；读写设置须保留最近工作空间等其他配置节。GitHub 账号只用于地址示例，不自动设置 origin，也不代表 SSH 登录身份。
+- Git 服务商和 GitLab 主机分别保存在仓库本地 `codeversionmanager.gitProvider`、`codeversionmanager.gitlabHost`；服务商取 `github` / `gitlab`，GitLab 主机只接受不含路径的 HTTPS 主机地址。无旧配置时仅从明确的 GitHub/GitLab.com origin 推断，其余默认 GitHub。服务商切换不得自动改写现有 origin。
 - 用户配置中的 `[window]` 保存主窗口普通状态的 `width`、`height` 及独立的 `maximized`；通过 `window_settings()` / `save_window_settings()` 读写，不能写入仓库 Git 配置。记录是应用级的，不按工作空间区分；未配置或尺寸无效时回退为 1120 × 720，不按屏幕占比重新计算。
 - 仓库本地配置键包括 `user.name`、`user.email`、`codeversionmanager.pushTimeout`、`codeversionmanager.compareTool`、`codeversionmanager.lastWorkingBranch` 及各分支的 `codeVersionManagerBase`。提交身份记录作者；SSH 密钥负责远程授权。
 
@@ -46,6 +48,8 @@
 | 版本删除与提交撤回 | `preview_version_deletion()`、`delete_version()`、`delete_latest_version_commit()`；GTK 的 `on_delete_version()`、`_background_version_deletion_ready()` |
 | 恢复文件清理 | `plan_recovery_cleanup()`、`clear_recovery_files(expected)`；GTK 的 `on_clear_recovery_files()` 及清理结果回调 |
 | 主窗口布局与版本选择 | `_build_header()`、`_build_content()`、`on_history_selection_changed()`、`_update_history_actions()`、`on_compare_selected()` |
+| 工作空间拖放打开 | `_install_workspace_drop_target()`、`on_workspace_drop()`、`load_workspace()` |
+| Git 服务商与 SSH 地址 | `validate_git_provider()`、`validate_gitlab_host()`、`provider_*()`；仓库 `git_provider()` / `configure_remote()`；GTK `on_git_account()` |
 | 版本备注 | `version_remark()`、`preview_version_remark()`、`update_version_remark()`；GTK 的 `prompt_version_remark()` 及备注后台回调 |
 | 主窗口尺寸记忆 | `window_settings()`、`save_window_settings()`；GTK 的 `_on_window_configure()`、`_on_window_state()`、`_flush_window_settings()` |
 | 操作状态与独立日志 | `_set_operation_status()`、`on_operation_log()`、`_refresh_operation_log()`、`_operation_log_text()` |
@@ -53,6 +57,8 @@
 - 用户 settings.ini 中 `[repository] path` 记录上次工作空间，`[recent_workspaces] paths` 保存 JSON 数组；路径会展开、去重并过滤不存在目录。删除最近记录只改列表，不删除工作空间或改写上次启动路径。
 - 对比工具默认 Beyond Compare，通过“设置”保存到仓库本地配置；只接受预设 Beyond Compare、Meld、KDiff3。GitHub 创建入口仅打开网页，默认建议私有仓库，不代用户创建或授权远程。
 - SSH 公钥辅助只读取有效普通 `.pub` 文件，拒绝符号链接；生成 Ed25519 密钥在临时目录完成，再以不覆盖方式发布成对文件。不得记录私钥或口令。
+- 主窗口拖放只接受单个 `file:` URI 对应的本地目录；文件、多项、非本地 URI 或 busy 状态必须拒绝并调用 `Gtk.drag_finish()`，不切换工作空间。
+- “Git 账号”的服务商和 GitLab HTTPS 主机按当前仓库保存；旧配置通过 GitHub/GitLab.com origin 推断。更改服务商只改变建议、创建页和公钥设置入口，不得自动改写 origin；远程认证错误按实际远程主机和已配置 GitLab 主机判断。
 - 版本清单按完整标签名分层存为 `versions/<tag>.manifest`；beta 路径包含 `branches/<编码分支名>/...`。标签对象更新后只失效受影响清单，避免继续使用旧清单。
 - `manifest()` 返回 `None` 表示没有可用清单，应使用完整 Git 树；返回 `[]` 表示明确的空清单，应导出空包。不得用同一个真假判断合并两种含义。
 - 恢复引用在 `refs/code-version-manager/recovery/<id>/<操作>/before/`，配套资料在实际 Git 目录 `code-version-manager/recovery/<id>/`，包括 git-config、state.json、versions 和内部 CHANGELOG。它们仅存在本机，不随日常或高级同步上传。
