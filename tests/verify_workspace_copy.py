@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -116,7 +117,7 @@ def verify(workspace):
                 except MODULE.GitError as error:
                     anomalies[branch.name] = {'expected_legacy_warning': str(error)}
         report['branch_baselines'] = anomalies
-        repo.sync_remote()
+        repo.sync_remote(scope="all")
         assert managed_refs(remote) == original_refs
         report['initial_whole_push'] = 'passed'
         main = original_refs['refs/heads/main']
@@ -126,7 +127,7 @@ def verify(workspace):
                        and MODULE.parse_version_tag(ref)[0] is None), None)
         if formal:
             git(remote, 'update-ref', formal, main)
-        snap = repo.sync_snapshot()
+        snap = repo.sync_snapshot(scope="all")
         status = repo.remote_sync_status(snap)
         assert status.can_sync_local, status.local_message
         repo.sync_local_from_remote(snap, status)
@@ -135,13 +136,68 @@ def verify(workspace):
         report['whole_pull_with_shared_tag_change'] = 'passed'
         repo.run(['branch', '-D', 'cvm-verification-remote-only'])
         repo.run(['branch', 'cvm-verification-local-only', 'main'])
-        repo.sync_remote()
+        repo.sync_remote(scope="all")
         assert repo._local_refs() == managed_refs(remote)
         assert git(remote, 'show-ref', '--verify', 'refs/tags/cvm-verification-note')
         assert not git(remote, 'for-each-ref', '--format=%(refname)', 'refs/code-version-manager/')
         assert list((repo.metadata_path / 'recovery').rglob('git-config'))
         report['whole_push_with_branch_deletion'] = 'passed'
         report['private_refs_excluded_and_recovery_created'] = 'passed'
+        # Daily sync must preserve a collaborator's independent branch updates.
+        repo.switch_branch('main')
+        releases = repo.formal_releases()
+        if not releases:
+            raise MODULE.GitError('隔离验证需要 main 历史中的正式标签。')
+        base = releases[0].name
+        suffix = uuid.uuid4().hex[:8]
+        branch_a, branch_b = 'cvm-check-a-' + suffix, 'cvm-check-b-' + suffix
+        def beta(repository, branch, sequence):
+            repository.run(['commit', '--allow-empty', '-m', 'isolated branch verification'])
+            repository.run(['tag', '-a', MODULE.version_tag_name(
+                branch, base + '-beta.0.0.' + str(sequence)), '-m', 'isolated beta'])
+        for branch in (branch_a, branch_b):
+            repo.create_branch(branch, base)
+            beta(repo, branch, 1)
+            repo.sync_remote()
+            repo.switch_branch('main')
+        peer_path = root / 'collaborator'
+        git(root, 'clone', '--no-local', '--no-hardlinks', '--branch', 'main', '-q', str(remote), str(peer_path))
+        peer = MODULE.GitRepository(peer_path)
+        peer.configure_remote(str(remote), 'Isolated Peer', 'peer@example.invalid')
+        peer.switch_branch(branch_b, source='remote')
+        repo.switch_branch(branch_a)
+        beta(repo, branch_a, 2)
+        snapshot = repo.sync_snapshot()
+        status = repo.remote_sync_status(snapshot)
+        assert status.can_sync_remote, status.remote_message
+        beta(peer, branch_b, 2)
+        peer.sync_remote()
+        other = repo._scope_refs(managed_refs(remote), branch_b)
+        repo.sync_remote_from_local(snapshot, status)
+        assert repo._scope_refs(managed_refs(remote), branch_b) == other
+        report['different_branches_concurrent_daily_push'] = 'passed'
+        repo.switch_branch('main')
+        # Simulate a deletion timeout before origin has accepted it, then reopen
+        # and explicitly delete the remaining origin-only entry.
+        original_remote = repo._run_remote
+        def deletion_timeout(args, url):
+            if args[0] == 'push':
+                raise MODULE.RemoteTimeoutError('isolated deletion timeout', 'push')
+            return original_remote(args, url)
+        with mock.patch.object(repo, '_run_remote', side_effect=deletion_timeout):
+            deleted = repo.delete_branch(branch_b, delete_remote=True)
+        assert deleted.local_deleted and deleted.remote_state == 'unknown'
+        assert repo._scope_refs(managed_refs(remote), branch_b) == other
+        reopened = MODULE.GitRepository(copy)
+        reopened.sync_remote()
+        assert reopened._scope_refs(managed_refs(remote), branch_b) == other
+        deleted = reopened.delete_branch(branch_b, delete_local=False, delete_remote=True)
+        assert deleted.remote_state == 'deleted'
+        assert not reopened._scope_refs(managed_refs(remote), branch_b)
+        reopened.delete_branch(branch_a, delete_remote=True)
+        report['daily_main_preserves_origin_only_branch'] = 'passed'
+        report['deletion_timeout_and_origin_only_retry'] = 'passed'
+
     after = fingerprint(source.path)
     report['source_unchanged'] = after == before
     if after != before:

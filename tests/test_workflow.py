@@ -31,7 +31,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
 
     def status(self, repo=None):
         repo = repo or self.repo
-        snap = repo.sync_snapshot()
+        snap = repo.sync_snapshot(scope="all")
         return snap, repo.remote_sync_status(snap)
 
     def peer(self):
@@ -60,7 +60,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.repo.run(['add', 'main-only.txt'])
         self.repo.run(['commit', '--amend', '--no-edit', '-q'])
         self.repo.run(['tag', '-f', '-a', 'v0.0.6', '-m', 'six'])
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         self.repo.switch_branch('branch1')
         self.assertEqual('branches/branch1/v0.0.3-beta.0.0.2', self.repo.next_version())
         self.repo.switch_branch('main')
@@ -101,7 +101,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertNotIn('refs/heads/branch1', self.refs(self.path))
         self.assertFalse(any('/branches/branch1/' in ref for ref in self.refs(self.path)))
         self.assertIn('refs/heads/branch1', self.refs(self.remote))
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         self.assertEqual(self.refs(self.path), self.refs(self.remote))
         self.assertTrue(self.repo.run(['for-each-ref', '--format=%(refname)', 'refs/code-version-manager/recovery/']).strip())
 
@@ -110,7 +110,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.publish(self.repo, 'feature/camera/v0.0.3-beta.0.0.1', 'feature\n')
         self.repo.switch_branch('main')
         self.publish(self.repo, 'v0.0.6', 'main six\n')
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         peer = self.peer()
         snap, status = self.status(peer)
         peer.sync_local_from_remote(snap, status)
@@ -123,7 +123,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.repo.create_branch('feature', 'v0.0.3')
         self.repo.switch_branch('main')
         self.publish(self.repo, 'v0.0.6', 'six\n')
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         peer = self.peer()
         snap, status = self.status(peer)
         peer.sync_local_from_remote(snap, status)
@@ -135,7 +135,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.repo.create_branch('feature', 'v0.0.3')
         self.assertEqual('v0.0.3', self.repo.branch_base())
         self.repo.switch_branch('main')
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         peer = self.peer()
         snap, status = self.status(peer)
         peer.sync_local_from_remote(snap, status)
@@ -180,7 +180,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.repo.create_branch('branch1')
         self.publish(self.repo, 'branch1/v0.0.3-beta.0.0.1', 'feature\n')
         self.repo.switch_branch('main')
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         peer = self.peer()
         snap, status = self.status(peer)
         peer.sync_local_from_remote(snap, status)
@@ -188,7 +188,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         peer.run(['branch', 'remote-only'])
         peer.run(['tag', 'external-note'])
         self.git(peer.path, 'push', '-q', 'origin', 'refs/tags/external-note')
-        peer.sync_remote()
+        peer.sync_remote(scope="all")
         self.repo.run(['branch', 'local-only'])
         self.repo.run(['tag', 'local-note'])
         snap, status = self.status()
@@ -201,12 +201,12 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertNotIn('refs/heads/local-only', self.refs(self.path))
         self.assertIn('refs/heads/remote-only', self.refs(self.path))
         self.repo.run(['branch', '-d', 'remote-only'])
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         self.assertEqual(self.refs(self.remote), self.refs(self.path))
         self.assertIn('external-note', self.git(self.remote, 'tag').splitlines())
 
     def test_current_branch_deleted_by_remote_returns_to_main(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         self.repo.create_branch('local-only')
         snap, status = self.status()
         self.repo.sync_local_from_remote(snap, status)
@@ -215,11 +215,11 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertEqual('0.0.3\n', (self.path / 'VERSION').read_text())
 
     def test_dirty_staged_untracked_and_ignored_files_have_recovery(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         peer = self.peer()
         (peer.path / 'collision.txt').write_text('remote file\n', encoding='utf-8')
         peer.save_version('v0.0.4', 'remote', ['shared.txt', 'collision.txt'])
-        peer.sync_remote()
+        peer.sync_remote(scope="all")
         (self.path / '.gitignore').write_text('/collision.txt\n', encoding='utf-8')
         self.repo.run(['add', '.gitignore'])
         (self.path / 'shared.txt').write_text('staged\n', encoding='utf-8')
@@ -245,7 +245,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertTrue((self.path / 'untracked.txt').exists())
 
     def test_snapshot_changes_cancel_before_writing_refs(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         self.publish(self.repo, 'v0.0.4', 'four\n')
         snap, status = self.status()
         before = self.refs(self.remote)
@@ -255,7 +255,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertEqual(before, self.refs(self.remote))
 
     def test_other_worktree_blocks_local_mirror(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         self.repo.run(['branch', 'busy'])
         other = self.root / 'other-worktree'
         self.repo.run(['worktree', 'add', '-q', str(other), 'busy'])
@@ -265,7 +265,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertIn('refs/heads/busy', self.refs(self.path))
 
     def test_atomic_server_rejection_keeps_every_remote_ref(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         self.repo.create_branch('branch1')
         self.publish(self.repo, 'branch1/v0.0.3-beta.0.0.1', 'feature\n')
         self.repo.switch_branch('main')
@@ -273,11 +273,11 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.git(self.remote, 'config', 'receive.advertiseAtomic', 'false')
         before = self.refs(self.remote)
         with self.assertRaises(MODULE.GitError):
-            self.repo.sync_remote()
+            self.repo.sync_remote(scope="all")
         self.assertEqual(before, self.refs(self.remote))
 
     def test_missing_main_and_shallow_history_block_mirrors(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         self.repo.run(['branch', '-m', 'main', 'other'])
         snap, status = self.status()
         self.assertFalse(status.can_sync_remote)
@@ -285,10 +285,10 @@ class UnifiedWorkflowTest(unittest.TestCase):
         shallow = self.root / 'shallow'
         self.git(self.root, 'clone', '--depth=1', '--branch=main', '-q', self.remote.as_uri(), str(shallow))
         with self.assertRaisesRegex(MODULE.GitError, '浅克隆'):
-            MODULE.GitRepository(shallow).sync_snapshot()
+            MODULE.GitRepository(shallow).sync_snapshot(scope="all")
 
     def test_unrelated_histories_can_be_mirrored_after_explicit_confirmation(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         other = self.root / 'other'
         other.mkdir()
         (other / 'different.txt').write_text('different root\n', encoding='utf-8')
@@ -301,7 +301,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertTrue(repo.run(['for-each-ref', 'refs/code-version-manager/recovery/']).strip())
 
     def test_failed_local_ref_transaction_preserves_heads_and_branch_identity(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         self.repo.run(['branch', 'local-only'])
         before = self.refs(self.path)
         snap, status = self.status()
@@ -313,7 +313,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
 
 
     def test_precise_lease_rejects_concurrent_remote_change_without_partial_tags(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         peer = self.peer()
         (peer.path / 'peer.txt').write_text('concurrent change\n')
         peer.run(['add', 'peer.txt'])
@@ -334,7 +334,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertIn('refs/tags/v0.0.4', self.refs(self.path))
 
     def test_remote_snapshot_change_cancels_before_backup_or_local_refs_change(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         self.repo.run(['branch', 'local-only'])
         snap, status = self.status()
         before = self.refs(self.path)
@@ -345,11 +345,11 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertEqual('main', self.repo.current_branch())
 
     def test_real_ref_lock_failure_is_a_batch_failure(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         peer = self.peer()
         self.publish(peer, 'v0.0.4', 'peer four\n')
         peer.run(['branch', 'new-branch'])
-        peer.sync_remote()
+        peer.sync_remote(scope="all")
         before = self.refs(self.path)
         snap, status = self.status()
         lock = self.path / '.git' / 'refs' / 'heads' / 'main.lock'
@@ -364,7 +364,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertEqual('base\n', (self.path / 'shared.txt').read_text())
 
     def test_empty_local_repository_import_populates_worktree(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         empty = self.root / 'empty'
         empty.mkdir()
         repo = MODULE.create_repository(empty)
@@ -379,10 +379,10 @@ class UnifiedWorkflowTest(unittest.TestCase):
         self.assertEqual([], repo.status())
 
     def test_import_invalidates_stale_manifest_for_previously_missing_tag(self):
-        self.repo.sync_remote()
+        self.repo.sync_remote(scope="all")
         peer = self.peer()
         self.publish(peer, 'v0.0.4', 'four\n')
-        peer.sync_remote()
+        peer.sync_remote(scope="all")
         manifest = self.repo.metadata_path / 'versions' / 'v0.0.4.manifest'
         manifest.parent.mkdir(parents=True, exist_ok=True)
         manifest.write_text('wrong-file.txt\n')
@@ -407,7 +407,7 @@ class UnifiedWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.GitError, '手动合并'):
             self.repo.switch_branch('branch1')
         with self.assertRaisesRegex(MODULE.GitError, '手动合并'):
-            self.repo.sync_snapshot()
+            self.repo.sync_snapshot(scope="all")
         with self.assertRaisesRegex(MODULE.GitError, '关闭对比工具'):
             self.repo.complete_merge()
         self.assertEqual(tags, self.repo.tags())
@@ -434,7 +434,8 @@ class RepositoryStatusUITest(unittest.TestCase):
         window.remote_status_generation = 5
         window.busy = False
         repo.sync_snapshot.return_value = mock.sentinel.new_snapshot
-        MODULE.VersionManagerWindow._remote_status_complete(window, repo, 5, mock.sentinel.old_snapshot, mock.sentinel.status)
+        snapshot = MODULE.RemoteSyncSnapshot("origin", "refs/heads/main", ())
+        MODULE.VersionManagerWindow._remote_status_complete(window, repo, 5, snapshot, mock.sentinel.status)
         window._set_remote_status.assert_not_called()
         window._invalidate_remote_status.assert_called_once()
         window._refresh_remote_status.assert_called_once()

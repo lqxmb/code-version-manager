@@ -2,13 +2,14 @@
 
 ## 项目概况
 
-本项目是 Python 3、GTK 3 桌面应用，用于管理任意独立 Git 工作空间，提供本地离线发布、固定基线开发分支、手动目录合并、版本比较与 ZIP 导出，以及可选 SSH 整仓同步。应用代码有意集中在 `src/code_version_manager.py`，不引入额外服务或 Python 包管理框架。
+本项目是 Python 3、GTK 3 桌面应用，用于管理任意独立 Git 工作空间，提供本地离线发布、固定基线开发分支、手动目录合并、版本比较与 ZIP 导出，以及可选 SSH 当前分支同步和高级整仓覆盖。应用代码有意集中在 `src/code_version_manager.py`，不引入额外服务或 Python 包管理框架。
 
 | 路径 | 职责 |
 | --- | --- |
 | `src/code_version_manager.py` | 版本标签解析、数据类型、GitRepository 后端、GTK 界面和应用入口；Git 操作与界面有意集中于单文件 |
 | `tests/test_backend.py` | Git 后端、发布、同步、恢复和 GTK 回归测试 |
-| `tests/test_workflow.py` | 临时工作仓库与 bare origin 的完整流程测试 |
+| `tests/test_workflow.py` | 临时工作仓库与 bare origin 的高级整仓覆盖流程测试 |
+| `tests/test_scoped_sync.py` | 当前分支同步、双人协作、两端删除、超时与 GTK 回归 |
 | `tests/test_merge_comparison.py` | 手动合并隔离副本、忽略规则、提交及取消测试 |
 | `tests/verify_workspace_copy.py` | 仅在工作区隔离副本和临时远程中验证，不改来源和真实 origin |
 | `README.md` / `INSTALL.md` | 用户说明与 Ubuntu 安装、故障排查 |
@@ -43,11 +44,11 @@
 - 工作区根目录 `VERSION`、`CHANGELOG.rst` 为软件生成的本地状态，不进入新发布提交、manifest、ZIP 或新的远程发布快照。软件自身项目根目录 `VERSION` 是 Debian 发行号，保持独立且仍受 Git 跟踪。
 - `current_version_tag()` 优先查 HEAD 上属于当前分支的标签或正式标签，否则沿第一父链查最近正式标签或本分支 beta；无 beta 的开发分支校验固定正式基线。无标签返回空，不伪造版本。
 - `workspace_version_value()` 将正式版转换成不带 v 的号（`0.0.3`），beta 转换成未编码分支名与标签（`feature/camera/v0.0.3-beta.0.0.1`）。
-- `refresh_workspace_generated_files()` 统一刷新两个根目录文件。切换本地/远程分支、从 main 创建分支、发布、完成合并、删除分支、修改/删除标签及整仓同步完成后调用，不在 GTK 普通刷新中隐式写文件。不创建提交或改变用户源文件的暂存选择。
+- `refresh_workspace_generated_files()` 统一刷新两个根目录文件。切换本地/远程分支、从 main 创建分支、发布、完成合并、删除分支、修改/删除标签及同步完成后调用，不在 GTK 普通刷新中隐式写文件。不创建提交或改变用户源文件的暂存选择。
 - VERSION 采用当前分支最近已发布标签；根目录 CHANGELOG 只含当前分支可达的正式版本和本分支 beta，不含其他分支 beta。无标签时移除过期 VERSION，生成“尚无版本”的 CHANGELOG。内部 metadata CHANGELOG 仍含全仓库版本历史。
 - `prepare_workspace_release_files()` 在启用和发布前准备说明模板与忽略规则。新 `.gitignore` 从 `data/workspace.gitignore` 复制；已有文件保留内容与换行，仅补齐 `/VERSION`、`/CHANGELOG.rst`。规则迁移自动纳入本次发布，即使用户未选 `.gitignore`。
 - 默认忽略内容不写入 Python 多行常量。`workspace_gitignore_template_path()` 分别查源码 data 目录和安装目录；模板缺失明确报错。打包前可编辑模板，用户自定义默认规则只用于新建 `.gitignore`；两个生成文件的必要忽略项始终补齐。
-- 发布使用临时 index，只提交所选文件、选定顶层删除范围和必要 `.gitignore` 迁移；显式从临时 index 移除历史跟踪的 VERSION、CHANGELOG，保留其他暂存内容。旧提交不重写，整仓同步仍传输旧历史；旧 manifest 和无 manifest 的导出也过滤两个根目录文件。
+- 发布使用临时 index，只提交所选文件、选定顶层删除范围和必要 `.gitignore` 迁移；显式从临时 index 移除历史跟踪的 VERSION、CHANGELOG，保留其他暂存内容。旧提交不重写，同步仍传输所选引用需要的旧历史；旧 manifest 和无 manifest 的导出也过滤两个根目录文件。
 - 切换仍要求用户源文件干净。`_user_status()` 排除两个生成路径并关闭重命名折叠，避免隐藏涉及源文件的移动。`_generated_file_transition()` 临时规范旧树中的生成路径以安全切换，失败恢复原生成文件与 index；成功后从目标标签重新生成，不使用 assume-unchanged 或 skip-worktree。
 - 发布始终离线。根目录 CHANGELOG 仍是发布说明输入；发布窗口读取匹配章节，最终以用户确认的改动内容写标签说明。发布后、分支切换及其他刷新点覆盖根目录文件；手写草稿须先保存在发布窗口或另行备份。
 
@@ -62,33 +63,61 @@
 - `VERSION`、`CHANGELOG.rst` 和相同内容文件不可编辑。只有相对 main 有内容差异的普通文件可写回；验证拒绝额外路径、目录/链接替换、来源只读侧变化和确认后的输出变化。
 - 会话记录位于 `code-version-manager/merge-review/<id>/`，`merge.json` 保存来源、基线、引用与工具关闭状态。合并期间禁止发布、切换和同步。工具退出后才显示“完成合并”“取消合并”。
 - 完成前再次校验仓库、工作区、工具输出和 worktree 使用情况；把人工选择写成以原 main 提交为唯一父提交的普通提交，不执行 merge commit，不发布或创建标签，随后按 main 最近正式标签刷新本地 VERSION 和 CHANGELOG。默认删除来源本地分支及其全部 beta 标签；确认选项可关闭以保留分支。
-- 提交和删除引用使用完成阶段生成的本地恢复点。清理只影响本地，后续“同步远程”才传播删除。
+- 提交和删除引用使用完成阶段生成的本地恢复点。清理只影响本地，远程来源分支须通过“删除分支”中的 origin 条目显式删除，日常同步 main 不传播其他分支删除。
 - 取消删除临时对比副本和会话状态，不创建恢复引用、不改变原检出分支、工作树、index、提交、分支或标签。
 - Beyond Compare 使用内置 `data/bcompare/BCSessions.xml`；普通历史目录比较配置保持独立。
 
+## 日常同步与高级整仓覆盖
+
+### 方向与范围
+
+同步始终单向覆盖，不自动合并两个人对同一分支的修改。确认后允许新增、替换、回退和删除，不能用提交时间或版本号自动选择准本。
+
+| 入口 / 当前分支 | 同步本地（origin 为准） | 同步远程（本地为准） |
+| --- | --- | --- |
+| 日常按钮 / main | 本地 main 与全部正式标签变为远程状态 | 远程 main 与全部正式标签变为本地状态 |
+| 日常按钮 / 开发分支 | 本地当前分支与所属全部 beta 标签变为远程状态 | 远程当前分支与所属全部 beta 标签变为本地状态 |
+| 高级整仓覆盖 | 全部本地受管分支与版本标签变为远程状态 | 全部远程受管分支与版本标签变为本地状态 |
+
+- 来源缺少的范围内目标引用也删除；范围外分支及其标签不受影响。本地落后或从未下载其他分支，不能导致这些远程分支被覆盖或删除。
+- `sync_snapshot()`、`sync_remote()` 默认 `scope="current"`；整仓调用必须显式传入 `scope="all"`。`RemoteSyncSnapshot.refs` 仅含写入范围，`dependencies` 记录只读正式基线，`branch_ref` 固定操作前工作分支。禁止将完整 `remote_refs` 直接作为日常操作目标。
+- main 同步和整仓覆盖的来源必须有有效 main。开发分支同步、首次导入不补入或改写正式标签；固定基线必须属于两端相应历史，且完整正式标签 OID 一致，说明不同也算冲突。缺失、多基线或冲突时提示先处理 main，不能猜测或重写固定基线。
+- 远程已删除当前开发分支时，同步本地确认后删除该本地分支及全部 beta，返回现有本地 main；main 本身不随此次下载更新。遗留远程 beta 不阻止清理本地。
+- 顶部“高级整仓覆盖”独立执行：后台全量检查 → 用户选择本地或远程准本 → 完整覆盖、回退及删除清单 → 用户确认。其状态不替代日常按钮的当前范围状态。
+
+### 安全、恢复与界面状态
+
+- 仅管理 `refs/heads/*` 和可解析版本标签。非版本标签、其他 remote、stash、恢复引用不参与覆盖；禁止 `git push --mirror` 或泛化删除引用。
+- 每次状态检查读取完整远程引用，用 `RemoteSyncStatus.remote_refs` 更新 origin 分支列表；对象获取和提交详情检查限定在当前范围及必要基线。读取失败清空远程选项，基线阻塞仍可展示已成功读取的 origin 列表。
+- 确认后复核当前范围完整引用集合、OID、当前检出分支、origin 和正式基线；当前范围增删引用或改变 OID 时停止。其他分支正常更新不阻止日常同步。整仓确认仍校验全部受管引用。
+- origin 使用非交互 SSH。读取/权限预检查 120 秒，传输默认 900 秒，仓库配置可设 60–3600 秒。推送必须原子更新并使用精确 `--force-with-lease`，refspec 不带 `+`；推送使用已确认的 origin 地址，避免命名 remote 的 fetch 映射或 mirror 配置隐式改动本地引用。本地事务使用旧 OID 校验。
+- 同步本地先记录忽略文件冲突，再 stash 暂存、未暂存和未跟踪文件；可能被覆盖的忽略文件移入恢复目录。恢复用 `stash apply --index`，冲突不删除恢复点。其他 worktree 占用待更新分支或返回目标时停止。
+- 覆盖前备份目标旧引用、配置、manifest 和内部 CHANGELOG。远程传输所选引用所需 Git 历史，不传 manifest；缺清单的远程版本从完整 Git 树导出并重建内部历史。
+- 跟踪引用、manifest、分支配置和基线缓存的更新须遵守操作范围；开发分支同步保留固定基线，不能运行全量清理影响其他分支。
+- 日常按钮禁用/着色以当前范围状态为准；成功后刷新分支、历史、修改、冲突、生成文件和按钮。generation、仓库实例及快照共同丢弃过期后台结果。
+
 ## 分支删除
 
-- “删除分支”只列出本地非 main 分支。选择目标后直接在后台删除，不再弹出清单确认框；不要求已合入或已发布，并删除该分支及所属 beta 标签，不删除 main、正式标签或远程引用。
-- 删除非当前分支不要求工作区干净，不切换分支，也不改动当前工作区、index 或未跟踪文件。main 有本地修改时仍可删除未检出的开发分支。
-- 删除当前检出的分支时，必须先检查工作区干净、main 可安全切换，再切到 main 后删除。其他 worktree 正在使用目标分支时仍拒绝删除。
-- `plan_branch_deletion()` 校验分支和引用快照；`delete_branch()` 保留旧引用与元数据恢复点，并用旧 OID 校验批量删除。失败保留恢复资料；远程删除由后续整仓同步传播。
+### 选择与执行
 
-## 整仓同步
+- 选择器合并本地和 origin 同名条目，只提供非 main 分支；main 和正式标签不能通过此入口删除。
+- 删除前后台检查 origin。远程存在同名分支时提供“同时删除远程分支及全部 beta 标签”，默认不勾选。仅删本地后保留 `分支名（origin）`；可选择 origin 独有条目明确确认删除远程及所属 beta。
+- 无远程配置、离线或检查失败仍允许只删本地。删除不要求已合入或已发布。合并后来源清理始终只操作本地，远程清理由用户另行显式删除。
+- 删除非当前本地分支不要求工作区干净，不切换分支，不改变当前工作树、index 或未跟踪文件。删除当前分支必须工作区干净、main 可安全切换；其他 worktree 使用目标分支时拒绝。远程独有删除不切换本地分支。
+- `BranchDeletionPlan` 固定目标分支及 beta 的两端引用、origin、远程检查结果和本地切换保护；其他分支正常变化不使该清单失效。`BranchDeletionResult` 记录本地完成状态、远程结果与恢复位置。
+- 两端删除顺序：本地安全预检及恢复点 → 远程旧引用备份和复核 → 原子远程删除及核验 → 本地旧 OID 校验删除。权限拒绝、确认后引用变化等非超时错误停止并保留本地；部分完成必须明确报告。
 
-| 操作 | 来源 | 目标 |
+### 超时与重试
+
+| 远程结果 | 本地处理 | 用户提示 |
 | --- | --- | --- |
-| 同步本地 | origin | 所有本地分支、正式标签、beta 标签变为远程状态 |
-| 同步远程 | 本地 | 所有远程分支、正式标签、beta 标签变为本地状态 |
+| 删除成功 | 继续删除本地 | 两端完成 |
+| 复查或恢复备份超时，尚未发出删除 | 继续本地安全校验及删除 | 远程删除未发起，恢复连接后刷新重试 |
+| 删除请求或后续核验超时 | 继续本地安全校验及删除 | 远程结果待确认 |
+| 权限拒绝、引用变化等非超时错误 | 停止，保留本地 | 具体错误及恢复位置 |
 
-- 两个方向都新增、替换、删除受管分支和可解析版本标签；来源不存在的目标引用也删除。来源必须有有效 main。
-- 不按时间或版本号自动选方向。检查时逐引用展示领先、落后、分叉、无共同历史及标签变化；整仓差异可能有多个方向。
-- 只管理 `refs/heads/*` 与可解析版本标签。非版本标签、其他 remote、stash、恢复引用不参与覆盖；不得使用 `git push --mirror` 或泛化的引用删除。
-- `RemoteSyncSnapshot.refs` 是全部受管引用；`branch_ref` 只记录操作前工作分支，不能缩小覆盖范围。所有同步入口共用状态、快照校验、备份和恢复流程。
-- 每次同步状态检查读取远程完整引用并同步更新分支选择器中的 origin 分支。没有独立“刷新远程分支”按钮；检查失败清空远程分支选项，避免显示过期信息。generation、仓库实例和快照用于丢弃旧后台结果。
-- origin 使用非交互 SSH。连接/权限检查 120 秒，传输默认 900 秒，可在仓库配置 60–3600 秒。推送原子更新并使用精确 `--force-with-lease`，refspec 不得带 `+`；本地批量更新使用旧 OID 校验。
-- 同步本地先记录忽略文件冲突，再 stash 暂存、未暂存和未跟踪文件；可能被覆盖的忽略文件移入恢复目录。恢复用 `stash apply --index`，冲突不删除恢复点。其他 worktree 占用待更新分支时阻止覆盖。
-- 覆盖前备份受管引用、配置、manifest 和内部 CHANGELOG。远程传输 Git 历史和引用，不传 manifest；缺 manifest 的远程版本从 Git 完整树导出并重建内部 CHANGELOG。
-- 远程状态来自 `RemoteSyncStatus.remote_refs`。同步按钮禁用/着色应通过统一状态机更新，成功后刷新分支、历史、修改、冲突和按钮状态。
+- `_run_remote()` 以 `RemoteTimeoutError(GitError)` 标识超时并记录阶段；禁止匹配中文错误文字判断超时。
+- 超时不伪造远程成功；刷新或重启后重新读取 origin，实际已删除的条目消失，仍存在的条目可再次显式删除。恢复记录保留远程是否发出删除、完成状态和错误。
 
 ## 元数据、GTK 与错误处理
 
@@ -107,7 +136,7 @@
 
 ## 测试、兼容与打包
 
-- `tests/test_backend.py` 覆盖解析、仓库后端、发布、身份配置、远程验证、GTK 回调和文件安全；`tests/test_workflow.py` 使用临时工作仓库与 bare origin 覆盖整仓同步及并发变化；`tests/test_generated_files.py` 覆盖生成文件、旧仓库迁移、分支范围、文件安全和独立忽略模板；`tests/test_merge_comparison.py` 覆盖隔离目录合并；`tests/verify_workspace_copy.py` 只操作验证副本和临时 origin。
+- `tests/test_backend.py` 覆盖解析、仓库后端、发布、身份配置、远程验证、GTK 回调和文件安全；`tests/test_workflow.py` 使用临时工作仓库与 bare origin 覆盖高级整仓覆盖及并发变化；`tests/test_scoped_sync.py` 覆盖双人分支隔离、基线、两端删除、超时与 GTK 回归；`tests/test_generated_files.py` 覆盖生成文件、旧仓库迁移、分支范围、文件安全和独立忽略模板；`tests/test_merge_comparison.py` 覆盖隔离目录合并；`tests/verify_workspace_copy.py` 只操作验证副本和临时 origin。
 - `legacy_test_*` 是历史流程用例，不会被 unittest 自动发现，不作为当前合并规则或验证通过的依据；新增用例应使用 `test_*`。配置相关测试应指向临时 settings.ini，避免依赖实际用户设置。
 - 常规验证运行完整 unittest、源码 `py_compile` 和 `git diff --check`。实仓验证必须先复制 Git 数据与元数据，不得对来源目录或真实 origin 执行覆盖。
 - `VERSION`（项目根目录）是 Debian 软件包版本；`<工作空间>/VERSION` 是被管理仓库的本地生成标签显示号，两者不能混用。`build_deb.sh` 从项目根 VERSION 命名 deb 并复制源码、README、INSTALL、图标、桌面入口、Beyond Compare 默认会话及 `data/workspace.gitignore`。模板安装到 `/usr/lib/code-version-manager/workspace.gitignore`，可在打包前直接修改，不改 Python 源码。

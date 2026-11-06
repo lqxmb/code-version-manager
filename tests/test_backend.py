@@ -1030,7 +1030,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         remote = self.root / "origin.git"
         self.git(self.root, "init", "--bare", "-q", str(remote))
         self.repository.configure_remote(str(remote), "Test User", "test@example.com")
-        snapshot = self.repository.sync_snapshot()
+        snapshot = self.repository.sync_snapshot(scope="all")
         status = self.repository.remote_sync_status(snapshot)
         self.repository.sync_remote_from_local(snapshot, status)
         self.assertIn(version, self.git(remote, "tag").splitlines())
@@ -1138,7 +1138,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         repo.create_branch("current-feature")
         repo.switch_branch("current-feature")
         result = repo.delete_branch("current-feature")
-        self.assertIn("current-feature", result)
+        self.assertIn("current-feature", result.message)
         self.assertEqual("main", repo.current_branch())
         with self.assertRaisesRegex(MODULE.GitError, "main 分支不能删除"):
             repo.plan_branch_deletion("main")
@@ -1168,7 +1168,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         plan = repo.plan_branch_deletion("test1")
         self.assertEqual("test1", plan.name)
         result = repo.delete_branch("test1", expected=plan)
-        self.assertIn("恢复点", result)
+        self.assertIn("恢复点", result.message)
         self.assertEqual("main", repo.current_branch())
         self.assertEqual("staged\n", repo.run(["show", ":robot.txt"]))
         self.assertEqual("unstaged\n", (self.path / "robot.txt").read_text(encoding="utf-8"))
@@ -1429,7 +1429,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         remote = self.root / "origin.git"
         self.git(self.root, "init", "--bare", "-q", str(remote))
         self.repository.configure_remote(str(remote), "Test User", "test@example.com")
-        self.repository.sync_remote()
+        self.repository.sync_remote(scope="all")
         self.repository.create_branch("test1")
         self.repository.switch_branch("main")
         peer = self.root / "peer"
@@ -1442,7 +1442,7 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         self.git(peer, "tag", "-f", "-a", "v0.2.0", "-m", "rewritten remote label")
         self.git(peer, "push", "-q", "--force", "origin", "main", "refs/tags/v0.2.0")
 
-        snapshot = self.repository.sync_snapshot()
+        snapshot = self.repository.sync_snapshot(scope="all")
         status = self.repository.remote_sync_status(snapshot)
 
         self.assertTrue(status.can_sync_remote, status.remote_message)
@@ -1454,32 +1454,37 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         remote = self.root / "origin.git"
         self.git(self.root, "init", "--bare", "-q", str(remote))
         self.repository.configure_remote(str(remote), "Test User", "test@example.com")
-        self.repository.sync_remote()
+        self.repository.sync_remote(scope="all")
         self.repository.create_branch("feature/camera")
         (self.path / "camera.txt").write_text("camera\n", encoding="utf-8")
         self.repository.save_version("feature/camera/v0.2.0-beta.0.0.1", "camera preview", ["camera.txt"])
-        self.repository.sync_remote()
+        self.repository.sync_remote(scope="all")
         self.repository.switch_branch("main")
         (self.path / "robot.txt").write_text("main progress\n", encoding="utf-8")
         self.repository.save_version("v0.3.0", "main progress", ["robot.txt"])
-        self.repository.sync_remote()
+        self.repository.sync_remote(scope="all")
 
         imported = self.root / "imported"
         imported.mkdir()
         repo = MODULE.create_repository(imported)
         repo.configure_remote(str(remote), "Test User", "test@example.com")
         branch = next(branch for branch in repo.remote_branches() if branch.name == "feature/camera")
+        with self.assertRaisesRegex(MODULE.GitError, "先处理 main"):
+            repo.switch_branch(branch.name, source="remote", expected_oid=branch.oid)
+        snapshot = repo.sync_snapshot()
+        repo.sync_local_from_remote(snapshot, repo.remote_sync_status(snapshot))
         repo.switch_branch(branch.name, source="remote", expected_oid=branch.oid)
 
         self.assertEqual("feature/camera", repo.current_branch())
         self.assertIn("v0.2.0", repo.tags())
-        self.assertNotIn("v0.3.0", repo.tags())
+        self.assertIn("v0.3.0", repo.tags())
         self.assertEqual(["branches/feature%2Fcamera/v0.2.0-beta.0.0.1", "v0.2.0"], [entry.tags[0] for entry in repo.history()])
         self.assertEqual("feature/camera/v0.2.0-beta.0.0.1\n", (imported / "VERSION").read_text())
         notes = (imported / "CHANGELOG.rst").read_text()
         self.assertIn("camera preview", notes)
         self.assertNotIn("0.3.0 (", notes)
-        snapshot = repo.sync_snapshot()
+        repo.run(["branch", "local-extra", "main"])
+        snapshot = repo.sync_snapshot(scope="all")
         status = repo.remote_sync_status(snapshot)
         self.assertTrue(status.can_sync_local, status.local_message)
         repo.sync_local_from_remote(snapshot, status)
@@ -1493,12 +1498,12 @@ class BranchReleaseWorkflowTest(unittest.TestCase):
         remote = self.root / "origin.git"
         self.git(self.root, "init", "--bare", "-q", str(remote))
         self.repository.configure_remote(str(remote), "Test User", "test@example.com")
-        self.repository.sync_remote()
+        self.repository.sync_remote(scope="all")
         self.repository.create_branch("test1")
         self.repository.switch_branch("main")
         self.git(self.path, "tag", "-d", "v0.2.0")
 
-        snapshot = self.repository.sync_snapshot()
+        snapshot = self.repository.sync_snapshot(scope="all")
         status = self.repository.remote_sync_status(snapshot)
 
         self.assertTrue(status.can_sync_local, status.local_message)
@@ -2033,8 +2038,9 @@ class RemoteRepositoryTest(unittest.TestCase):
 
 
     def test_uses_actual_working_branch_instead_of_assuming_main(self):
-        self.repository.run(["switch", "-c", "release"])
         self.configure()
+        self.repository.sync_remote()
+        self.repository.run(["switch", "-c", "release"])
         self.publish("v0.0.1-beta.0.0.1")
         self.repository.sync_remote()
 
@@ -2304,9 +2310,11 @@ class BackgroundProgressTest(unittest.TestCase):
                     )
                     thread.call_args.kwargs["target"]()
 
-                idle_add.assert_called_once_with(
-                    window._background_complete, result or "默认成功提示", False
-                )
+                idle_add.assert_called_once()
+                delivery, callback, *arguments = idle_add.call_args.args
+                self.assertEqual(window._background_complete, callback)
+                delivery(callback, *arguments)
+                window._background_complete.assert_called_once_with(result or "默认成功提示", False)
 
     def test_background_timer_updates_elapsed_time_and_is_removed_after_completion(self):
         window = mock.Mock()
@@ -2533,7 +2541,11 @@ class DownloadChangelogTest(unittest.TestCase):
                     MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
                     self.window.repository.download_changelog.assert_not_called()
                     thread.call_args.kwargs["target"]()
-                idle_add.assert_called_once_with(self.window._background_failed, str(error))
+                idle_add.assert_called_once()
+                delivery, callback, *arguments = idle_add.call_args.args
+                self.assertEqual(self.window._background_failed, callback)
+                delivery(callback, *arguments)
+                self.window._background_failed.assert_called_with(str(error))
                 self.window.repository.download_changelog.reset_mock()
                 self.assertFalse(self.destination.exists())
 
@@ -2677,19 +2689,30 @@ class BranchPresentationTest(unittest.TestCase):
         self.assertTrue(rows["branch:feature"][3])
         self.assertFalse(rows["branch:main"][3])
 
-    def test_delete_branch_selection_starts_backend_delete_without_confirmation(self):
+        repository.current_branch.return_value = "main"
+        repository.local_branches.return_value = [MODULE.BranchInfo("main", "local", "main-oid", True)]
+        window.remote_branch_choices = [MODULE.BranchInfo("feature", "remote", "remote-feature")]
+        window._refresh_branch_choices()
+        self.assertTrue(window.delete_branch_button.get_sensitive())
+        self.assertEqual("feature（origin）", window.branch_choices["branch:feature"].label)
+        window.remote_branch_choices = []
+        window._refresh_branch_choices()
+        self.assertFalse(window.delete_branch_button.get_sensitive())
+
+    def test_delete_branch_selection_checks_origin_in_background(self):
         window = mock.Mock()
         window.repository = mock.Mock()
+        window.repository.local_branches.return_value = [MODULE.BranchInfo("retreat_teb", "local", "a" * 40)]
+        window.remote_branch_choices = []
         window.busy = False
-        window._choose_development_branch.return_value = "retreat_teb"
-
-        MODULE.VersionManagerWindow.on_delete_branch(window, None)
-
-        busy, operation, success = window.run_background.call_args.args
-        self.assertEqual("正在删除分支…", busy)
-        self.assertEqual("分支已删除。", success)
+        with mock.patch.object(MODULE.Gtk, "Dialog") as factory, mock.patch.object(MODULE.Gtk, "ComboBoxText") as combo:
+            factory.return_value.run.return_value = MODULE.Gtk.ResponseType.OK
+            combo.return_value.get_active_id.return_value = "retreat_teb"
+            MODULE.VersionManagerWindow.on_delete_branch(window, None)
+        operation = window.run_background.call_args.args[1]
         operation()
-        window.repository.delete_branch.assert_called_once_with("retreat_teb")
+        window.repository.plan_branch_deletion.assert_called_once_with("retreat_teb")
+        window.repository.delete_branch.assert_not_called()
 
     def test_inherited_formal_release_is_marked_read_only(self):
         temp = tempfile.TemporaryDirectory()
