@@ -57,6 +57,7 @@
 - 用户 settings.ini 中 `[repository] path` 记录上次工作空间，`[recent_workspaces] paths` 保存 JSON 数组；路径会展开、去重并过滤不存在目录。删除最近记录只改列表，不删除工作空间或改写上次启动路径。
 - 对比工具默认 Beyond Compare，通过“设置”保存到仓库本地配置；只接受预设 Beyond Compare、Meld、KDiff3。GitHub 创建入口仅打开网页，默认建议私有仓库，不代用户创建或授权远程。
 - SSH 公钥辅助只读取有效普通 `.pub` 文件，拒绝符号链接；生成 Ed25519 密钥在临时目录完成，再以不覆盖方式发布成对文件。不得记录私钥或口令。
+- 公钥窗口的发现、复制和生成成功提示均按所选 GitHub/GitLab 服务商显示；选择 `.pub` 仅控制展示和复制，不设置 SSH 默认身份。首次主机信任由用户核对官方或实例管理员公布的指纹，软件不自动信任或关闭主机校验。
 - 主窗口拖放只接受单个 `file:` URI 对应的本地目录；文件、多项、非本地 URI 或 busy 状态必须拒绝并调用 `Gtk.drag_finish()`，不切换工作空间。
 - “Git 账号”的服务商和 GitLab HTTPS 主机按当前仓库保存；旧配置通过 GitHub/GitLab.com origin 推断。更改服务商只改变建议、创建页和公钥设置入口，不得自动改写 origin；远程认证错误按实际远程主机和已配置 GitLab 主机判断。
 - 版本清单按完整标签名分层存为 `versions/<tag>.manifest`；beta 路径包含 `branches/<编码分支名>/...`。标签对象更新后只失效受影响清单，避免继续使用旧清单。
@@ -190,6 +191,7 @@
 - 高级“整仓覆盖”保留旧功能：全部受管分支和版本标签以所选来源为准，来源独有项新增，目标独有项删除。必须有有效 main，展示完整覆盖清单，不与日常按钮共用隐含的整仓默认值。
 - 仅管理 `refs/heads/*`、可解析版本标签及上述版本备注引用；非版本标签、其他 notes、其他 remote、stash、恢复引用均不参与覆盖。禁止 `git push --mirror` 或无范围的引用删除。
 - origin 用非交互 SSH。连接/权限检查 120 秒，传输默认 900 秒，可在仓库本地配置为 60–3600 秒。推送使用 `--atomic`、逐引用精确 `--force-with-lease`，refspec 不得带 `+`；不支持原子更新的服务端直接报错，不退回逐项修改。
+- `_run_remote()` 仅在默认 SSH 明确报告连接阶段 `Network is unreachable` 时，对同一命令使用 IPv4 重试一次，保留原子推送、精确租约、agent 和主机校验；不修改用户 SSH 配置，不改写自定义 `GIT_SSH_COMMAND`。超时、认证、主机校验和权限错误不自动重试。GitLab 受保护分支拒绝强制推送时提供分支规则及账号权限指引，不自动修改远程规则；dry-run 通过不保证实际覆盖获准。排查步骤统一放在 INSTALL 常见问题。
 - 本地引用通过带旧 OID 的 `update-ref --stdin` 事务更新。下载当前分支时，其他本地分支及 tracking、基线缓存和 manifest 保持原值；返回 main 时仅验证其 OID，不将远程 main 写入。
 - “覆盖本地”先记录忽略文件冲突，再 stash 暂存、未暂存和未跟踪文件；可能被覆盖的忽略文件移至恢复目录。恢复使用 `stash apply --index`，冲突不删除恢复点。只检查本次会更新或检出的分支是否被其他 worktree 占用。
 - 覆盖前备份目标范围的引用、配置、manifest 和内部 CHANGELOG。远程只传 Git 对象和引用，不传 manifest；缺 manifest 的版本从完整 Git 树导出并重建内部 CHANGELOG。

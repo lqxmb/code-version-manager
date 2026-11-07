@@ -1219,16 +1219,30 @@ class GitRepository:
             "SSH_ASKPASS_REQUIRE": "never",
             "LC_ALL": "C",
         })
+        default_ssh = "GIT_SSH_COMMAND" not in environment
         environment.setdefault("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=15")
+        network_unreachable = re.compile(
+            r"^ssh: connect to host [^\r\n]+ port [0-9]+: Network is unreachable\s*$",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        ipv4_retried = False
         try:
-            result = run_remote_process(
-                ["git", "-C", str(self.path), *args],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=environment,
-                timeout=timeout,
-            )
+            for attempt in range(2):
+                result = run_remote_process(
+                    ["git", "-C", str(self.path), *args],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=environment,
+                    timeout=timeout,
+                )
+                if (result.returncode == 0 or attempt or not default_ssh
+                        or Path(remote_url).is_absolute()
+                        or not network_unreachable.search(result.stderr or result.stdout)):
+                    break
+                # SSH failed before connecting. Keep the same Git arguments and leases.
+                environment = dict(environment, GIT_SSH_COMMAND="ssh -4 -oBatchMode=yes -oConnectTimeout=15")
+                ipv4_retried = True
         except subprocess.TimeoutExpired as error:
             output = error.stderr or error.stdout or ""
             if isinstance(output, bytes):
@@ -1257,6 +1271,18 @@ class GitRepository:
             )
             if re.search(r"(?:connection|operation|connect) timed out|connection timeout", message, re.IGNORECASE):
                 raise RemoteTimeoutError("远程连接或传输超时，结果待确认。\n" + message)
+            if network_unreachable.search(message):
+                detail = (
+                    "已使用 IPv4 自动重试一次，仍未连接成功。" if ipv4_retried else
+                    "已设置自定义 GIT_SSH_COMMAND，程序保留原命令，未自动重试。" if not default_ssh else
+                    "请检查远程连接所使用的网络配置。"
+                )
+                raise GitError(
+                    "SSH 网络不可达。" + detail + "\n"
+                    "请检查网络、路由、代理或 VPN；可在终端保留当前 SSH 配置，添加 -4 诊断 IPv4 连接。"
+                    "详细步骤见 INSTALL 的“SSH 网络不可达”章节。\n"
+                    "本地提交和版本标签均已保留，无需重新发布。\n\nGit 原始错误：\n" + message
+                )
             try:
                 gitlab_host = self.gitlab_host()
             except (AttributeError, GitError, TypeError):
@@ -1296,6 +1322,18 @@ class GitRepository:
                         f"尚未建立可信的 GitLab（{ssh_host}）SSH 主机连接。请核对实例管理员公布的主机指纹；"
                         "不要关闭主机密钥检查。\n本地提交和版本标签均已保留。\n\nGit 原始错误：\n" + message
                     )
+                if re.search(r"not allowed to force push(?: code)? to a\s+protected branch", message, re.IGNORECASE):
+                    raise GitError(
+                        f"GitLab（{ssh_host}）拒绝强制覆盖受保护分支。SSH 连接和身份认证已通过，"
+                        "但目标分支的保护规则不允许此次历史覆盖。\n"
+                        "请打开项目 Settings → Repository → Branch rules（分支规则）或 "
+                        "Protected branches（受保护分支），检查目标分支（如 main）的规则及当前账号推送权限。\n"
+                        "仅在确认以本地替换远程历史时，由有权限的用户临时开启 Allow force push（允许强制推送）；"
+                        "覆盖完成后可关闭。需要保留远程历史时应先整合，程序不会更改服务器保护规则。\n"
+                        "“保存并验证连接”的推送预检查不能保证实际覆盖获准。"
+                        "处理后点击“刷新”，重新核对差异再执行“覆盖远程”。\n"
+                        "本地提交和版本标签均已保留，无需再次发布。\n\nGit 原始错误：\n" + message
+                    )
                 if re.search(r"permission to .+ denied to|not allowed to push|You are not allowed to push", message, re.IGNORECASE):
                     raise GitError(
                         f"GitLab（{ssh_host}）拒绝当前账号写入仓库。请检查项目成员权限及分支保护规则。\n"
@@ -1318,7 +1356,10 @@ class GitRepository:
         if status.state == "pending" and not status.remote_changes:
             raise GitError(status.remote_message or status.message)
         if status.can_sync_remote:
-            return "远程可读取，推送预检查通过，当前分支和所属版本标签覆盖预检查通过，未上传版本。"
+            return (
+                "远程可读取，推送预检查通过，当前分支和所属版本标签覆盖预检查通过，未上传版本。"
+                "服务器分支保护等规则仍可能在实际推送时拒绝覆盖。"
+            )
         if not status.remote_changes:
             return "远程可读取；当前分支和所属版本标签已一致，当前无需上传。"
         if status.remote_changes:
@@ -6470,7 +6511,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             copy_button.set_sensitive(bool(keys))
             selector.set_sensitive(bool(keys))
             status.set_text(
-                "已找到本机公钥，可直接复制并添加到 GitHub。" if keys else
+                f"已找到本机 .pub 公钥，可直接复制并添加到 {provider_label} 账号。" if keys else
                 "未找到可用的 .pub 公钥。请在上方填写邮箱，点击“生成新的 SSH 密钥”。"
             )
 
@@ -6480,7 +6521,10 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
                 clipboard.set_text(public, -1)
                 clipboard.store()
-                status.set_text("公钥已复制。请打开 GitHub 添加页面，选择 Authentication Key 并粘贴保存。")
+                status.set_text(
+                    f"公钥已复制。请打开 {provider_label} 的 SSH 公钥设置页面，"
+                    "将完整公钥添加到账号并保存，用途需包含身份验证。"
+                )
 
         def finish_generation(path: Optional[Path], error: Optional[str], encrypted: bool = False) -> bool:
             dialog.set_deletable(True)
@@ -6495,7 +6539,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             reload_keys(str(path) + ".pub")
             message = (
                 f"密钥已生成，公钥：{path}.pub\n"
-                "请复制下方公钥并添加到 GitHub，再返回验证连接。"
+                f"请复制下方 .pub 公钥并添加到 {provider_label} 账号，再返回验证连接。"
             )
             if path.name != "id_ed25519" or encrypted:
                 message += "\n使用前请在终端执行：ssh-add " + shlex.quote(str(path))

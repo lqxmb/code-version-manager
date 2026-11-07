@@ -108,6 +108,137 @@ class GitProviderTest(unittest.TestCase):
         self.assertIn("GitLab SSH 公钥设置", str(raised.exception))
 
 
+class RemoteSSHRecoveryTest(unittest.TestCase):
+    def setUp(self):
+        environment = mock.patch.dict(MODULE.os.environ, {"SSH_AUTH_SOCK": "/temporary/agent"}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.repository = mock.Mock(path=Path("/temporary/workspace"))
+        self.repository.gitlab_host.return_value = "https://gitlab.example.org"
+        self.repository.push_timeout_seconds.return_value = MODULE.PUSH_TIMEOUT
+        self.remote = "git@gitlab.example.org:group/repo.git"
+        self.unreachable = subprocess.CompletedProcess(
+            [], 128, stdout="",
+            stderr="ssh: connect to host gitlab.example.org port 22: Network is unreachable\n"
+                   "fatal: Could not read from remote repository.\n",
+        )
+
+    def run_remote(self, args):
+        return MODULE.GitRepository._run_remote(self.repository, args, self.remote)
+
+    def test_network_unreachable_retries_same_read_fetch_and_atomic_push_using_ipv4(self):
+        commands = (
+            ["ls-remote", "--", self.remote],
+            ["fetch", "--no-tags", self.remote, "refs/heads/main"],
+            ["push", "--atomic", "--dry-run", "--no-verify", "origin", "main"],
+            ["push", "--atomic", "--force-with-lease=refs/heads/main:" + "b" * 40,
+             "origin", "a" * 40 + ":refs/heads/main"],
+        )
+        success = subprocess.CompletedProcess([], 0, stdout="remote result", stderr="")
+        for args in commands:
+            with self.subTest(operation=args[0]), \
+                    mock.patch.object(MODULE, "run_remote_process", side_effect=[self.unreachable, success]) as run:
+                self.assertEqual("remote result", self.run_remote(args))
+            self.assertEqual(2, run.call_count)
+            first, second = run.call_args_list
+            self.assertEqual(["git", "-C", str(self.repository.path), *args], first.args[0])
+            self.assertEqual(first.args, second.args)
+            first_env, second_env = first.kwargs["env"], second.kwargs["env"]
+            self.assertEqual("ssh -oBatchMode=yes -oConnectTimeout=15", first_env["GIT_SSH_COMMAND"])
+            self.assertEqual("ssh -4 -oBatchMode=yes -oConnectTimeout=15", second_env["GIT_SSH_COMMAND"])
+            self.assertEqual(first_env, dict(second_env, GIT_SSH_COMMAND=first_env["GIT_SSH_COMMAND"]))
+            self.assertEqual("/temporary/agent", second_env["SSH_AUTH_SOCK"])
+            self.assertEqual("never", second_env["SSH_ASKPASS_REQUIRE"])
+            self.assertNotIn("GIT_SSH_COMMAND", MODULE.os.environ)
+            expected_timeout = MODULE.REMOTE_TIMEOUT if args[0] == "ls-remote" or "--dry-run" in args else MODULE.PUSH_TIMEOUT
+            self.assertEqual(expected_timeout, first.kwargs["timeout"])
+            self.assertEqual(first.kwargs["timeout"], second.kwargs["timeout"])
+
+    def test_ipv4_failure_stops_after_one_retry_and_explains_network_problem(self):
+        with mock.patch.object(MODULE, "run_remote_process", return_value=self.unreachable) as run:
+            with self.assertRaises(MODULE.GitError) as raised:
+                self.run_remote(["ls-remote", self.remote])
+        self.assertEqual(2, run.call_count)
+        self.assertIn("IPv4 自动重试一次", str(raised.exception))
+        self.assertIn("SSH 网络不可达", str(raised.exception))
+        self.assertIn("本地提交和版本标签均已保留", str(raised.exception))
+        self.assertIn(self.unreachable.stderr.strip(), str(raised.exception))
+
+    def test_ipv4_retry_still_reports_host_verification_and_authentication_failures(self):
+        for error in ("Host key verification failed.", "Permission denied (publickey)."):
+            failed = subprocess.CompletedProcess([], 128, stdout="", stderr=error)
+            with self.subTest(error=error), \
+                    mock.patch.object(MODULE, "run_remote_process", side_effect=[self.unreachable, failed]) as run:
+                with self.assertRaises(MODULE.GitError) as raised:
+                    self.run_remote(["ls-remote", self.remote])
+            self.assertEqual(2, run.call_count)
+            self.assertIn(error, str(raised.exception))
+            self.assertNotIn("SSH 网络不可达", str(raised.exception))
+
+    def test_other_errors_do_not_trigger_retry(self):
+        for error in (
+            "Host key verification failed.",
+            "Permission denied (publickey).",
+            "GitLab: You are not allowed to force push code to a protected branch on this project.",
+            "ssh: connect to host gitlab.example.org port 22: Connection timed out",
+            "remote: Network is unreachable",
+            "remote: ssh: connect to host another.example.org port 22: Network is unreachable",
+            "Network is unreachable",
+        ):
+            failed = subprocess.CompletedProcess([], 128, stdout="", stderr=error)
+            with self.subTest(error=error), mock.patch.object(MODULE, "run_remote_process", return_value=failed) as run:
+                with self.assertRaises(MODULE.GitError):
+                    self.run_remote(["ls-remote", self.remote])
+            run.assert_called_once()
+
+    def test_custom_ssh_command_is_preserved_without_retry(self):
+        custom_command = "ssh -F /custom/config -p 2222"
+        with mock.patch.dict(MODULE.os.environ, {"GIT_SSH_COMMAND": custom_command}), \
+                mock.patch.object(MODULE, "run_remote_process", return_value=self.unreachable) as run:
+            with self.assertRaises(MODULE.GitError) as raised:
+                self.run_remote(["ls-remote", self.remote])
+            self.assertEqual(custom_command, MODULE.os.environ["GIT_SSH_COMMAND"])
+        run.assert_called_once()
+        self.assertEqual(custom_command, run.call_args.kwargs["env"]["GIT_SSH_COMMAND"])
+        self.assertIn("自定义 GIT_SSH_COMMAND", str(raised.exception))
+        self.assertIn("未自动重试", str(raised.exception))
+        self.assertIn("添加 -4", str(raised.exception))
+
+    def test_local_remote_does_not_trigger_ssh_retry(self):
+        with mock.patch.object(MODULE, "run_remote_process", return_value=self.unreachable) as run:
+            with self.assertRaises(MODULE.GitError):
+                MODULE.GitRepository._run_remote(self.repository, ["ls-remote", "/temporary/origin.git"],
+                                                 "/temporary/origin.git")
+        run.assert_called_once()
+
+    def test_success_does_not_trigger_retry(self):
+        success = subprocess.CompletedProcess([], 0, stdout="remote result", stderr="")
+        with mock.patch.object(MODULE, "run_remote_process", return_value=success) as run:
+            self.assertEqual("remote result", self.run_remote(["ls-remote", self.remote]))
+        run.assert_called_once()
+
+    def test_timeout_on_ipv4_retry_uses_existing_timeout_handling(self):
+        timeout = subprocess.TimeoutExpired("git", MODULE.PUSH_TIMEOUT, stderr="retry timed out")
+        with mock.patch.object(MODULE, "run_remote_process", side_effect=[self.unreachable, timeout]) as run:
+            with self.assertRaises(MODULE.RemoteTimeoutError) as raised:
+                self.run_remote(["push", "--atomic", "origin", "main"])
+        self.assertEqual(2, run.call_count)
+        self.assertIn("远程是否已经接收更新", str(raised.exception))
+        self.assertIn("retry timed out", str(raised.exception))
+
+    def test_gitlab_force_push_rejection_offers_branch_rules_and_keeps_original_error(self):
+        raw = "remote: GitLab: You are not allowed to force push code to a protected branch on this project."
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr=raw)
+        with mock.patch.object(MODULE, "run_remote_process", return_value=failed) as run:
+            with self.assertRaises(MODULE.GitError) as raised:
+                self.run_remote(["push", "--atomic", "origin", "main"])
+        run.assert_called_once()
+        message = str(raised.exception)
+        for expected in ("GitLab（gitlab.example.org）", "受保护分支", "main", "Branch rules",
+                         "账号推送权限", "Allow force push", "预检查不能保证", "无需再次发布", raw):
+            self.assertIn(expected, message)
+
+
 class WorkspaceDropTest(unittest.TestCase):
     def setUp(self):
         if not MODULE.Gtk.init_check()[0]:
@@ -195,6 +326,53 @@ class WorkspaceDropTest(unittest.TestCase):
                 "https://gitlab.example.org",
             )
 
+    def test_public_key_discovery_copy_and_generation_use_selected_provider(self):
+        existing = str(self.root / "id_ed25519.pub")
+        generated = self.root / "id_ed25519_cvm_1"
+        public_keys = {
+            existing: "ssh-ed25519 AAAA test@example.com",
+            str(generated) + ".pub": "ssh-ed25519 BBBB test@example.com",
+        }
+        for provider, label, other in ((MODULE.GIT_PROVIDER_GITHUB, "GitHub", "GitLab"),
+                                       (MODULE.GIT_PROVIDER_GITLAB, "GitLab", "GitHub")):
+            def interact(dialog):
+                self.addCleanup(dialog.destroy)
+                controls = list(self.walk(dialog))
+
+                def displayed_text():
+                    return "\n".join(item.get_text() for item in controls if isinstance(item, MODULE.Gtk.Label))
+
+                self.assertIn(f"添加到 {label} 账号", displayed_text())
+                self.assertNotIn(other, displayed_text())
+                buttons = [item for item in controls if isinstance(item, MODULE.Gtk.Button)]
+                copy = next(item for item in buttons if item.get_label() == "复制所选公钥")
+                generate = next(item for item in buttons if item.get_label() == "生成新的 SSH 密钥")
+                copy.clicked()
+                clipboard.set_text.assert_called_once_with(public_keys[existing], -1)
+                self.assertIn(f"请打开 {label} 的 SSH 公钥设置页面", displayed_text())
+                self.assertNotIn(other, displayed_text())
+                generate.clicked()
+                self.assertIn(f".pub 公钥并添加到 {label} 账号", displayed_text())
+                self.assertIn("ssh-add " + str(generated), displayed_text())
+                self.assertNotIn(other, displayed_text())
+                selector = next(item for item in controls if isinstance(item, MODULE.Gtk.ComboBoxText))
+                self.assertEqual(str(generated) + ".pub", selector.get_active_id())
+                return MODULE.Gtk.ResponseType.CLOSE
+
+            def immediate_thread(*, target, daemon):
+                return mock.Mock(start=target)
+
+            with self.subTest(provider=provider), \
+                    mock.patch.object(MODULE, "ssh_public_keys", return_value=public_keys), \
+                    mock.patch.object(MODULE, "generate_ssh_key", return_value=generated) as generate_key, \
+                    mock.patch.object(MODULE.Gtk.Clipboard, "get") as get_clipboard, \
+                    mock.patch.object(MODULE.Gtk.Dialog, "run", new=interact), \
+                    mock.patch.object(MODULE.threading, "Thread", side_effect=immediate_thread), \
+                    mock.patch.object(MODULE.GLib, "idle_add", side_effect=lambda callback, *args: callback(*args)):
+                clipboard = get_clipboard.return_value
+                self.window.show_ssh_public_keys(self.window, "test@example.com", provider)
+                generate_key.assert_called_once_with("test@example.com", "")
+
     @staticmethod
     def walk(widget):
         yield widget
@@ -251,4 +429,3 @@ class WorkspaceDropTest(unittest.TestCase):
         self.assertEqual(origin, repository.remote_url())
         self.assertEqual(MODULE.GIT_PROVIDER_GITLAB, repository.git_provider())
         self.assertEqual("https://gitlab.example.org", repository.gitlab_host())
-

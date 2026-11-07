@@ -134,11 +134,83 @@ sudo apt install ./dist/code-version-manager_$(cat VERSION)_all.deb
 ### 远程失败或超时
 
 - Permission denied (publickey)：核对公钥所属账号、授权和 SSH agent。
-- Host key verification failed：在终端连接并核对官方指纹。
-- 无写权限或服务器拒绝：检查仓库权限、分支保护和组织授权。
+- Host key verification failed：按下方“首次连接提示主机验证失败”核对并信任主机。
+- Network is unreachable：按下方“SSH 网络不可达”检查路由及 IPv4 连接。
+- You are not allowed to force push code to a protected branch：按下方“GitLab 拒绝覆盖受保护分支”检查目标分支规则。
+- 其他无写权限或服务器拒绝：检查仓库权限、分支保护和组织授权。
 - 不支持原子推送：必须使用支持原子更新的 Git 服务，程序不会退回逐项覆盖。
 
 读取/权限预检查 120 秒；传输默认 900 秒，可在 Git 账号高级设置改为 60–3600 秒。同步超时保留本地版本，远程可能已接收更新；修复网络后刷新核对，不要重复发布同一版本。
+
+### SSH 公钥和私钥如何选择
+
+生成一次 SSH 密钥会得到两个配套文件：
+
+| 文件示例 | 用途 |
+| --- | --- |
+| `~/.ssh/id_ed25519.pub` | 公钥，将完整的一行内容添加到 GitHub 或 GitLab 账号的 SSH Keys 页面 |
+| `~/.ssh/id_ed25519` | 私钥，保留在本机，不粘贴到网站、不上传或发送 |
+
+`ed25519` 是密钥算法名称，两家服务均支持。已有同名文件时，软件使用 `id_ed25519_cvm_1`、`id_ed25519_cvm_2` 等名称，分别配套相同名称的 `.pub` 文件；编号用于避免覆盖，不表示优先级。每次生成都是不同的密钥对，不需要为每个仓库重复生成。同一公钥可以分别添加到 GitHub 和 GitLab；末尾邮箱只是备注，不决定登录账号。
+
+公钥窗口的下拉框只选择显示和复制哪个 `.pub`，不会设置 SSH 默认使用的密钥。使用自定义文件名或加密私钥时，可按窗口提示执行，例如：
+
+```bash
+ssh-add ~/.ssh/id_ed25519_cvm_1
+```
+
+`ssh-add` 在本机加载对应私钥，不会上传它；重启或切换会话后是否需要再次加载取决于 SSH agent 和系统密钥环设置。若提示 `Permission denied (publickey)`，检查网站保存的公钥与本机已加载的私钥是否配套、密钥所属账号是否有目标仓库权限。
+
+### 首次连接提示主机验证失败
+
+`Host key verification failed` 表示 SSH 未通过服务器的主机身份校验，可能尚未信任该主机，也可能已有记录与服务器不符。将自己的公钥添加到平台账号，只解决平台如何验证你的身份；本机还需要确认服务器身份，两者独立。软件后台不交互确认主机指纹。
+
+使用运行软件的同一个用户，在终端连接实际远程主机，不要加 `sudo`：
+
+```bash
+ssh -T git@github.com
+# GitLab.com 使用下面的命令；不必为两个平台都执行
+ssh -T git@gitlab.com
+```
+
+自建 GitLab 替换为实际 SSH 主机；自定义用户或端口时使用对应用户及 `-p 端口`。首次显示的指纹属于服务器，应与 [GitHub 官方指纹](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)、[GitLab.com 官方指纹](https://docs.gitlab.com/user/gitlab_com/#ssh-host-keys-fingerprints)或自建实例管理员公布的指纹核对，一致后才输入 `yes`。主机记录保存在当前用户的 `~/.ssh/known_hosts`；信任 GitHub 不会同时信任 GitLab，同一主机上的新仓库通常无需重复确认。
+
+看到平台的身份验证成功信息后，返回软件“保存并验证连接”。如果提示主机密钥已更改，先向服务商或管理员核实原因，不直接删除记录或关闭主机密钥检查；如果随后提示 `Permission denied (publickey)`，继续排查账号公钥和 SSH agent。
+
+### SSH 网络不可达
+
+`ssh: connect to host ... port ...: Network is unreachable` 是连接阶段的网络错误，尚未进入主机指纹或账号密钥验证。常见情况是域名有 IPv6 地址，但当前网络没有 IPv6 路由；也可能是其他路由或代理问题，不能仅凭该错误确定原因。
+
+使用软件默认 SSH 命令时，只有遇到上述明确错误才对同一操作使用 IPv4 自动重试一次，不修改 `~/.ssh/config`，继续保留主机指纹校验。认证失败、主机验证失败、权限拒绝及超时不触发这次重试。若设置了自定义 `GIT_SSH_COMMAND`，软件保持原命令并给出诊断提示。
+
+可在终端手动验证 IPv4，例如：
+
+```bash
+ssh -4 -T git@gitlab.com
+```
+
+GitHub 或自建实例请替换为对应主机，自定义 SSH 配置、用户和端口应保留。若 IPv4 可以连接而普通命令不能连接，可在已有 `~/.ssh/config` 中补充或调整对应主机配置，保留其他内容：
+
+```sshconfig
+Host gitlab.com
+    AddressFamily inet
+```
+
+IPv4 仍不通时检查网络连接、路由、防火墙、代理或 VPN。网页可打开不代表 SSH 端口可达；无需因此重新生成密钥或重新发布版本。连接恢复后，按上一节核对主机指纹，再返回软件刷新。
+
+### GitLab 拒绝覆盖受保护分支
+
+`You are not allowed to force push code to a protected branch` 表示连接和身份认证已通过，但 GitLab 拒绝覆盖目标分支的历史。常见情形是远程创建时初始化了 README，本地又独立初始化仓库，两端没有共同历史；“覆盖远程”以本地为准替换远程历史，可能需要强制推送。普通快进上传不一定需要允许强制推送。
+
+如果确定要以本地历史替换远程，由有权限的用户执行：
+
+1. 打开 GitLab 项目 **Settings → Repository → Branch rules**，或旧版的 **Protected branches**。
+2. 检查实际目标分支（例如 `main`）的保护规则，以及当前密钥所属账号的推送权限。
+3. 在确认覆盖影响后临时启用 **Allow force push**，回软件点击“刷新”，重新核对差异并执行“覆盖远程”；完成后可关闭该选项。没有设置入口时请联系项目维护者或管理员。
+
+需要保留远程历史时应先整合两端历史，不能直接覆盖。软件不会代为调整服务器保护规则，也不会自动合并。组织策略仍可能限制可修改的规则。
+
+“保存并验证连接”使用推送 dry-run，不能保证服务端在实际推送时放行所有分支保护或钩子。日志中的 `Writing objects: 100%` 仅表示对象已传输，不代表引用更新成功；以最终结果及刷新后的两端状态为准，本地版本不需要重复发布。
 
 ### 恢复点在哪里
 

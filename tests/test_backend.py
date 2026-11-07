@@ -2013,7 +2013,7 @@ class RemoteRepositoryTest(unittest.TestCase):
     def test_sync_rejects_detached_head(self):
         self.configure()
         self.repository.run(["switch", "--detach", "v0.0.1"])
-        with self.assertRaisesRegex(MODULE.GitError, "查看历史版本时不能同步"):
+        with self.assertRaisesRegex(MODULE.GitError, "查看历史版本.*请先返回工作分支"):
             self.repository.sync_remote()
         self.assertEqual("", self.git(self.remote, "for-each-ref"))
 
