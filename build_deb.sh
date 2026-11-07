@@ -34,6 +34,7 @@ install -m 0644 "$project_dir/data/code-version-manager.svg" \
     "$stage/usr/share/icons/hicolor/scalable/apps/code-version-manager.svg"
 install -m 0644 "$project_dir/README.md" "$stage/usr/share/doc/$package_name/README.md"
 install -m 0644 "$project_dir/INSTALL.md" "$stage/usr/share/doc/$package_name/INSTALL.md"
+install -m 0644 "$project_dir/HELP.md" "$stage/usr/share/doc/$package_name/HELP.md"
 install -m 0755 "$project_dir/data/code-version-manager" \
     "$stage/usr/bin/code-version-manager"
 

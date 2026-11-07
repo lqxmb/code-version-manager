@@ -13,16 +13,28 @@
 | `tests/test_merge_comparison.py` | 手动合并隔离副本、忽略规则、提交及取消测试 |
 | `tests/test_version_deletion.py` | 末尾版本撤回、暂存保护、固定基线、确认快照、恢复及 GTK 删除回调测试 |
 | `tests/test_recovery_cleanup.py` | 恢复文件清理、stash 保护、文件安全、并发变化、失败报告及 GTK 清理回调测试 |
-| `tests/test_ui_layout.py` | 工具栏顺序、最近两项选择、动态比较、独立日志、窗口尺寸记忆及忙碌状态回归 |
+| `tests/test_ui_layout.py` | 工具栏顺序、帮助按钮与文档路径、最近两项选择、动态比较、独立日志、窗口尺寸记忆及忙碌状态回归 |
 | `tests/test_version_remarks.py` | 独立版本备注、编辑快照、定向同步、分支隔离、删除恢复及 GTK 备注入口 |
 | `tests/test_provider_and_drop.py` | 工作空间文件夹拖放、GitHub/GitLab 地址与主机校验、仓库隔离配置及 GTK 服务商切换 |
 | `tests/verify_workspace_copy.py` | 仅在工作区隔离副本和临时远程中验证，不改来源和真实 origin |
-| `README.md` / `INSTALL.md` | 用户说明与 Ubuntu 安装、故障排查 |
+| `HELP.md` | 软件使用者帮助：界面操作、版本管理、同步、SSH、恢复和常见问题 |
+| `INSTALL.md` | 安装、升级、启动、卸载和安装故障排查 |
+| `README.md` | 项目开发、源码运行、测试、隔离验证和 Debian 打包 |
 | `README_ai.md`（若存在） | 历史讨论，不作为当前业务规则依据 |
 | `VERSION` | 软件发行版本，与受管理工作空间的 Git 版本无关 |
 | `data/`、`debian/`、`build_deb.sh` | 图标、启动器、Beyond Compare 配置、`workspace.gitignore` 默认工作区模板及 Debian 打包 |
 
-入口为 `main()`，应用 ID 为 `cn.local.CodeVersionManager`。安装启动器 `/usr/bin/code-version-manager` 加载 `/usr/lib/code-version-manager/code_version_manager.py`。启动工作空间依次读取 `CODE_VERSION_MANAGER_REPOSITORY`、GTK 用户配置 `code-version-manager/settings.ini`、`~/catkin_ws`。最近工作空间最多保存 10 个。GTK 初始化、窗口、对话框及主线程事件回调均位于同一源码文件；后端操作由 `GitRepository` 负责。
+入口为 `main()`，应用 ID 为 `cn.local.CodeVersionManager`。安装启动器 `/usr/bin/code-version-manager` 加载 `/usr/lib/code-version-manager/code_version_manager.py`。启动工作空间依次读取 `CODE_VERSION_MANAGER_REPOSITORY`、GTK 用户配置 `code-version-manager/settings.ini`、`~/catkin_ws`。最近工作空间最多保存 10 个。GTK 初始化、窗口、对话框及主线程事件回调均位于同一源码文件；后端操作由 `GitRepository` 负责。标题栏“关于”旁的“帮助”按钮打开用户帮助文档：优先使用 `/usr/share/doc/code-version-manager/HELP.md`，源码运行时回退到项目根目录 `HELP.md`。
+
+## 文档职责与更新规则
+
+- `HELP.md` 是普通软件使用者的唯一应用操作帮助，说明界面、发布、分支、合并、版本删除、恢复、同步、SSH 和常见操作问题；不放构建、测试或开发者打包命令。
+- `INSTALL.md` 面向安装、升级和卸载软件的用户或运维人员，只记录系统依赖、预构建 deb 安装、启动、升级、卸载和安装故障排查；应用功能细节链接到 `HELP.md`。
+- `README.md` 面向项目开发者和维护者，记录项目简介、源码运行、测试、隔离工作区验证、构建 deb、打包结构和开发入口；不作为应用内帮助的唯一来源。
+- `AGENTS.md` 面向编程代理和维护者，保存详细业务规则、源码导航、存储边界、并发约束、测试边界和实现注意事项；不安装到用户 deb 文档目录。
+- `CHANGELOG.rst` 只记录版本变更；`VERSION` 只记录软件包版本。不要把用户工作空间的生成文件说明混入软件包版本文件。
+- 新增或修改用户可见行为时，先更新 `HELP.md`；涉及安装或升级时更新 `INSTALL.md`；涉及源码、测试或打包流程时更新 `README.md`；业务规则和实现约束同步更新本文件。避免在多个文件复制同一段操作说明。
+- `build_deb.sh` 将 `README.md`、`INSTALL.md` 和 `HELP.md` 安装到 `/usr/share/doc/code-version-manager/`；源码运行时帮助从项目根目录回退读取。帮助按钮使用系统默认程序打开 Markdown 文件，不在应用内嵌浏览器。
 
 所选目录必须是独立 Git 根目录。初始化用 `git init`，默认分支为 main。已管理仓库的 Git 身份、唯一 origin、服务商、自建 GitLab 主机、推送超时、比较工具和分支基线都保存在仓库本地配置。用户级 `code-version-manager/settings.ini` 另存 GitHub 账号、默认提交姓名和邮箱，作为新启用工作空间的默认值；打开已有仓库的“Git 账号”时，非空默认姓名和邮箱逐项预填，只有保存该窗口才写入仓库本地配置，单独保存设置不会修改已有仓库。应用元数据保存在实际 Git 目录下 `code-version-manager/`，不进入用户工作树或远程同步。
 
@@ -232,7 +244,7 @@
 - `legacy_test_*` 是历史流程用例，不会被 unittest 自动发现，不作为当前合并规则或验证通过的依据；新增用例应使用 `test_*`。配置相关测试应指向临时 settings.ini，避免依赖实际用户设置。
 - 测试通过 `importlib.util.spec_from_file_location()` 直接加载单文件源码，各测试模块可拥有独立的 `MODULE`；mock 要作用于被测模块，不能假定所有用例共享一次导入。补丁生命周期须覆盖 GTK 销毁及延迟定时器，防止尺寸保存写入真实用户配置。
 - 常规验证运行完整 unittest、源码 `py_compile` 和 `git diff --check`。实仓验证必须先复制 Git 数据与元数据，不得对来源目录或真实 origin 执行覆盖。
-- `VERSION`（项目根目录）是 Debian 软件包版本；`<工作空间>/VERSION` 是被管理仓库的本地生成标签显示号，两者不能混用。`build_deb.sh` 从项目根 VERSION 命名 deb 并复制源码、README、INSTALL、图标、桌面入口、Beyond Compare 默认会话及 `data/workspace.gitignore`。模板安装到 `/usr/lib/code-version-manager/workspace.gitignore`，可在打包前直接修改，不改 Python 源码。
+- `VERSION`（项目根目录）是 Debian 软件包版本；`<工作空间>/VERSION` 是被管理仓库的本地生成标签显示号，两者不能混用。`build_deb.sh` 从项目根 VERSION 命名 deb 并复制源码、README、INSTALL、HELP、图标、桌面入口、Beyond Compare 默认会话及 `data/workspace.gitignore`。模板安装到 `/usr/lib/code-version-manager/workspace.gitignore`，用户文档安装到 `/usr/share/doc/code-version-manager/`，可在打包前直接修改模板，不改 Python 源码。
 - Debian 入口为 `data/code-version-manager`，包控制文件为 `debian/control`，安装/卸载脚本只更新桌面数据库和图标缓存，不清理工作空间或用户配置。
 - `build_deb.sh` 使用 `dpkg-deb --root-owner-group` 生成 `Architecture: all` 包，当前版本的暂存目录为 `build/code-version-manager_<VERSION>_all/`，产物为 `dist/code-version-manager_<VERSION>_all.deb`。默认比较工具列为建议依赖；SVG 图标、桌面入口和启动脚本均来自 `data/`。
 - 兼容基线为 Git 2.25、Python 3.8、GTK 3；避免使用这些版本不支持的 Git 参数、Python 语法或 GTK API。
