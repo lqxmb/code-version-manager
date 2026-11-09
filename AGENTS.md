@@ -254,10 +254,13 @@
 
 ### 任意软件 GitHub Release 发布
 
-- 发布入口位于高级操作，主机固定 github.com，目标接受 owner/repo、仓库或 Releases HTTPS 链接。`GitRepository.release_repository()` 优先读取本地 `codeversionmanager.releaseRepository`，未配置时从明确 GitHub origin 预填，否则为空；`configure_release_repository()` 仅写该本地配置。有效目标在启动预检查时保存。窗口固定打开时的仓库实例与工作空间，不因主窗口切换改变目标或配置保存位置。发布器独立于源码 Git 操作，不读取或上传源码树和历史，不改变 origin。本软件自身更新源仍固定 lqxmb/code-version-manager。
+- 发布入口位于高级操作，主机固定 github.com，目标接受 owner/repo、仓库或 Releases HTTPS 链接。`GitRepository.release_repository()` 优先读取本地 `codeversionmanager.releaseRepository`，未配置时从明确 GitHub origin 预填，否则为空；`configure_release_repository()` 仅写该本地配置。有效目标在启动发布预检查或仓库创建结果确认后保存。窗口固定打开时的仓库实例与工作空间，不因主窗口切换改变目标或配置保存位置。发布器独立于源码 Git 操作，不读取或上传源码树和历史，不改变 origin。本软件自身更新源仍固定 lqxmb/code-version-manager。
 - gh 为建议依赖；浏览器授权通过系统终端运行 gh auth login --hostname github.com --web --git-protocol ssh --skip-ssh-key。不调用 auth token，不在应用配置、日志或命令行保存访问令牌，不输出 auth status 的原始内容。
+- 发布窗口初始化仅通过 `shutil.which()` 检查 gh 及受支持终端，不启动子进程或联网；终端检测与登录共用逻辑，依次使用 gnome-terminal、x-terminal-emulator。缺少任一依赖时，详情区立即显示具体缺项和可复制的 GitHub CLI 官方 Linux 安装说明完整地址；gh 缺失、版本过旧及终端缺失报错也使用源码统一的地址，不指引用户查阅 INSTALL.md。终端缺失另提示安装终端并保留手动登录命令，不阻止已有授权的检查登录和发布。
+- 目标输入框旁“创建发行仓库”只要求有效目标，不要求 deb。`preview_repository_creation()` 只读检查登录、CLI 创建能力及目标存在性；不可变 `SoftwareReleaseRepositoryCreationPlan` 固定仓库、账号和可见性，确认框默认公开且允许改为私有。`create_repository()` 复核账号与目标后，经现有 `_run()` 使用 `gh repo create <owner/repo> --public/--private` 创建空仓库，不传 source、push、clone 或初始化参数。当前账号及组织创建权限由 GitHub 校验；已有仓库停止创建，HTTP 404 明确说明“不存在或当前账号无权访问”，不将私有仓库不可访问当作确定不存在。
+- 创建请求结束、失败、取消或超时后，用新的取消事件只读核实目标及实际可见性，不重复发送创建请求；`SoftwareReleaseRepositoryCreationResult` 仅在已确认仓库可发布且可见性匹配时携带 target，否则报告结果待确认或实际差异及仓库链接，不删除已创建仓库。确认结果在后台保存到窗口绑定的工作空间，保存配置失败须保留远程结果并明确提示。GTK 保留已选 deb、标题和说明，创建后由用户主动点击“检查并发布”；README 初始化、标签及 Release 仍经原发布确认。
 - 后台准备任意有效包名及架构的普通 deb 私有副本及 SHA-256，`SoftwareReleaseBatch` 固定一批相同包名和版本、架构各异的包；附件为 `<包名>_<版本>_<架构>.deb` 及各自 `.sha256`。存在相邻校验文件时必须核对；任一准备失败清理该批临时副本。标签默认 v<Debian版本>，须通过 Git 引用校验，不能复用工作空间标签解析。
-- 不可变预检查固定目标仓库路径、ID、可见性、必要默认分支提交、已有标签对象及提交、整批附件、草稿、最新正式发行版、标题及说明。目标必须已存在并有写权限；空仓库确认后通过 contents API 创建仅说明发行用途的 README 和初始提交，缺少标签时在已确认的目标提交上创建引用，不改写已有标签。失败和取消保留已发生的初始化、标签和草稿，报告阶段及链接；预检查不写远程，执行及发布前重查目标与相关状态。
+- 不可变发布预检查固定目标仓库路径、ID、可见性、必要默认分支提交、已有标签对象及提交、整批附件、草稿、最新正式发行版、标题及说明。发布时目标必须已存在并有写权限；已有空仓库在发布确认后通过 contents API 创建仅说明发行用途的 README 和初始提交，缺少标签时在已确认的目标提交上创建引用，不改写已有标签。失败和取消保留已发生的初始化、标签和草稿，报告阶段及链接；预检查不写远程，执行及发布前重查目标与相关状态。
 - 先草稿后公开；只续传唯一同版本草稿，同名附件内容相同才复用，缺失则上传，额外或冲突附件拒绝。已公开版本禁止覆盖，正式新版必须高于当前最新版本。上传失败保留草稿，不删除或 clobber。公开请求失败后复查状态及最新接口，无法核实则报告结果待确认，不重复发送公开请求。
 - 公开目标额外通过匿名 HTTPS 检查该目标的最新正式发行、附件大小及精确下载地址，拒绝重定向到其他地址；私有目标仅使用 gh 授权核实并提示客户端下载需要授权。不得调用固定本软件更新源来核实其他软件的发行，不放宽本软件更新下载及安装的校验。
 - 发布/登录/准备在独立后台任务执行，GTK 回主线程，固定输入并支持取消；取消子进程时清理进程组。发布活动阻止应用退出和自身更新安装，取消或失败报告已完成阶段及草稿地址。测试仅模拟 gh 与临时文件，禁止创建真实测试 Release。

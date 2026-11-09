@@ -62,6 +62,8 @@ UPDATE_DOWNLOAD_RESPONSE = 101
 UPDATE_INSTALL_RESPONSE = 102
 UPDATE_CANCEL_RESPONSE = 103
 UPDATE_RESTART_RESPONSE = 104
+GITHUB_CLI_INSTALL_URL = "https://github.com/cli/cli/blob/trunk/docs/install_linux.md"
+GITHUB_CLI_INSTALL_HELP = f"GitHub CLI 官方 Linux 安装说明：\n{GITHUB_CLI_INSTALL_URL}"
 HELP_DOCUMENT_NAME = "HELP.md"
 HELP_DOCUMENT_SYSTEM_PATH = Path("/usr/share/doc/code-version-manager") / HELP_DOCUMENT_NAME
 DEFAULT_REPOSITORY = Path.home() / "catkin_ws"
@@ -882,6 +884,25 @@ class SoftwareReleaseTarget:
 
 
 @dataclass(frozen=True)
+class SoftwareReleaseRepositoryCreationPlan:
+    repository: str
+    account: str
+    private: bool
+
+
+@dataclass(frozen=True)
+class SoftwareReleaseRepositoryCreationResult:
+    plan: SoftwareReleaseRepositoryCreationPlan
+    target: Optional[SoftwareReleaseTarget]
+    message: str
+
+    @property
+    def url(self) -> str:
+        repository = self.target.repository if self.target is not None else self.plan.repository
+        return f"https://github.com/{repository}"
+
+
+@dataclass(frozen=True)
 class SoftwareReleaseAsset:
     asset_id: int
     name: str
@@ -1011,6 +1032,25 @@ def prepare_software_release_batch(sources: Sequence[Path], cancel: threading.Ev
         raise
 
 
+def software_release_terminal_command() -> List[str]:
+    executable = shutil.which("gnome-terminal")
+    if executable:
+        return [executable, "--wait", "--"]
+    executable = shutil.which("x-terminal-emulator")
+    return [executable, "-e"] if executable else []
+
+
+def software_release_dependency_message() -> str:
+    messages = []
+    if not shutil.which("gh"):
+        messages.append("未安装 GitHub CLI（gh）。请按以下官方说明安装后重试。")
+    if not software_release_terminal_command():
+        messages.append("找不到桌面终端。请安装桌面终端（如 gnome-terminal）后重试登录；已登录时仍可检查登录和发布。")
+    if messages:
+        messages.append(GITHUB_CLI_INSTALL_HELP)
+    return "\n\n".join(messages)
+
+
 class SoftwareReleasePublisher:
     """Publish application packages; never read or mutate a workspace repository."""
 
@@ -1033,7 +1073,8 @@ class SoftwareReleasePublisher:
     def _run(self, arguments: Sequence[str], data: Optional[bytes] = None,
              output=None, timeout: int = 120, raw_command: bool = False):
         if not self.executable:
-            raise GitError("未安装 GitHub CLI（gh）。请按 INSTALL.md 安装后重试。")
+            raise GitError("未安装 GitHub CLI（gh）。请按以下官方说明安装后重试。\n\n"
+                           + GITHUB_CLI_INSTALL_HELP)
         if self.cancel.is_set():
             raise UpdateCancelled("发布已取消。")
         environment = os.environ.copy()
@@ -1080,7 +1121,8 @@ class SoftwareReleasePublisher:
             code, stdout, stderr = self._run(command)
             help_text = (stdout + stderr).decode("utf-8", errors="replace")
             if code or any(flag not in help_text for flag in required):
-                raise GitError("GitHub CLI 版本不支持所需的发布能力，请按 INSTALL.md 升级 gh。")
+                raise GitError("GitHub CLI 版本不支持所需的发布能力，请按以下官方说明升级 gh。\n\n"
+                               + GITHUB_CLI_INSTALL_HELP)
 
     def _api(self, method: str, path: str, payload=None, missing: bool = False):
         if path != "user" and (path != self.api_path and not path.startswith(self.api_path + "/")):
@@ -1096,6 +1138,11 @@ class SoftwareReleasePublisher:
             message = stderr.decode("utf-8", errors="replace")
             if missing and re.search(r"HTTP 404\b", message):
                 return None
+            if (method == "GET" and self.repository and path == self.api_path
+                    and re.search(r"HTTP 404\b", message)):
+                raise GitError(f"目标仓库 {self.repository} 不存在或当前账号无权访问。\n"
+                               "请核对登录账号和仓库地址；尚未创建时可点击“创建发行仓库”。\n"
+                               f"https://github.com/{self.repository}")
             if (missing and method == "GET" and path.startswith(self.api_path + "/git/ref/")
                     and re.search(r"HTTP 409\b", message)):
                 # GitHub returns 409 instead of 404 for refs in empty repositories.
@@ -1120,16 +1167,75 @@ class SoftwareReleasePublisher:
 
     def login(self) -> str:
         self.check_tools()
-        if shutil.which("gnome-terminal"):
-            terminal = [shutil.which("gnome-terminal"), "--wait", "--"]
-        elif shutil.which("x-terminal-emulator"):
-            terminal = [shutil.which("x-terminal-emulator"), "-e"]
-        else:
-            raise GitError("找不到桌面终端。请在终端运行 gh auth login --hostname github.com --web --git-protocol ssh --skip-ssh-key，再点击检查登录。")
+        terminal = software_release_terminal_command()
+        if not terminal:
+            raise GitError("找不到桌面终端。请安装桌面终端（如 gnome-terminal）后重试登录。\n"
+                           "也可在终端运行 gh auth login --hostname github.com --web --git-protocol ssh --skip-ssh-key，再点击检查登录。\n\n"
+                           + GITHUB_CLI_INSTALL_HELP)
         command = terminal + [self.executable, "auth", "login", "--hostname", "github.com",
                               "--web", "--git-protocol", "ssh", "--skip-ssh-key"]
         self._run(command, timeout=900, raw_command=True)
         return self.authentication()
+
+    def preview_repository_creation(self, private: bool = False) -> SoftwareReleaseRepositoryCreationPlan:
+        if type(private) is not bool:
+            raise GitError("请选择公开或私有仓库。")
+        self.progress("检查 GitHub 登录和目标仓库…", 0.1)
+        account = self.authentication()
+        code, stdout, stderr = self._run(["repo", "create", "--help"])
+        help_text = (stdout + stderr).decode("utf-8", errors="replace")
+        if code or any(flag not in help_text for flag in ("--public", "--private")):
+            raise GitError("GitHub CLI 版本不支持创建仓库，请按以下官方说明升级 gh。\n\n"
+                           + GITHUB_CLI_INSTALL_HELP)
+        if self._api("GET", self.api_path, missing=True) is not None:
+            raise GitError(f"目标仓库 {self.repository} 已存在，无需创建。\n"
+                           "请核对当前账号的发布权限，然后点击“检查并发布”。\n"
+                           f"https://github.com/{self.repository}")
+        return SoftwareReleaseRepositoryCreationPlan(self.repository, account, private)
+
+    def create_repository(self, plan: SoftwareReleaseRepositoryCreationPlan) -> SoftwareReleaseRepositoryCreationResult:
+        if self.repository != plan.repository:
+            raise GitError("确认后目标仓库发生变化，请重新检查并确认。")
+        current = self.preview_repository_creation(plan.private)
+        if current != plan:
+            raise GitError("确认后 GitHub 登录账号发生变化，请重新检查并确认。")
+        if self.cancel.is_set():
+            raise UpdateCancelled("创建已取消，尚未发送仓库创建请求。")
+        self.progress("创建 GitHub 发行仓库…", 0.4)
+        request_error = ""
+        try:
+            code, _stdout, _stderr = self._run(
+                ["repo", "create", plan.repository, "--private" if plan.private else "--public"])
+            if code:
+                owner = plan.repository.split("/", 1)[0]
+                request_error = (f"仓库创建命令未正常结束。请确认账号 {plan.account} 有权在 {owner} 下创建仓库，"
+                                 "并检查网络和仓库名是否被占用。")
+                if owner.lower() != plan.account.lower():
+                    request_error += "个人仓库请使用当前登录账号，组织仓库需要组织授权。"
+        except UpdateCancelled:
+            request_error = "创建操作已取消。"
+        except Exception as error:
+            request_error = f"创建请求未正常完成：{error}"
+        # The create request may already have succeeded even when it was cancelled.
+        # Reconcile with a fresh cancellation event and never repeat the request.
+        self.progress("核实发行仓库创建结果…", 0.8)
+        verifier = SoftwareReleasePublisher(plan.repository)
+        try:
+            target = verifier._target(False)
+        except Exception as error:
+            message = ("创建结果待确认。" + (request_error or "GitHub 已返回成功，但尚未核实目标仓库。")
+                       + f"\n{error}\n已创建的仓库会保留，请先打开网页核对。")
+            return SoftwareReleaseRepositoryCreationResult(plan, None, message)
+        if target.private != plan.private:
+            actual = "私有" if target.private else "公开"
+            expected = "私有" if plan.private else "公开"
+            return SoftwareReleaseRepositoryCreationResult(
+                plan, None, f"已确认目标仓库存在，但实际为{actual}，与确认的{expected}设置不一致。"
+                "请打开网页核对仓库和权限，再重新检查发布。")
+        message = (request_error + "\n已确认目标仓库存在且可发布，请核对后点击“检查并发布”。"
+                   if request_error else "发行仓库已创建。请点击“检查并发布”继续，随后会确认 README 初始化、标签和发行信息。")
+        self.progress("已确认发行仓库", 1.0)
+        return SoftwareReleaseRepositoryCreationResult(plan, target, message)
 
     def _state(self, record) -> SoftwareReleaseState:
         try:
@@ -5669,6 +5775,10 @@ class SoftwareReleaseDialog(Gtk.Dialog):
         self.repository_entry = Gtk.Entry()
         self.repository_entry.set_placeholder_text("owner/repo 或 https://github.com/owner/repo/releases")
         target_row.pack_start(self.repository_entry, True, True, 0)
+        self.create_repository_button = Gtk.Button(label="创建发行仓库")
+        self.create_repository_button.set_tooltip_text("使用当前 GitHub 登录创建空的发行仓库")
+        self.create_repository_button.connect("clicked", self._create_repository)
+        target_row.pack_start(self.create_repository_button, False, False, 0)
         self.inputs.pack_start(target_row, False, False, 0)
         self.visibility_label = Gtk.Label(label="目标可见性：预检查后显示", xalign=0)
         self.visibility_label.set_line_wrap(True)
@@ -5716,13 +5826,14 @@ class SoftwareReleaseDialog(Gtk.Dialog):
         self.connect("delete-event", self._delete)
         self.connect("destroy", self._destroyed)
         self.show_all()
-        message = "请选择已构建的 deb，并填写更新说明。首次使用请在浏览器完成 GitHub CLI 登录。"
+        message = (software_release_dependency_message()
+                   or "请选择已构建的 deb，并填写更新说明。首次使用请在浏览器完成 GitHub CLI 登录。")
         try:
             if self.workspace_repository:
                 self.repository_entry.set_text(self.workspace_repository.release_repository())
             self._target_changed()
         except GitError as error:
-            message = str(error)
+            message += "\n\n" + str(error)
         self._sensitivity()
         self._message(message)
 
@@ -5742,6 +5853,12 @@ class SoftwareReleaseDialog(Gtk.Dialog):
 
     def _sensitivity(self) -> None:
         self.inputs.set_sensitive(not self.busy)
+        try:
+            validate_release_repository(self.repository_entry.get_text())
+            valid_target = True
+        except GitError:
+            valid_target = False
+        self.create_repository_button.set_sensitive(not self.busy and valid_target)
         self.get_widget_for_response(Gtk.ResponseType.OK).set_sensitive(
             not self.busy and self.batch is not None and bool(self.repository_entry.get_text().strip()))
         self.get_widget_for_response(Gtk.ResponseType.CANCEL).set_sensitive(self.busy and not self.cancel.is_set())
@@ -5800,6 +5917,95 @@ class SoftwareReleaseDialog(Gtk.Dialog):
         self.auth_label.set_text("已登录：" + account if not error else "GitHub 登录尚未确认")
         self._finish(error or "已确认 GitHub 登录，可选择升级包并发布。")
 
+    def _create_repository(self, _button) -> None:
+        if self.busy:
+            return
+        try:
+            repository = validate_release_repository(self.repository_entry.get_text())
+        except GitError as error:
+            self._message(str(error))
+            return
+        self.repository_entry.set_text(repository)
+        self._message("正在检查 GitHub 登录和目标仓库是否存在…")
+        self._worker(lambda cancel: SoftwareReleasePublisher(repository, cancel, self._progress)
+                     .preview_repository_creation(), self._repository_creation_ready)
+
+    def _repository_creation_ready(self, plan, error: str) -> None:
+        if error:
+            self._finish(error)
+            return
+        if self.cancel.is_set():
+            self._finish("创建预检查已取消，尚未发送仓库创建请求。")
+            return
+        self.auth_label.set_text("已登录：" + plan.account)
+        confirmation = Gtk.Dialog(title="创建 GitHub 发行仓库", transient_for=self, modal=True)
+        confirmation.set_destroy_with_parent(True)
+        confirmation.set_default_size(520, -1)
+        confirmation.add_buttons("取消", Gtk.ResponseType.CANCEL, "创建仓库", Gtk.ResponseType.OK)
+        content = confirmation.get_content_area()
+        content.set_border_width(16)
+        content.set_spacing(12)
+        identity = Gtk.Label(label=f"登录账号：{plan.account}\n目标仓库：{plan.repository}", xalign=0)
+        identity.set_selectable(True)
+        identity.set_line_wrap(True)
+        identity.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        identity.set_max_width_chars(64)
+        content.pack_start(identity, False, False, 0)
+        explanation = Gtk.Label(
+            label="GitHub 未找到该仓库，或当前账号无权访问。确认后将尝试创建空的远程发行仓库；"
+                  "README 初始化和版本信息会在后续发布时另行确认。", xalign=0)
+        explanation.set_line_wrap(True)
+        explanation.set_max_width_chars(64)
+        content.pack_start(explanation, False, False, 0)
+        row = Gtk.Box(spacing=8)
+        row.pack_start(Gtk.Label(label="仓库可见性", xalign=0), False, False, 0)
+        visibility = Gtk.ComboBoxText()
+        visibility.append("public", "公开")
+        visibility.append("private", "私有")
+        visibility.set_active_id("public")
+        row.pack_start(visibility, False, False, 0)
+        content.pack_start(row, False, False, 0)
+        hint = Gtk.Label(label="公开：用户可免登录下载安装包。\n私有：用户下载也需要 GitHub 授权。", xalign=0)
+        hint.set_line_wrap(True)
+        hint.set_max_width_chars(64)
+        content.pack_start(hint, False, False, 0)
+        confirmation.show_all()
+        response = confirmation.run()
+        private = visibility.get_active_id() == "private" if self.alive else False
+        confirmation.destroy()
+        if not self.alive:
+            return
+        if response != Gtk.ResponseType.OK or self.cancel.is_set():
+            self._finish("已取消创建确认，尚未发送仓库创建请求。")
+            return
+        plan = replace(plan, private=private)
+        workspace = self.workspace_repository
+        def create(cancel):
+            result = SoftwareReleasePublisher(plan.repository, cancel, self._progress).create_repository(plan)
+            if result.target is not None and workspace is not None:
+                try:
+                    workspace.configure_release_repository(result.target.repository)
+                except Exception as exception:
+                    result = replace(result, message=result.message
+                                     + f"\n仓库已确认，但工作空间的发布目标保存失败：{exception}。下次请手动填写此目标。")
+            return result
+        self._message("正在重新核对账号和目标，然后创建发行仓库…")
+        self._worker(create, self._repository_created)
+
+    def _repository_created(self, result, error: str) -> None:
+        if error:
+            self._finish(error)
+            return
+        if result.target is not None:
+            self.repository_entry.set_text(result.target.repository)
+            visibility = ("私有：升级客户端下载也需要 GitHub 授权。" if result.target.private
+                          else "公开：用户可免登录读取发行信息和下载安装包。")
+            self.visibility_label.set_text("目标可见性：" + visibility)
+        self.link.set_uri(result.url)
+        self.link.set_label("打开发行仓库" if result.target is not None else "打开网页核对创建结果")
+        self.link.set_sensitive(True)
+        self._finish(result.message + "\n" + result.url)
+
     def _select_package(self, _button) -> None:
         if self.busy:
             return
@@ -5847,7 +6053,7 @@ class SoftwareReleaseDialog(Gtk.Dialog):
         if self.busy:
             if response in (Gtk.ResponseType.CLOSE, Gtk.ResponseType.DELETE_EVENT, Gtk.ResponseType.CANCEL):
                 self.cancel.set()
-                self._message("正在停止操作；初始化、标签和草稿若已创建将保留，发布请求若已发出将先核实结果。")
+                self._message("正在停止操作；仓库、初始化、标签和草稿若已创建将保留，创建或发布请求若已发出将先核实结果。")
                 self._sensitivity()
             return
         if response == Gtk.ResponseType.OK and self.batch is not None:
