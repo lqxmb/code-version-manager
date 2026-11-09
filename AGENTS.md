@@ -15,6 +15,7 @@
 | `tests/test_recovery_cleanup.py` | 恢复文件清理、stash 保护、文件安全、并发变化、失败报告及 GTK 清理回调测试 |
 | `tests/test_ui_layout.py` | 工具栏顺序、帮助菜单和内置阅读器、文档路径、最近两项选择、动态比较、独立日志、窗口尺寸记忆及忙碌状态回归 |
 | `tests/test_application_updates.py` | 软件发行检查、下载校验、取消、模拟授权安装与 GTK 更新流程 |
+| `tests/test_build_config.py` | 更新仓库构建配置、配置异常、下载来源限制及隔离 deb 打包验证 |
 | `tests/test_software_releases.py` | 任意软件 Release 目标配置、多架构附件、初始化、预检查、续传、取消及 GTK 发布窗口 |
 | `tests/test_version_remarks.py` | 独立版本备注、编辑快照、定向同步、分支隔离、删除恢复及 GTK 备注入口 |
 | `tests/test_provider_and_drop.py` | 工作空间文件夹拖放、GitHub/GitLab 地址与主机校验、仓库隔离配置及 GTK 服务商切换 |
@@ -24,6 +25,7 @@
 | `README.md` | 项目开发、源码运行、测试、隔离验证和 Debian 打包 |
 | `README_ai.md`（若存在） | 历史讨论，不作为当前业务规则依据 |
 | `VERSION` | 软件发行版本，与受管理工作空间的 Git 版本无关 |
+| `build_config.json` | 构建配置，作为本软件更新仓库的唯一配置来源 |
 | `data/`、`debian/`、`build_deb.sh` | 图标、启动器、Beyond Compare 配置、`workspace.gitignore` 默认工作区模板及 Debian 打包 |
 
 入口为 `main()`，应用 ID 为 `cn.local.CodeVersionManager`。安装启动器 `/usr/bin/code-version-manager` 加载 `/usr/lib/code-version-manager/code_version_manager.py`。启动工作空间依次读取 `CODE_VERSION_MANAGER_REPOSITORY`、GTK 用户配置 `code-version-manager/settings.ini`、`~/catkin_ws`。最近工作空间最多保存 10 个。GTK 初始化、窗口、对话框及主线程事件回调均位于同一源码文件；后端操作由 `GitRepository` 负责。标题栏唯一“帮助”菜单提供使用帮助、检查更新和关于；内置帮助优先读取 `/usr/share/doc/code-version-manager/HELP.md`，源码运行时回退到项目根目录 `HELP.md`。
@@ -244,7 +246,8 @@
 
 ### 应用自身联网更新
 
-- 更新源固定为公开仓库 `lqxmb/code-version-manager` 的最新正式 GitHub Release，标签为 `v<Debian软件版本>`，附件为 `code-version-manager_<版本>_all.deb` 和同名 `.sha256`。软件发行号仅从应用 VERSION 读取，不能复用工作空间版本标签解析或 Git origin。
+- 更新源取自项目根目录 `build_config.json` 的 `update_repository`，默认 `lqxmb/code-version-manager`，使用该公开 GitHub 仓库的最新正式 Release。标签为 `v<Debian软件版本>`，附件为 `code-version-manager_<版本>_all.deb` 和同名 `.sha256`。软件发行号仅从应用 VERSION 读取，不能复用工作空间版本标签解析或 Git origin。
+- `build_deb.sh` 使用 Python 标准库校验配置为 JSON 对象且仓库为有效 `owner/repo`，缺失或无效时在打包前终止；每次以 `0644` 权限安装配置到 `/usr/lib/code-version-manager/build_config.json`。`application_build_config_path()` 按源码 `src/` 目录或安装程序目录定位唯一文件，不依赖当前工作目录，也不在安装文件缺失时寻找其他配置。应用启动时集中读取配置；API、发行页、附件及重定向校验共用该仓库值，Python 中不得保留备用默认仓库。读取失败保存配置错误，仅更新检查报错，沿用自动静默、手动提示的机制；本地功能保持可用。
 - 更新逻辑保留在现有单文件，独立于 GitRepository。使用标准库 HTTPS、证书校验和严格的 GitHub 资产重定向校验；下载流式写入用户缓存中的私有临时目录，校验大小、SHA-256、deb 包名、版本及架构后才提供安装。缓存和安装日志不进入工作树或 Git 元数据。
 - 用户 settings.ini 的 `[updates]` 保存 `auto_check` 与 `last_success`，默认启用；显示主窗口 5 秒后检查，成功间隔至少 24 小时。手动检查绕过间隔，自动失败静默；只有成功联网取得有效检查结果才更新检查时间。无 Release 不是“已是最新”。
 - 标题栏只保留“帮助”菜单，依次提供“使用帮助”“检查更新”和“关于”；F1 绑定使用帮助。“关于”窗口提供帮助及手动检查更新快捷按钮。帮助在 GTK 可滚动文本窗口中打开，读取系统文档路径并回退源码 HELP.md，不调用系统 URI 阅读器；新版入口显示在主窗口底部，不另占标题栏。
@@ -254,7 +257,7 @@
 
 ### 任意软件 GitHub Release 发布
 
-- 发布入口位于高级操作，主机固定 github.com，目标接受 owner/repo、仓库或 Releases HTTPS 链接。`GitRepository.release_repository()` 优先读取本地 `codeversionmanager.releaseRepository`，未配置时从明确 GitHub origin 预填，否则为空；`configure_release_repository()` 仅写该本地配置。有效目标在启动发布预检查或仓库创建结果确认后保存。窗口固定打开时的仓库实例与工作空间，不因主窗口切换改变目标或配置保存位置。发布器独立于源码 Git 操作，不读取或上传源码树和历史，不改变 origin。本软件自身更新源仍固定 lqxmb/code-version-manager。
+- 发布入口位于高级操作，主机固定 github.com，目标接受 owner/repo、仓库或 Releases HTTPS 链接。`GitRepository.release_repository()` 优先读取本地 `codeversionmanager.releaseRepository`，未配置时从明确 GitHub origin 预填，否则为空；`configure_release_repository()` 仅写该本地配置。有效目标在启动发布预检查或仓库创建结果确认后保存。窗口固定打开时的仓库实例与工作空间，不因主窗口切换改变目标或配置保存位置。发布器独立于源码 Git 操作，不读取或上传源码树和历史，不改变 origin。本软件自身更新源只读构建配置，不受发布窗口目标影响。
 - gh 为建议依赖；浏览器授权通过系统终端运行 gh auth login --hostname github.com --web --git-protocol ssh --skip-ssh-key。不调用 auth token，不在应用配置、日志或命令行保存访问令牌，不输出 auth status 的原始内容。
 - 发布窗口初始化仅通过 `shutil.which()` 检查 gh 及受支持终端，不启动子进程或联网；终端检测与登录共用逻辑，依次使用 gnome-terminal、x-terminal-emulator。缺少任一依赖时，详情区立即显示具体缺项和可复制的 GitHub CLI 官方 Linux 安装说明完整地址；gh 缺失、版本过旧及终端缺失报错也使用源码统一的地址，不指引用户查阅 INSTALL.md。终端缺失另提示安装终端并保留手动登录命令，不阻止已有授权的检查登录和发布。
 - 目标输入框旁“创建发行仓库”只要求有效目标，不要求 deb。`preview_repository_creation()` 只读检查登录、CLI 创建能力及目标存在性；不可变 `SoftwareReleaseRepositoryCreationPlan` 固定仓库、账号和可见性，确认框默认公开且允许改为私有。`create_repository()` 复核账号与目标后，经现有 `_run()` 使用 `gh repo create <owner/repo> --public/--private` 创建空仓库，不传 source、push、clone 或初始化参数。当前账号及组织创建权限由 GitHub 校验；已有仓库停止创建，HTTP 404 明确说明“不存在或当前账号无权访问”，不将私有仓库不可访问当作确定不存在。
@@ -270,7 +273,7 @@
 - `legacy_test_*` 是历史流程用例，不会被 unittest 自动发现，不作为当前合并规则或验证通过的依据；新增用例应使用 `test_*`。配置相关测试应指向临时 settings.ini，避免依赖实际用户设置。
 - 测试通过 `importlib.util.spec_from_file_location()` 直接加载单文件源码，各测试模块可拥有独立的 `MODULE`；mock 要作用于被测模块，不能假定所有用例共享一次导入。补丁生命周期须覆盖 GTK 销毁及延迟定时器，防止尺寸保存写入真实用户配置。
 - 常规验证运行完整 unittest、源码 `py_compile` 和 `git diff --check`。实仓验证必须先复制 Git 数据与元数据，不得对来源目录或真实 origin 执行覆盖。
-- `VERSION`（项目根目录）是 Debian 软件包版本；`<工作空间>/VERSION` 是被管理仓库的本地生成标签显示号，两者不能混用。`build_deb.sh` 从项目根 VERSION 命名 deb 并复制源码、README、INSTALL、HELP、图标、桌面入口、Beyond Compare 默认会话及 `data/workspace.gitignore`。模板安装到 `/usr/lib/code-version-manager/workspace.gitignore`，用户文档安装到 `/usr/share/doc/code-version-manager/`，可在打包前直接修改模板，不改 Python 源码。
+- `VERSION`（项目根目录）是 Debian 软件包版本；`<工作空间>/VERSION` 是被管理仓库的本地生成标签显示号，两者不能混用。`build_deb.sh` 从项目根 VERSION 命名 deb 并复制源码、`build_config.json`、README、INSTALL、HELP、图标、桌面入口、Beyond Compare 默认会话及 `data/workspace.gitignore`。模板安装到 `/usr/lib/code-version-manager/workspace.gitignore`，用户文档安装到 `/usr/share/doc/code-version-manager/`，可在打包前直接修改模板，不改 Python 源码。
 - Debian 入口为 `data/code-version-manager`，包控制文件为 `debian/control`，安装/卸载脚本只更新桌面数据库和图标缓存，不清理工作空间或用户配置。
 - `build_deb.sh` 使用 `dpkg-deb --root-owner-group` 生成 `Architecture: all` 包，当前版本的暂存目录为 `build/code-version-manager_<VERSION>_all/`，产物为 `dist/code-version-manager_<VERSION>_all.deb`。默认比较工具列为建议依赖；SVG 图标、桌面入口和启动脚本均来自 `data/`。
 - 兼容基线为 Git 2.25、Python 3.8、GTK 3；避免使用这些版本不支持的 Git 参数、Python 语法或 GTK API。

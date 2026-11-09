@@ -48,13 +48,41 @@ def load_application_version() -> str:
     return "unknown"
 
 
+def application_build_config_path() -> Path:
+    source = Path(__file__).resolve()
+    if source.parent.name == "src":
+        return source.parents[1] / "build_config.json"
+    return source.with_name("build_config.json")
+
+
+def load_application_update_repository(config_file: Optional[Path] = None) -> str:
+    config_file = config_file or application_build_config_path()
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("配置必须为 JSON 对象")
+        repository = config.get("update_repository")
+        if (not isinstance(repository, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}", repository)
+                or repository.rsplit("/", 1)[-1] in (".", "..")):
+            raise ValueError("update_repository 必须为有效的 GitHub owner/repo")
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError(f"软件更新配置无效（{config_file}）：{error}。请检查配置或重新安装后重启软件。") from error
+    return repository
+
+
 APP_ID = "cn.local.CodeVersionManager"
 APP_NAME = "工作空间版本管理"
 APP_VERSION = load_application_version()
 APPLICATION_PACKAGE = "code-version-manager"
 APPLICATION_SOURCE = Path("/usr/lib/code-version-manager/code_version_manager.py")
-UPDATE_REPOSITORY = "lqxmb/code-version-manager"
-UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
+try:
+    UPDATE_REPOSITORY = load_application_update_repository()
+    UPDATE_CONFIG_ERROR = ""
+except ValueError as error:
+    UPDATE_REPOSITORY = ""
+    UPDATE_CONFIG_ERROR = str(error)
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest" if UPDATE_REPOSITORY else ""
 UPDATE_INTERVAL = 24 * 60 * 60
 UPDATE_TIMEOUT = 20
 UPDATE_MAX_PACKAGE_SIZE = 512 * 1024 * 1024
@@ -611,6 +639,8 @@ def application_version_is_newer(candidate: str, current: str) -> bool:
 
 
 def _validate_update_url(url: str) -> str:
+    if UPDATE_CONFIG_ERROR:
+        raise GitError(UPDATE_CONFIG_ERROR)
     parsed = urlsplit(url)
     if (parsed.scheme != "https" or parsed.username or parsed.password
             or parsed.netloc != parsed.hostname or parsed.fragment):
@@ -640,6 +670,8 @@ def _open_update_url(url: str):
 
 
 def check_application_update() -> Optional[ApplicationRelease]:
+    if UPDATE_CONFIG_ERROR:
+        raise GitError(UPDATE_CONFIG_ERROR)
     try:
         with _open_update_url(UPDATE_API_URL) as response:
             raw = response.read(2 * 1024 * 1024 + 1)

@@ -33,7 +33,7 @@ code-version-manager
 
 ## 升级或重装
 
-从 0.4.9 开始，软件支持从公开项目 [GitHub Releases](https://github.com/lqxmb/code-version-manager/releases) 检查并下载升级包。已有旧版本须先手动安装一次 0.4.9 或更新版本。联网升级的界面操作见 [HELP.md](HELP.md#软件更新)。升级包和同名 `.sha256` 文件来自同一次正式 Release；只有校验通过的包才能在软件内安装。管理员授权由系统 PolicyKit 提供，依赖 `policykit-1`；APT 负责安装及依赖处理。
+从 0.4.9 开始，软件支持从发布者在构建时确定的公开 GitHub 仓库检查并下载升级包，默认仓库为 [lqxmb/code-version-manager](https://github.com/lqxmb/code-version-manager/releases)。安装包携带更新配置，安装并重启软件后生效。已有旧版本须先手动安装一次 0.4.9 或更新版本。联网升级的界面操作见 [HELP.md](HELP.md#软件更新)。升级包和同名 `.sha256` 文件来自同一次正式 Release；只有校验通过的包才能在软件内安装。管理员授权由系统 PolicyKit 提供，依赖 `policykit-1`；APT 负责安装及依赖处理。
 
 无法访问 GitHub 或离线时，可在其他联网电脑下载 deb 后拷贝过来，仍按下述方式安装。
 
@@ -69,6 +69,8 @@ sudo apt --fix-broken install
 ### 联网更新失败
 
 “暂无已发布升级包”表示项目还没有正式 Release；只有代码或 Git 标签不能提供升级包。连接超时或 GitHub API 限流时可稍后手动检查；不会影响本地版本管理。缺少附件或校验失败时请重新下载完整发行包，不要安装未完成文件。
+
+提示“软件更新配置无效”时，按上述重装步骤恢复安装包中的配置文件，并重启软件后重试；本地版本管理仍可使用。
 
 取消管理员授权会保留现有安装。APT 锁占用时先等待系统其他安装任务结束再重试；依赖或安装中断按上面的修复步骤处理。安装错误窗口包含安装日志位置，下载包和日志位于用户缓存目录 `code-version-manager/updates/`（通常在 `~/.cache/` 下）。
 

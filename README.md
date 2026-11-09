@@ -21,6 +21,7 @@ Python 3、GTK 3 桌面 Git 管理器，用于在任意独立工作空间中离�
 | `tests/verify_workspace_copy.py` | 仅在隔离 Git 副本和临时远程中验证真实工作空间流程 |
 | `data/` | 启动器、图标、默认忽略模板和 Beyond Compare 配置 |
 | `debian/`、`build_deb.sh` | Debian 元数据、安装维护脚本和 deb 打包 |
+| `build_config.json` | 构建配置，统一指定本软件的更新仓库 |
 | `VERSION` | Debian 软件包版本，不是被管理工作空间的版本标签 |
 
 仓库业务细节和存储边界以 [`AGENTS.md`](AGENTS.md) 为准。用户操作说明集中在 `HELP.md`，安装维护说明集中在 `INSTALL.md`；更新行为时同时检查对应文档，避免把开发步骤写入用户帮助。
@@ -55,11 +56,21 @@ python3 tests/verify_workspace_copy.py /path/to/workspace
 
 项目发行号取自根目录 `VERSION`。构建前可调整 `data/workspace.gitignore`，它作为新建工作空间的忽略模板。脚本把程序安装至 `/usr/lib/code-version-manager/`，将 `README.md`、`INSTALL.md` 和 `HELP.md` 安装至 `/usr/share/doc/code-version-manager/`，并在 `dist/` 生成 `Architecture: all` 软件包。
 
+本软件更新仓库的唯一配置来源是项目根目录 [`build_config.json`](build_config.json) 的 `update_repository` 字段，默认内容为：
+
+```json
+{
+  "update_repository": "lqxmb/code-version-manager"
+}
+```
+
+发布前将该字段改为用于分发升级包的公开 GitHub 仓库 `owner/repo`，再运行下面的构建命令。脚本先检查 JSON 对象及仓库格式，配置缺失或无效时终止；每次构建将文件以 `0644` 权限复制到包内 `/usr/lib/code-version-manager/build_config.json`。安装并重启后，应用从程序旁读取这一副本；源码运行从项目根目录读取，均不依赖启动时的工作目录。Python 源码不另设默认更新仓库，配置异常只使更新检查报错，不影响本地版本管理。
+
 ```bash
 sh build_deb.sh
 ```
 
-脚本同时生成 `dist/code-version-manager_<VERSION>_all.deb.sha256`。从“高级操作 → 发布软件到 GitHub”将本软件 deb 发布到 `lqxmb/code-version-manager`，确认发行信息后执行。若希望发行标签关联实际源码提交，应先推送 `v<VERSION>` 标签；缺少标签时，发布器在已确认的目标默认分支提交上创建标签。发布器也支持其他软件、独立公开或私有发行仓库及同版多架构 deb，目标按工作空间保存在本地 Git 配置 `codeversionmanager.releaseRepository`。空发行仓库在确认后仅初始化 README，不读取或上传源码工作空间。应用使用 GitHub CLI 登录状态，固定本地附件副本，先上传到草稿，校验后发布。操作细节见 HELP；CLI 安装见 INSTALL。仍可到 GitHub 网页手动创建正式 Release 并上传附件；不要勾选预发布。客户端按 Debian 版本规则比较最新正式发行版，只推送代码或标签不会提供升级包。根目录 `VERSION` 保持本地忽略；首次提供联网更新的发行号为 0.4.9。
+脚本同时生成 `dist/code-version-manager_<VERSION>_all.deb.sha256`。从“高级操作 → 发布软件到 GitHub”将本软件 deb 及校验文件发布到构建配置指定的更新仓库，确认发行信息后执行。若希望发行标签关联实际源码提交，应先推送 `v<VERSION>` 标签；缺少标签时，发布器在已确认的目标默认分支提交上创建标签。发布器也支持其他软件、独立公开或私有发行仓库及同版多架构 deb，目标按工作空间保存在本地 Git 配置 `codeversionmanager.releaseRepository`；这一发布目标不会改变本软件的构建配置。空发行仓库在确认后仅初始化 README，不读取或上传源码工作空间。应用使用 GitHub CLI 登录状态，固定本地附件副本，先上传到草稿，校验后发布。操作细节见 HELP；CLI 安装见 INSTALL。仍可到 GitHub 网页手动创建正式 Release 并上传附件；不要勾选预发布。客户端按 Debian 版本规则比较最新正式发行版，只推送代码或标签不会提供升级包。根目录 `VERSION` 保持本地忽略；首次提供联网更新的发行号为 0.4.9。
 
 发布窗口打开时仅查找本机的 `gh` 和桌面终端，缺少时直接显示可复制的官方安装说明地址；CLI 能力和授权仍在操作时检查。依赖提示和终端启动共用终端检测逻辑，缺少终端不阻止已有授权的登录检查及发布。
 

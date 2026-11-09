@@ -33,9 +33,9 @@ class ApplicationUpdateFixtures:
             "tag_name": "v0.4.10", "draft": False, "prerelease": False, "body": "更新说明\n第二行",
             "assets": [
                 {"name": "code-version-manager_0.4.10_all.deb", "size": 8,
-                 "browser_download_url": "https://github.com/lqxmb/code-version-manager/releases/download/v0.4.10/code-version-manager_0.4.10_all.deb"},
+                 "browser_download_url": f"https://github.com/{MODULE.UPDATE_REPOSITORY}/releases/download/v0.4.10/code-version-manager_0.4.10_all.deb"},
                 {"name": "code-version-manager_0.4.10_all.deb.sha256", "size": 104,
-                 "browser_download_url": "https://github.com/lqxmb/code-version-manager/releases/download/v0.4.10/code-version-manager_0.4.10_all.deb.sha256"},
+                 "browser_download_url": f"https://github.com/{MODULE.UPDATE_REPOSITORY}/releases/download/v0.4.10/code-version-manager_0.4.10_all.deb.sha256"},
             ],
         }
 

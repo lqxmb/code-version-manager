@@ -2,6 +2,27 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+python3 - "$project_dir/build_config.json" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+config_file = Path(sys.argv[1])
+try:
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("配置必须为 JSON 对象")
+    repository = config.get("update_repository")
+    if (not isinstance(repository, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}", repository)
+            or repository.rsplit("/", 1)[-1] in (".", "..")):
+        raise ValueError("update_repository 必须为有效的 GitHub owner/repo")
+except (OSError, UnicodeError, ValueError) as error:
+    raise SystemExit(f"构建配置无效（{config_file}）：{error}")
+PY
+
 package_name=code-version-manager
 package_version=$(tr -d '\r\n' < "$project_dir/VERSION")
 stage="$project_dir/build/${package_name}_${package_version}_all"
@@ -23,6 +44,8 @@ install -m 0755 "$project_dir/debian/postinst" "$stage/DEBIAN/postinst"
 install -m 0755 "$project_dir/debian/postrm" "$stage/DEBIAN/postrm"
 install -m 0755 "$project_dir/src/code_version_manager.py" \
     "$stage/usr/lib/$package_name/code_version_manager.py"
+install -m 0644 "$project_dir/build_config.json" \
+    "$stage/usr/lib/$package_name/build_config.json"
 install -m 0644 "$project_dir/data/workspace.gitignore" \
     "$stage/usr/lib/$package_name/workspace.gitignore"
 install -m 0644 "$project_dir/VERSION" "$stage/usr/lib/$package_name/VERSION"
