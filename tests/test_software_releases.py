@@ -1,7 +1,10 @@
 #!/usr/bin/python3
 import copy
+import base64
 import hashlib
 import importlib.util
+import io
+import json
 import subprocess
 import tempfile
 import threading
@@ -16,8 +19,8 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FakePublisher(MODULE.SoftwareReleasePublisher):
-    def __init__(self, package):
-        super().__init__()
+    def __init__(self, package, repository=MODULE.UPDATE_REPOSITORY):
+        super().__init__(repository)
         self.executable = '/fake/gh'
         self.package = package
         self.records = []
@@ -32,6 +35,12 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
         self.public_no_effect = False
         self.cancel_after_upload = False
         self.public_count = 0
+        self.repository_id = 1
+        self.private = False
+        self.default_branch = 'main'
+        self.branch_oid = 'd' * 40
+        self.tag_type = 'tag'
+        self.public_reads = 0
 
     def draft(self, assets=()):
         record = {'id': 12, 'tag_name': self.package.tag, 'draft': True, 'prerelease': False,
@@ -45,13 +54,28 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
 
     def _api(self, method, path, payload=None, missing=False):
         self.calls.append((method, path, copy.deepcopy(payload)))
-        prefix = MODULE.RELEASE_API_PATH
+        if self.cancel.is_set():
+            raise MODULE.UpdateCancelled('发布已取消。')
+        prefix = self.api_path
         if path == 'user':
             return {'login': 'maintainer'}
         if path == prefix:
-            return {'permissions': {'push': self.permission}}
+            return {'id': self.repository_id, 'full_name': self.repository, 'private': self.private,
+                    'default_branch': self.default_branch, 'permissions': {'push': self.permission}}
         if '/git/ref/tags/' in path:
-            return None if self.missing_tag else {'object': {'sha': self.tag_oid, 'type': 'tag'}}
+            return None if self.missing_tag else {'object': {'sha': self.tag_oid, 'type': self.tag_type}}
+        if '/git/ref/heads/' in path:
+            return {'object': {'sha': self.branch_oid, 'type': 'commit'}} if self.branch_oid else None
+        if path == prefix + '/branches?per_page=1':
+            return [{'name': 'other'}] if self.branch_oid else []
+        if method == 'PUT' and path == prefix + '/contents/README.md':
+            self.branch_oid = 'e' * 40
+            return {'commit': {'sha': self.branch_oid, 'parents': []}}
+        if method == 'POST' and path == prefix + '/git/refs':
+            self.missing_tag = False
+            self.tag_type = 'commit'
+            self.tag_oid = self.commit_oid = payload['sha']
+            return {'ref': payload['ref'], 'object': {'sha': self.tag_oid, 'type': 'commit'}}
         if '/git/tags/' in path:
             return {'object': {'sha': self.commit_oid, 'type': 'commit'}}
         if path == prefix + '/releases/latest':
@@ -90,8 +114,9 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
             path = Path(arguments[3])
             if self.fail_upload == path.name:
                 return 1, b'', b'upload failed'
-            self.records[0]['assets'].append(self.asset(path, 20 + len(self.records[0]['assets'])))
-            self.records[0]['updated_at'] = str(int(self.records[0]['updated_at']) + 1)
+            record = next(item for item in self.records if item['tag_name'] == self.package.tag)
+            record['assets'].append(self.asset(path, 20 + len(record['assets'])))
+            record['updated_at'] = str(int(record['updated_at']) + 1)
             if self.cancel_after_upload:
                 self.cancel.set()
             return 0, b'', b''
@@ -102,6 +127,18 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
             output.write(path.read_bytes())
             return 0, b'', b''
         raise AssertionError(arguments)
+
+    def _verify_public_release(self, plan, state):
+        self.public_reads += 1
+        record = copy.deepcopy(next(item for item in self.records if item['id'] == self.latest_id))
+        for asset in record['assets']:
+            asset['browser_download_url'] = (f'https://github.com/{self.repository}/releases/download/'
+                + MODULE.quote(plan.batch.tag, safe='') + '/' + MODULE.quote(asset['name'], safe=''))
+        with mock.patch.object(MODULE, 'build_opener') as opener:
+            opener.return_value.open.return_value = io.BytesIO(json.dumps(record).encode())
+            super()._verify_public_release(plan, state)
+            request = opener.return_value.open.call_args.args[0]
+            self.public_request_url = request.full_url
 
 
 class ReleaseFixtures:
@@ -117,23 +154,16 @@ class ReleaseFixtures:
         self.source = self.make_deb()
         self.package = MODULE.prepare_software_release(self.source, threading.Event())
         self.publisher = FakePublisher(self.package)
-        patcher = mock.patch.object(MODULE, 'check_application_update', side_effect=self.client_release)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def make_deb(self, name='code-version-manager', version='0.4.10', architecture='all'):
-        stage = self.root / ('stage-' + name + '-' + architecture)
+        stage = self.root / ('stage-' + name + '-' + architecture + '-' + version)
         (stage / 'DEBIAN').mkdir(parents=True)
         (stage / 'DEBIAN' / 'control').write_text(
             f'Package: {name}\nVersion: {version}\nArchitecture: {architecture}\n'
             'Maintainer: Test <test@example.com>\nDescription: software release test\n')
-        source = self.root / (name + '-' + architecture + '.deb')
+        source = self.root / (name + '-' + architecture + '-' + version + '.deb')
         subprocess.run(['dpkg-deb', '--build', str(stage), str(source)], check=True, stdout=subprocess.PIPE)
         return source
-
-    def client_release(self):
-        return MODULE.ApplicationRelease(self.package.version, self.package.tag, 'Notes', 'url', 'deb',
-                                         self.package.size, 'checksum', self.package.checksum_path.stat().st_size)
 
     def preview(self):
         return self.publisher.preview(self.package, 'Title', 'Notes')
@@ -151,10 +181,10 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
         self.source.write_bytes(b'changed')
         self.assertEqual(before, self.package.path.read_bytes())
 
-    def test_reject_wrong_package_architecture_and_bad_checksum(self):
+    def test_accept_other_package_architecture_and_reject_bad_checksum(self):
         for source in (self.make_deb(name='another-package'), self.make_deb(architecture='amd64')):
-            with self.assertRaisesRegex(MODULE.GitError, '只可发布'):
-                MODULE.prepare_software_release(source, threading.Event())
+            package = MODULE.prepare_software_release(source, threading.Event())
+            self.assertEqual(f'{package.name}_{package.version}_{package.architecture}.deb', package.path.name)
         adjacent = self.source.with_name(self.source.name + '.sha256')
         adjacent.write_text('0' * 64 + '  ' + self.source.name + '\n')
         with self.assertRaisesRegex(MODULE.GitError, '不一致'):
@@ -180,14 +210,15 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
             MODULE.prepare_software_release(self.source, event)
         self.assertEqual(before, list(MODULE.application_update_cache().iterdir()))
 
-    def test_preview_fixes_tag_commit_and_requires_remote_tag_permissions(self):
+    def test_preview_fixes_tag_commit_and_missing_tag_and_permissions(self):
         plan = self.preview()
         self.assertEqual('a' * 40, plan.tag_oid)
         self.assertEqual('b' * 40, plan.commit_oid)
         self.assertIsNone(plan.draft)
         self.publisher.missing_tag = True
-        with self.assertRaisesRegex(MODULE.GitError, '先将'):
-            self.preview()
+        plan = self.preview()
+        self.assertEqual('', plan.tag_oid)
+        self.assertEqual(self.publisher.branch_oid, plan.target.branch_oid)
         self.publisher.missing_tag = False
         self.publisher.permission = False
         with self.assertRaisesRegex(MODULE.GitError, '发布权限'):
@@ -340,7 +371,7 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
         self.assertIn('待确认', result.message)
         self.assertEqual(1, self.publisher.public_count)
         self.publisher = FakePublisher(self.package)
-        with mock.patch.object(MODULE, 'check_application_update', return_value=None):
+        with mock.patch.object(self.publisher, '_verify_public_release', side_effect=MODULE.GitError('匿名接口未显示版本')):
             result = self.publisher.publish(self.preview())
         self.assertFalse(result.confirmed)
         self.assertEqual(1, self.publisher.public_count)
@@ -377,6 +408,258 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
         self.assertTrue(run.call_args.kwargs['raw_command'])
 
 
+class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
+    def batch(self):
+        return MODULE.prepare_software_release_batch([
+            self.make_deb(name='p7-lane-editor', version='1.2.3', architecture='arm64'),
+            self.make_deb(name='p7-lane-editor', version='1.2.3', architecture='amd64'),
+        ], threading.Event())
+
+    def test_target_address_normalization_and_rejection(self):
+        for value in (' lqxmb/p7_lane_editor ', 'https://github.com/lqxmb/p7_lane_editor',
+                      'https://github.com/lqxmb/p7_lane_editor.git',
+                      'https://github.com/lqxmb/p7_lane_editor/releases/'):
+            self.assertEqual('lqxmb/p7_lane_editor', MODULE.validate_release_repository(value))
+        for value in ('', '/owner/repo', 'owner/repo/extra', 'owner/../repo', 'owner/repo?x=1',
+                      'https://github.com.evil.example/owner/repo', 'http://github.com/owner/repo',
+                      'https://user:secret@github.com/owner/repo', 'https://github.com/owner/repo#x',
+                      'https://github.com/owner/repo?x=1', 'https://github.com/owner/repo/releases/tag/v1',
+                      'https://github.com/owner/repo%2Fextra', 'https://github.com:443/owner/repo'):
+            with self.subTest(value=value), self.assertRaises(MODULE.GitError):
+                MODULE.validate_release_repository(value)
+
+    def test_multiarchitecture_packages_and_all_checksums_publish_to_selected_repository(self):
+        batch = self.batch()
+        self.assertEqual(('amd64', 'arm64'), tuple(package.architecture for package in batch.packages))
+        publisher = FakePublisher(batch, 'lqxmb/p7_lane_editor')
+        with mock.patch.object(MODULE, 'check_application_update', side_effect=AssertionError('wrong update source')):
+            result = publisher.publish(publisher.preview(batch, 'P7 1.2.3', 'Changes'))
+        self.assertTrue(result.confirmed, result.message)
+        self.assertIn('/lqxmb/p7_lane_editor/', result.url)
+        self.assertEqual(4, len(publisher.records[0]['assets']))
+        self.assertEqual('https://api.github.com/repos/lqxmb/p7_lane_editor/releases/latest',
+                         publisher.public_request_url)
+        uploads = [call for call in publisher.calls if call[:2] == ('release', 'upload')]
+        self.assertEqual(4, len(uploads))
+        self.assertTrue(all(call[-1] == 'github.com/lqxmb/p7_lane_editor' for call in uploads))
+
+    def test_batch_rejects_mixed_names_versions_duplicate_architectures_and_cleans_up(self):
+        for other in (self.make_deb(name='different-package'), self.make_deb(version='0.4.11'), self.source):
+            before = set(MODULE.application_update_cache().iterdir())
+            with self.assertRaises(MODULE.GitError):
+                MODULE.prepare_software_release_batch([self.source, other], threading.Event())
+            self.assertEqual(before, set(MODULE.application_update_cache().iterdir()))
+        with self.assertRaises(MODULE.GitError):
+            MODULE.prepare_software_release_batch([], threading.Event())
+
+    def test_version_must_be_valid_git_tag(self):
+        source = self.make_deb(version='1:0.4.10')
+        before = set(MODULE.application_update_cache().iterdir())
+        with self.assertRaisesRegex(MODULE.GitError, 'Git 标签'):
+            MODULE.prepare_software_release(source, threading.Event())
+        self.assertEqual(before, set(MODULE.application_update_cache().iterdir()))
+
+    def test_empty_distribution_repository_initialized_only_after_confirmation(self):
+        batch = self.batch()
+        publisher = FakePublisher(batch, 'lqxmb/p7_lane_editor')
+        publisher.missing_tag = True
+        publisher.branch_oid = ''
+        plan = publisher.preview(batch, 'P7', 'Changes')
+        self.assertEqual('', plan.target.branch_oid)
+        self.assertFalse(any(call[0] in ('PUT', 'POST', 'PATCH') for call in publisher.calls))
+        result = publisher.publish(plan)
+        self.assertTrue(result.confirmed, result.message)
+        mutations = [call for call in publisher.calls if call[0] in ('PUT', 'POST')]
+        self.assertEqual(['PUT', 'POST'], [call[0] for call in mutations])
+        self.assertTrue(mutations[0][1].endswith('/contents/README.md'))
+        readme = base64.b64decode(mutations[0][2]['content']).decode()
+        self.assertIn('p7_lane_editor', readme)
+        self.assertNotIn('core', readme)
+        self.assertEqual({'ref': 'refs/tags/v1.2.3', 'sha': 'e' * 40}, mutations[1][2])
+
+    def test_missing_tag_created_at_confirmed_default_branch_without_initialization(self):
+        self.publisher.missing_tag = True
+        plan = self.preview()
+        self.assertTrue(self.publisher.publish(plan).confirmed)
+        writes = [call for call in self.publisher.calls if call[0] in ('PUT', 'POST')]
+        self.assertEqual(1, len(writes))
+        self.assertEqual({'ref': 'refs/tags/v0.4.10', 'sha': 'd' * 40}, writes[0][2])
+
+    def test_target_snapshot_changes_block_all_remote_mutations(self):
+        for field, value in (('repository_id', 2), ('private', True), ('default_branch', 'release'),
+                             ('branch_oid', 'f' * 40)):
+            publisher = FakePublisher(self.package)
+            publisher.missing_tag = True
+            plan = publisher.preview(self.package, 'Title', 'Notes')
+            setattr(publisher, field, value)
+            with self.subTest(field=field), self.assertRaisesRegex(MODULE.GitError, '确认后'):
+                publisher.publish(plan)
+            self.assertFalse(any(call[0] in ('PUT', 'POST', 'PATCH') for call in publisher.calls))
+
+    def test_plan_cannot_be_published_to_another_repository(self):
+        plan = self.preview()
+        publisher = FakePublisher(self.package, 'other/project')
+        with self.assertRaisesRegex(MODULE.GitError, '确认后目标'):
+            publisher.publish(plan)
+        self.assertEqual([], publisher.calls)
+
+    def test_canonical_repository_case_is_used_for_release_links_and_assets(self):
+        publisher = FakePublisher(self.package, 'lqxmb/p7_lane_editor')
+        original = publisher._api
+        def api(method, path, payload=None, missing=False):
+            result = original(method, path, payload, missing)
+            if path.lower() == 'repos/lqxmb/p7_lane_editor':
+                result['full_name'] = 'lqxmb/P7_Lane_Editor'
+            return result
+        with mock.patch.object(publisher, '_api', side_effect=api):
+            plan = publisher.preview(self.package, 'Title', 'Notes')
+            result = publisher.publish(plan)
+        self.assertTrue(result.confirmed, result.message)
+        self.assertEqual('lqxmb/P7_Lane_Editor', plan.target.repository)
+        self.assertIn('/lqxmb/P7_Lane_Editor/', result.url)
+
+    def test_initialization_or_tag_retained_when_later_stage_fails(self):
+        self.publisher.branch_oid = ''
+        self.publisher.missing_tag = True
+        self.publisher.fail_upload = self.package.path.name
+        with self.assertRaises(MODULE.GitError) as error:
+            self.publisher.publish(self.preview())
+        self.assertIn('已创建发行 README', str(error.exception))
+        self.assertIn('已创建标签', str(error.exception))
+        self.assertEqual('e' * 40, self.publisher.branch_oid)
+        self.assertFalse(self.publisher.missing_tag)
+        self.assertTrue(self.publisher.records[0]['draft'])
+        self.assertFalse(any(call[0] == 'DELETE' for call in self.publisher.calls))
+
+    def test_initialization_detects_concurrent_commit(self):
+        self.publisher.branch_oid = ''
+        self.publisher.missing_tag = True
+        original = self.publisher._api
+        def api(method, path, payload=None, missing=False):
+            record = original(method, path, payload, missing)
+            if method == 'PUT':
+                record['commit']['parents'] = [{'sha': 'f' * 40}]
+            return record
+        plan = self.preview()
+        with mock.patch.object(self.publisher, '_api', side_effect=api):
+            with self.assertRaisesRegex(MODULE.GitError, '并发修改'):
+                self.publisher.publish(plan)
+        self.assertTrue(self.publisher.missing_tag)
+        self.assertEqual([], self.publisher.records)
+
+    def test_private_release_uses_authorized_verification_and_explains_client_auth(self):
+        self.publisher.private = True
+        with mock.patch.object(self.publisher, '_verify_public_release') as anonymous:
+            result = self.publisher.publish(self.preview())
+        self.assertTrue(result.confirmed)
+        self.assertIn('客户端下载也需要', result.message)
+        anonymous.assert_not_called()
+
+    def test_visibility_changed_during_upload_stops_publication(self):
+        plan = self.preview()
+        original = self.publisher._run
+        def run(arguments, **kwargs):
+            result = original(arguments, **kwargs)
+            if arguments[:2] == ['release', 'upload']:
+                self.publisher.private = True
+            return result
+        with mock.patch.object(self.publisher, '_run', side_effect=run):
+            with self.assertRaisesRegex(MODULE.GitError, '可见性.*发生变化'):
+                self.publisher.publish(plan)
+        self.assertEqual(0, self.publisher.public_count)
+
+    def test_batch_cancellation_after_first_package_cleans_prepared_copies(self):
+        second = self.make_deb(architecture='arm64')
+        cancel = threading.Event()
+        original = MODULE.prepare_software_release
+        def prepare(source, event):
+            package = original(source, event)
+            cancel.set()
+            return package
+        before = set(MODULE.application_update_cache().iterdir())
+        with mock.patch.object(MODULE, 'prepare_software_release', side_effect=prepare):
+            with self.assertRaises(MODULE.UpdateCancelled):
+                MODULE.prepare_software_release_batch([self.source, second], cancel)
+        self.assertEqual(before, set(MODULE.application_update_cache().iterdir()))
+
+    def test_multiarchitecture_partial_upload_can_resume(self):
+        batch = self.batch()
+        publisher = FakePublisher(batch, 'lqxmb/p7_lane_editor')
+        publisher.fail_upload = batch.packages[1].path.name
+        with self.assertRaises(MODULE.GitError):
+            publisher.publish(publisher.preview(batch, 'Title', 'Notes'))
+        self.assertEqual(2, len(publisher.records[0]['assets']))
+        publisher.fail_upload = None
+        result = publisher.publish(publisher.preview(batch, 'Title', 'Notes'))
+        self.assertTrue(result.confirmed, result.message)
+        self.assertEqual(4, len(publisher.records[0]['assets']))
+
+    def test_anonymous_release_response_and_redirects_are_checked_without_credentials(self):
+        draft = self.publisher.draft([self.publisher.asset(path, 20 + i)
+                                      for i, path in enumerate(self.package.assets)])
+        draft['draft'] = False
+        for asset in draft['assets']:
+            asset['browser_download_url'] = (f'https://github.com/{self.publisher.repository}/releases/download/'
+                                             f'{self.package.tag}/{asset["name"]}')
+        state = self.publisher._state(draft)
+        plan = MODULE.SoftwareReleasePlan(MODULE.SoftwareReleaseBatch((self.package,)),
+            self.publisher._target(False), 'Title', 'Notes', 'a' * 40, 'b' * 40, None, None)
+        for mutation in ('none', 'missing', 'url', 'size', 'prerelease', 'malformed', 'oversize'):
+            record = copy.deepcopy(draft)
+            if mutation == 'missing':
+                record['assets'].pop()
+            elif mutation == 'url':
+                record['assets'][0]['browser_download_url'] = 'https://evil.example/package.deb'
+            elif mutation == 'size':
+                record['assets'][0]['size'] += 1
+            elif mutation == 'prerelease':
+                record['prerelease'] = True
+            raw = json.dumps(record).encode()
+            if mutation == 'malformed':
+                raw = b'[]'
+            elif mutation == 'oversize':
+                raw = b'x' * (2 * 1024 * 1024 + 1)
+            with self.subTest(mutation=mutation), mock.patch.object(MODULE, 'build_opener') as opener:
+                opener.return_value.open.return_value = io.BytesIO(raw)
+                if mutation == 'none':
+                    MODULE.SoftwareReleasePublisher._verify_public_release(self.publisher, plan, state)
+                else:
+                    with self.assertRaises(MODULE.GitError):
+                        MODULE.SoftwareReleasePublisher._verify_public_release(self.publisher, plan, state)
+                request = opener.return_value.open.call_args.args[0]
+                self.assertNotIn('Authorization', dict(request.header_items()))
+                handler = opener.call_args.args[0]
+                with self.assertRaises(MODULE.GitError):
+                    handler.redirect_request(None, None, 302, '', {}, 'https://evil.example')
+
+
+class ReleaseRepositorySettingsTest(ReleaseFixtures, unittest.TestCase):
+    def repository(self, name, origin=''):
+        workspace = self.root / name
+        subprocess.run(['git', 'init', '-q', str(workspace)], check=True)
+        if origin:
+            subprocess.run(['git', '-C', str(workspace), 'remote', 'add', 'origin', origin], check=True)
+        return MODULE.GitRepository(workspace)
+
+    def test_targets_are_local_and_origin_is_only_a_default(self):
+        first = self.repository('core', 'git@github.com:lqxmb/p7_lane_editor_core.git')
+        second = self.repository('other', 'git@github.com:other/project.git')
+        self.assertEqual('lqxmb/p7_lane_editor_core', first.release_repository())
+        first.configure_release_repository('https://github.com/lqxmb/p7_lane_editor/releases')
+        self.assertEqual('lqxmb/p7_lane_editor', first.release_repository())
+        self.assertEqual('other/project', second.release_repository())
+        self.assertEqual('git@github.com:lqxmb/p7_lane_editor_core.git', first.remote_url())
+        self.assertFalse(self.settings.exists())
+        with self.assertRaises(MODULE.GitError):
+            first.configure_release_repository('https://evil.example/owner/repo')
+        self.assertEqual('lqxmb/p7_lane_editor', first.release_repository())
+
+    def test_without_github_origin_no_hardcoded_default(self):
+        for index, origin in enumerate(('', 'git@gitlab.com:owner/project.git')):
+            repo = self.repository(str(index), origin)
+            self.assertEqual('', repo.release_repository())
+
+
 class SoftwareReleaseUiTest(ReleaseFixtures, unittest.TestCase):
     def setUp(self):
         super().setUp()
@@ -392,7 +675,8 @@ class SoftwareReleaseUiTest(ReleaseFixtures, unittest.TestCase):
         self.assertEqual('发布软件到 GitHub', self.window.publish_software_item.get_label())
         self.window.on_publish_software(None)
         self.assertIs(self.dialog, self.window.software_release_dialog)
-        self.dialog._package_ready(self.package, '')
+        self.dialog.repository_entry.set_text(MODULE.UPDATE_REPOSITORY)
+        self.dialog._package_ready(MODULE.SoftwareReleaseBatch((self.package,)), '')
         self.assertEqual(self.package.tag, self.dialog.version_entry.get_text())
         self.assertFalse(self.dialog.version_entry.get_editable())
         self.assertIn(self.package.version, self.dialog.title_entry.get_text())
@@ -422,7 +706,7 @@ class SoftwareReleaseUiTest(ReleaseFixtures, unittest.TestCase):
 
     def test_confirmation_snapshot_decline_does_not_publish(self):
         plan = self.preview()
-        self.dialog.package = self.package
+        self.dialog.batch = MODULE.SoftwareReleaseBatch((self.package,))
         self.dialog.busy = True
         with mock.patch.object(MODULE.Gtk, 'MessageDialog') as confirmation, mock.patch.object(self.dialog, '_worker') as worker:
             confirmation.return_value.run.return_value = MODULE.Gtk.ResponseType.CANCEL
@@ -444,12 +728,85 @@ class SoftwareReleaseUiTest(ReleaseFixtures, unittest.TestCase):
         callbacks = []
         with mock.patch.object(MODULE.threading, 'Thread') as thread, mock.patch.object(MODULE.GLib, 'idle_add', side_effect=lambda *args: callbacks.append(args)):
             callback = mock.Mock()
-            self.dialog._worker(lambda cancel: self.package, callback)
+            self.dialog._worker(lambda cancel: MODULE.SoftwareReleaseBatch((self.package,)), callback)
             thread.call_args.kwargs['target']()
         self.dialog.destroy()
         callbacks[0][0](*callbacks[0][1:])
         callback.assert_not_called()
         self.assertFalse(self.package.path.exists())
+
+    def test_multiple_packages_are_selected_and_displayed(self):
+        second = self.make_deb(architecture='arm64')
+        self.dialog.repository_entry.set_text('lqxmb/p7_lane_editor')
+        with mock.patch.object(MODULE.Gtk, 'FileChooserDialog') as chooser, mock.patch.object(self.dialog, '_worker') as worker:
+            chooser.return_value.run.return_value = MODULE.Gtk.ResponseType.OK
+            chooser.return_value.get_filenames.return_value = [str(self.source), str(second)]
+            self.dialog._select_package(None)
+            chooser.return_value.set_select_multiple.assert_called_once_with(True)
+            batch = worker.call_args.args[0](threading.Event())
+        self.dialog._package_ready(batch, '')
+        buffer = self.dialog.package_details.get_buffer()
+        text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
+        for expected in ('all', 'arm64', 'code-version-manager_0.4.10_arm64.deb.sha256'):
+            self.assertIn(expected, text)
+        self.assertEqual(4, len(self.dialog.batch.assets))
+
+    def test_dialog_keeps_original_workspace_target_after_workspace_switch(self):
+        def repository(name, origin):
+            path = self.root / name
+            subprocess.run(['git', 'init', '-q', str(path)], check=True)
+            subprocess.run(['git', '-C', str(path), 'remote', 'add', 'origin', origin], check=True)
+            return MODULE.GitRepository(path)
+        first = repository('first', 'git@github.com:lqxmb/p7_lane_editor_core.git')
+        second = repository('second', 'git@github.com:other/project.git')
+        self.dialog.destroy()
+        self.window.repository = first
+        self.window.on_publish_software(None)
+        self.dialog = self.window.software_release_dialog
+        self.assertEqual('lqxmb/p7_lane_editor_core', self.dialog.repository_entry.get_text())
+        self.window.repository = second
+        self.dialog.repository_entry.set_text('https://github.com/lqxmb/p7_lane_editor/releases')
+        self.dialog._package_ready(MODULE.SoftwareReleaseBatch((self.package,)), '')
+        self.dialog.notes.get_buffer().set_text('Changes')
+        with mock.patch.object(MODULE.SoftwareReleasePublisher, 'preview', return_value=self.preview()) as preview, \
+                mock.patch.object(self.dialog, '_worker') as worker:
+            self.dialog._response(self.dialog, MODULE.Gtk.ResponseType.OK)
+            worker.call_args.args[0](threading.Event())
+        self.assertEqual('lqxmb/p7_lane_editor', first.release_repository())
+        self.assertEqual('other/project', second.release_repository())
+        self.assertEqual('lqxmb/p7_lane_editor', self.dialog.repository_entry.get_text())
+        preview.assert_called_once()
+        self.assertIn('/lqxmb/p7_lane_editor/releases', self.dialog.link.get_uri())
+
+    def test_confirmation_lists_initialization_private_visibility_and_all_assets(self):
+        batch = MODULE.SoftwareReleaseBatch((self.package,))
+        self.publisher.private = True
+        self.publisher.branch_oid = ''
+        self.publisher.missing_tag = True
+        plan = self.preview()
+        self.dialog.batch = batch
+        self.dialog.busy = True
+        with mock.patch.object(MODULE.Gtk, 'MessageDialog') as confirmation, mock.patch.object(self.dialog, '_worker') as worker:
+            confirmation.return_value.run.return_value = MODULE.Gtk.ResponseType.CANCEL
+            self.dialog._preview_ready(plan, '')
+        text = confirmation.return_value.format_secondary_text.call_args.args[0]
+        for expected in ('初始化空仓库', '将创建标签', '私有', '客户端下载也需要', self.package.checksum_path.name):
+            self.assertIn(expected, text)
+        worker.assert_not_called()
+
+    def test_invalid_target_cannot_start_preview(self):
+        self.dialog.batch = MODULE.SoftwareReleaseBatch((self.package,))
+        self.dialog.repository_entry.set_text('https://evil.example/owner/repo')
+        with mock.patch.object(self.dialog, '_worker') as worker:
+            self.dialog._response(self.dialog, MODULE.Gtk.ResponseType.OK)
+        worker.assert_not_called()
+        self.assertFalse(self.dialog.link.get_sensitive())
+
+    def test_release_form_can_scroll_without_pushing_actions_below_window(self):
+        while MODULE.Gtk.events_pending():
+            MODULE.Gtk.main_iteration_do(False)
+        self.assertLessEqual(self.dialog.get_preferred_height().minimum_height, 740)
+        self.assertTrue(self.dialog.get_widget_for_response(MODULE.Gtk.ResponseType.OK).get_visible())
 
 
 class SoftwareReleaseProcessTest(unittest.TestCase):
@@ -464,14 +821,14 @@ class SoftwareReleaseProcessTest(unittest.TestCase):
             '"cwd": os.getcwd(), "host": os.environ.get("GH_HOST"), '
             '"prompt": os.environ.get("GH_PROMPT_DISABLED"), "debug": os.environ.get("GH_DEBUG")}))\n')
         self.executable.chmod(0o700)
-        self.publisher = MODULE.SoftwareReleasePublisher()
+        self.publisher = MODULE.SoftwareReleasePublisher(MODULE.UPDATE_REPOSITORY)
         self.publisher.executable = str(self.executable)
 
     def test_process_receives_exact_arguments_json_stdin_and_isolated_cwd(self):
         import json
         payload = {'name': 'Title $(no-shell)', 'body': 'Line one\nLine two'}
         with mock.patch.dict(MODULE.os.environ, {'GH_DEBUG': 'api', 'GH_HOST': 'other.example'}):
-            record = self.publisher._api('PATCH', MODULE.RELEASE_API_PATH + '/releases/1', payload)
+            record = self.publisher._api('PATCH', self.publisher.api_path + '/releases/1', payload)
         self.assertEqual(payload, json.loads(record['input']))
         self.assertEqual('github.com', record['host'])
         self.assertEqual(tempfile.gettempdir(), record['cwd'])
@@ -480,6 +837,12 @@ class SoftwareReleaseProcessTest(unittest.TestCase):
         self.assertIn('--input', record['args'])
         with self.assertRaisesRegex(MODULE.GitError, '其他发布目标'):
             self.publisher._api('POST', 'repos/other/project/releases', payload)
+
+    def test_missing_refs_in_empty_repository_allow_http_409_only_for_ref_reads(self):
+        with mock.patch.object(self.publisher, '_run', return_value=(1, b'', b'HTTP 409 repository empty')):
+            self.assertIsNone(self.publisher._api('GET', self.publisher.api_path + '/git/ref/tags/v1', missing=True))
+            with self.assertRaises(MODULE.GitError):
+                self.publisher._api('GET', self.publisher.api_path + '/releases/latest', missing=True)
 
     def test_cancel_and_timeout_terminate_real_local_process(self):
         import time

@@ -74,9 +74,9 @@ sudo apt --fix-broken install
 
 ## 可选：安装 GitHub Release 发布工具
 
-仅维护者使用“发布软件到 GitHub”时需要 GitHub CLI（`gh`）和可用的桌面终端。按 [GitHub CLI 官方 Linux 安装说明](https://github.com/cli/cli/blob/trunk/docs/install_linux.md) 安装；系统软件源提供 `gh` 时也可通过 APT 安装。该工具列为建议依赖，不影响普通用户检查、下载和安装软件更新。
+使用“发布软件到 GitHub”向任意 GitHub 发行仓库上传 deb 时，需要 GitHub CLI（`gh`）和可用的桌面终端。按 [GitHub CLI 官方 Linux 安装说明](https://github.com/cli/cli/blob/trunk/docs/install_linux.md) 安装；系统软件源提供 `gh` 时也可通过 APT 安装。该工具列为建议依赖，不影响普通用户检查、下载和安装本软件更新。发布目标、多架构包及私有源码搭配公开发行仓库的操作见 [HELP.md](HELP.md#发布软件升级包到-github)。
 
-发布窗口会检查 CLI 是否支持浏览器登录及 API 上传；旧版本不支持时请先升级 CLI。首次登录由 CLI 打开浏览器授权，凭据的存储方式由 CLI 和系统凭据服务决定。Git 的 SSH 授权用于推送代码和标签，创建 Release 和上传附件仍通过 CLI 的 HTTPS 授权完成。
+发布窗口会检查 CLI 是否支持浏览器登录及 API 上传；旧版本不支持时请先升级 CLI。首次登录由 CLI 打开浏览器授权，凭据的存储方式由 CLI 和系统凭据服务决定。登录账号须有目标仓库写权限；空仓库初始化和缺失标签创建同样使用 CLI 的 HTTPS 授权。Git 的 SSH 授权用于单独的代码推送，不替代 Release 发布授权。
 
 ## 卸载
 
