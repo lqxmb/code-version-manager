@@ -40,7 +40,7 @@ code-version-manager
 安装升级包之前先退出正在运行的版本管理器，然后执行：
 
 ```bash
-sudo apt install --reinstall ./code-version-manager_<新版本>_all.deb
+sudo apt install --reinstall ./dist/code-version-manager_$(cat VERSION)_all.deb
 ```
 
 升级不会删除受管理工作空间的 Git 历史和文件。若远程连接、分支或版本操作遇到问题，先点击应用“刷新”核对当前状态，再查看“帮助”和应用日志；不要因网络超时重复发布同一版本。

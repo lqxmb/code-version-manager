@@ -6394,20 +6394,32 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog scrolledwindow { border: 1px solid #d9e0e5; }
         infobar.warning { background-color: #fff3dc; color: #654d1b; }
         .command-bar button.sync-pending,
-        .command-bar button.sync-pending:disabled {
+        .command-bar button.sync-pending:disabled,
+        dialog button.sync-pending,
+        dialog button.sync-pending:disabled {
             background-image: none; background-color: #bb3030; color: white;
             border-color: #982727; text-shadow: none; box-shadow: none; opacity: 1;
         }
-        .command-bar button.sync-pending:hover { background-color: #a32929; }
+        .command-bar button.sync-pending:hover,
+        dialog button.sync-pending:hover { background-color: #a32929; }
         .command-bar button.sync-synced,
-        .command-bar button.sync-synced:disabled {
+        .command-bar button.sync-synced:disabled,
+        dialog button.sync-synced,
+        dialog button.sync-synced:disabled {
             background-image: none; background-color: #32804f; color: white;
             border-color: #286b41; text-shadow: none; box-shadow: none; opacity: 1;
         }
         .command-bar button.sync-unavailable,
-        .command-bar button.sync-unavailable:disabled {
+        .command-bar button.sync-unavailable:disabled,
+        dialog button.sync-unavailable,
+        dialog button.sync-unavailable:disabled {
             background-image: none; background-color: #f1f4f5; color: #89959d;
             border-color: #d5dde2; text-shadow: none; box-shadow: none; opacity: 1;
+        }
+        dialog button.sync-pending label,
+        dialog button.sync-synced label,
+        dialog button.sync-unavailable label {
+            color: inherit; text-shadow: none;
         }
         """
         provider = Gtk.CssProvider()
@@ -8127,21 +8139,40 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.add_button("取消", Gtk.ResponseType.CANCEL)
         local_button = dialog.add_button("以远程覆盖整个本地", 1)
         remote_button = dialog.add_button("以本地覆盖整个远程", 2)
-        local_button.set_sensitive(status.can_sync_local)
-        remote_button.set_sensitive(status.can_sync_remote)
+        css_class = {
+            "synced": "sync-synced", "pending": "sync-pending",
+        }.get(status.state, "sync-unavailable")
+        for button, can_sync, message in (
+            (local_button, status.can_sync_local, status.local_message),
+            (remote_button, status.can_sync_remote, status.remote_message),
+        ):
+            button.get_style_context().add_class(css_class)
+            button.set_sensitive(status.state == "pending" and can_sync)
+            tooltip = "无需覆盖" if status.state == "synced" else (message or status.message)
+            button.set_tooltip_text(tooltip)
         dialog.set_default_response(Gtk.ResponseType.CANCEL)
         dialog.get_content_area().add(Gtk.Label(
-            label="此功能会覆盖全部分支和版本标签，包括删除另一端独有分支。\n\n"
-                  + status.message + "\n\n下载：" + status.local_message + "\n\n上传：" + status.remote_message,
+            label="此操作会按所选来源更新另一端；来源独有项新增，目标独有项删除。\n\n"
+                  + status.message,
             wrap=True, xalign=0, margin=16,
         ))
         dialog.show_all()
         response = dialog.run()
         dialog.destroy()
+        if repository is not self.repository:
+            return False
         if response not in (1, 2):
             self.refresh()
             return False
+        if status.state == "synced":
+            self.refresh()
+            self._set_operation_status("两端已一致，无需覆盖。")
+            return False
         direction = "local" if response == 1 else "remote"
+        can_sync = status.can_sync_local if direction == "local" else status.can_sync_remote
+        if status.state != "pending" or not can_sync:
+            self.refresh()
+            return False
         if not self._confirm_sync_direction(direction, status):
             self.refresh()
             return False

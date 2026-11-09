@@ -484,6 +484,59 @@ class WindowLayoutTest(unittest.TestCase):
                 self.assertEqual("完整远程说明", window.remote_summary_label.get_tooltip_text())
                 self.assertFalse(window.remote_summary_label.get_line_wrap())
 
+    def test_advanced_sync_buttons_use_whole_repository_status_and_shared_colors(self):
+        window = self.window
+        snapshot = MODULE.RemoteSyncSnapshot("origin-url", "refs/heads/main", (), scope="all")
+        cases = (
+            ("synced", False, False, "sync-synced", (False, False), (50, 128, 79)),
+            ("pending", True, True, "sync-pending", (True, True), (187, 48, 48)),
+            ("pending", False, True, "sync-pending", (False, True), (187, 48, 48)),
+            ("pending", True, False, "sync-pending", (True, False), (187, 48, 48)),
+            ("pending", False, False, "sync-pending", (False, False), (187, 48, 48)),
+            ("checking", True, True, "sync-unavailable", (False, False), (241, 244, 245)),
+            ("unavailable", True, True, "sync-unavailable", (False, False), (241, 244, 245)),
+        )
+        for state, can_local, can_remote, css_class, enabled, rgb in cases:
+            with self.subTest(state=state, can_local=can_local, can_remote=can_remote):
+                window.remote_status = MODULE.RemoteSyncStatus(
+                    "pending" if state == "synced" else "synced", "当前分支状态与整仓状态不同",
+                )
+                status = MODULE.RemoteSyncStatus(
+                    state, "全部分支、版本标签和备注的检查结果", can_local, can_remote,
+                    local_message="下载检查结果或禁用原因", remote_message="上传检查结果或禁用原因",
+                    snapshot=snapshot,
+                )
+
+                def inspect_dialog(dialog):
+                    for response, sensitive, message in (
+                        (1, enabled[0], status.local_message),
+                        (2, enabled[1], status.remote_message),
+                    ):
+                        button = dialog.get_widget_for_response(response)
+                        context = button.get_style_context()
+                        self.assertEqual(sensitive, button.is_sensitive())
+                        self.assertTrue(context.has_class(css_class))
+                        if state == "synced":
+                            self.assertEqual("无需覆盖", button.get_tooltip_text())
+                        else:
+                            self.assertEqual(message or status.message, button.get_tooltip_text())
+                        color = context.get_background_color(button.get_state_flags())
+                        for actual, expected in zip((color.red, color.green, color.blue), rgb):
+                            self.assertAlmostEqual(expected / 255, actual, places=4)
+                    return MODULE.Gtk.ResponseType.CANCEL
+
+                with mock.patch.object(window, "_end_background"), \
+                        mock.patch.object(window, "refresh"), \
+                        mock.patch.object(window, "run_background") as run_background, \
+                        mock.patch.object(MODULE.Gtk, "Label", wraps=MODULE.Gtk.Label) as label_factory, \
+                        mock.patch.object(MODULE.Gtk.Dialog, "run", autospec=True, side_effect=inspect_dialog):
+                    window._background_advanced_sync_ready(window.repository, status)
+                run_background.assert_not_called()
+                label_text = label_factory.call_args.kwargs["label"]
+                self.assertNotIn("下载：", label_text)
+                self.assertNotIn("上传：", label_text)
+                self.assertEqual(1, label_text.count("全部分支、版本标签和备注"))
+
 
 if __name__ == "__main__":
     unittest.main()

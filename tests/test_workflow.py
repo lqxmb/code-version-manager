@@ -824,6 +824,60 @@ class RepositoryStatusUITest(unittest.TestCase):
         repository.sync_snapshot.assert_called_once_with(scope='all')
         repository.remote_sync_status.assert_called_once_with(repository.sync_snapshot.return_value)
 
+    def test_synced_advanced_buttons_report_no_changes_without_confirmation_or_writes(self):
+        snapshot = MODULE.RemoteSyncSnapshot('origin-url', 'refs/heads/main', (), scope='all')
+        status = MODULE.RemoteSyncStatus('synced', '全部分支、版本标签及备注已与远程一致', snapshot=snapshot)
+        for response in (1, 2):
+            with self.subTest(response=response):
+                window = mock.Mock()
+                repository = window.repository
+                with mock.patch.object(MODULE.Gtk, 'Dialog') as dialog_factory, \
+                        mock.patch.object(MODULE.Gtk, 'Label'):
+                    dialog_factory.return_value.run.return_value = response
+                    MODULE.VersionManagerWindow._background_advanced_sync_ready(window, repository, status)
+                    label_args = MODULE.Gtk.Label.call_args.kwargs
+                self.assertNotIn('下载：', label_args['label'])
+                self.assertNotIn('上传：', label_args['label'])
+                self.assertEqual(1, label_args['label'].count('全部分支、版本标签及备注'))
+                window._set_operation_status.assert_called_once_with('两端已一致，无需覆盖。')
+                window._confirm_sync_direction.assert_not_called()
+                window.run_background.assert_not_called()
+                repository.sync_local_from_remote.assert_not_called()
+                repository.sync_remote_from_local.assert_not_called()
+                window.refresh.assert_called_once_with()
+
+    def test_advanced_sync_preserves_confirmation_dispatch_and_direction_blocks(self):
+        snapshot = MODULE.RemoteSyncSnapshot('origin-url', 'refs/heads/main', (), scope='all')
+        for state, can_local, can_remote, response, direction in (
+            ('pending', True, True, 1, 'local'),
+            ('pending', True, True, 2, 'remote'),
+            ('pending', False, True, 1, None),
+            ('pending', True, False, 2, None),
+            ('unavailable', True, True, 1, None),
+            ('checking', True, True, 2, None),
+        ):
+            with self.subTest(state=state, can_local=can_local, can_remote=can_remote, response=response):
+                window = mock.Mock()
+                repository = window.repository
+                status = MODULE.RemoteSyncStatus(state, '整仓状态', can_local, can_remote, snapshot=snapshot)
+                with mock.patch.object(MODULE.Gtk, 'Dialog') as dialog_factory, \
+                        mock.patch.object(MODULE.Gtk, 'Label'):
+                    dialog_factory.return_value.run.return_value = response
+                    MODULE.VersionManagerWindow._background_advanced_sync_ready(window, repository, status)
+                if direction is None:
+                    window._confirm_sync_direction.assert_not_called()
+                    window.run_background.assert_not_called()
+                    continue
+                window._confirm_sync_direction.assert_called_once_with(direction, status)
+                self.assertTrue(window.run_background.call_args.kwargs['remote_sync'])
+                window.run_background.call_args.args[1]()
+                if direction == 'local':
+                    repository.sync_local_from_remote.assert_called_once_with(snapshot, status)
+                    repository.sync_remote_from_local.assert_not_called()
+                else:
+                    repository.sync_remote_from_local.assert_called_once_with(snapshot, status)
+                    repository.sync_local_from_remote.assert_not_called()
+
     def test_local_delete_after_remote_timeout_shows_result_warning(self):
         window = mock.Mock()
         message = '本地已删除，远程删除结果待确认：retreat_teb'
