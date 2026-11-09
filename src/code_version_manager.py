@@ -48,6 +48,8 @@ def load_application_version() -> str:
 APP_ID = "cn.local.CodeVersionManager"
 APP_NAME = "工作空间版本管理"
 APP_VERSION = load_application_version()
+HELP_DOCUMENT_NAME = "HELP.md"
+HELP_DOCUMENT_SYSTEM_PATH = Path("/usr/share/doc/code-version-manager") / HELP_DOCUMENT_NAME
 DEFAULT_REPOSITORY = Path.home() / "catkin_ws"
 VERSION_PATTERN = re.compile(r"^v(\d+(?:\.\d+){2,})$")
 PRERELEASE_PATTERN = re.compile(
@@ -473,6 +475,20 @@ class RemoteSyncStatus:
 
 def settings_file_path() -> Path:
     return Path(GLib.get_user_config_dir()) / "code-version-manager" / "settings.ini"
+
+
+def help_document_candidates() -> Tuple[Path, ...]:
+    """Return installed and source-tree locations for the user help document."""
+    source_path = Path(__file__).resolve().parents[1] / HELP_DOCUMENT_NAME
+    return HELP_DOCUMENT_SYSTEM_PATH, source_path
+
+
+def help_document_path() -> Path:
+    for candidate in help_document_candidates():
+        if candidate.is_file():
+            return candidate
+    searched = "、".join(str(path) for path in help_document_candidates())
+    raise GitError(f"找不到帮助文件 HELP.md。已检查：{searched}")
 
 
 def _read_settings(config_file: Path) -> configparser.ConfigParser:
@@ -4739,8 +4755,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         header.props.title = APP_NAME
         self.set_titlebar(header)
 
-        about_button = self._command_button("关于", "help-about-symbolic", self.on_about)
-        header.pack_end(about_button)
+        self.help_button = self._command_button("帮助", "help-browser-symbolic", self.on_help)
+        self.help_button.set_tooltip_text("打开用户帮助 HELP.md")
+        header.pack_end(self.help_button)
+        self.about_button = self._command_button("关于", "help-about-symbolic", self.on_about)
+        header.pack_end(self.about_button)
 
         self.workspace_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.workspace_bar.get_style_context().add_class("workspace-bar")
@@ -6078,6 +6097,15 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.set_logo_icon_name("code-version-manager")
         dialog.run()
         dialog.destroy()
+
+    def on_help(self, _button) -> None:
+        try:
+            path = help_document_path()
+            uri = Gio.File.new_for_path(str(path)).get_uri()
+            if not Gtk.show_uri_on_window(self, uri, Gdk.CURRENT_TIME):
+                raise GitError(f"无法使用系统默认程序打开帮助文件：{path}")
+        except (GitError, GLib.Error, OSError) as error:
+            self.show_error(str(error))
 
     def on_settings(self, _button) -> None:
         try:

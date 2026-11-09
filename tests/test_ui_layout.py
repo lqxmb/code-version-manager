@@ -12,6 +12,40 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+class HelpDocumentPathTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source = self.root / "checkout" / "src" / "code_version_manager.py"
+        self.source.parent.mkdir(parents=True)
+        self.source.touch()
+        self.project_help = self.root / "checkout" / "HELP.md"
+        self.installed_help = self.root / "installed-docs" / "HELP.md"
+        source_patch = mock.patch.object(MODULE, "__file__", str(self.source))
+        installed_patch = mock.patch.object(MODULE, "HELP_DOCUMENT_SYSTEM_PATH", self.installed_help)
+        source_patch.start()
+        installed_patch.start()
+        self.addCleanup(source_patch.stop)
+        self.addCleanup(installed_patch.stop)
+
+    def test_installed_help_path_takes_precedence_over_source_copy(self):
+        self.project_help.write_text("source help", encoding="utf-8")
+        self.installed_help.parent.mkdir()
+        self.installed_help.write_text("installed help", encoding="utf-8")
+        self.assertEqual(self.installed_help, MODULE.help_document_path())
+
+    def test_source_tree_help_is_used_when_installed_copy_is_missing(self):
+        self.project_help.write_text("source help", encoding="utf-8")
+        self.assertEqual(self.project_help, MODULE.help_document_path())
+
+    def test_missing_help_reports_both_locations(self):
+        with self.assertRaises(MODULE.GitError) as raised:
+            MODULE.help_document_path()
+        self.assertIn(str(self.installed_help), str(raised.exception))
+        self.assertIn(str(self.project_help), str(raised.exception))
+
+
 class WindowSettingsTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -190,6 +224,14 @@ class WindowLayoutTest(unittest.TestCase):
 
     def test_layout_keeps_actions_visible_and_in_confirmed_order(self):
         window = self.window
+        self.assertEqual("关于", window.about_button.get_label())
+        self.assertEqual("帮助", window.help_button.get_label())
+        self.assertIs(window.about_button.get_parent(), window.header)
+        self.assertIs(window.help_button.get_parent(), window.header)
+        window.show_all()
+        self.drain_events()
+        self.assertLess(window.about_button.get_allocation().x,
+                        window.help_button.get_allocation().x)
         self.assertEqual([window.history_scope_combo, window.compare_button, window.delete_button,
                           window.export_button, window.edit_message_button, window.changelog_button,
                           window.download_changelog_button], window.toolbar.get_children())
@@ -200,6 +242,30 @@ class WindowLayoutTest(unittest.TestCase):
         self.assertEqual((MODULE.Gtk.PolicyType.AUTOMATIC, MODULE.Gtk.PolicyType.NEVER),
                          window.history_action_scroll.get_policy())
         self.assertTrue(window.advanced_button.get_popup().get_children())
+
+    def test_help_button_opens_the_resolved_markdown_with_system_handler(self):
+        document = self.path / "HELP.md"
+        document.write_text("help", encoding="utf-8")
+        with mock.patch.object(MODULE, "help_document_path", return_value=document), \
+                mock.patch.object(MODULE.Gtk, "show_uri_on_window", return_value=True) as open_uri:
+            self.window.on_help(self.window.help_button)
+        open_uri.assert_called_once_with(
+            self.window, document.as_uri(), MODULE.Gdk.CURRENT_TIME,
+        )
+
+    def test_help_open_errors_use_the_existing_error_dialog(self):
+        with mock.patch.object(MODULE, "help_document_path", side_effect=MODULE.GitError("missing help")), \
+                mock.patch.object(self.window, "show_error") as show_error:
+            self.window.on_help(self.window.help_button)
+        show_error.assert_called_once_with("missing help")
+
+        document = self.path / "HELP.md"
+        with mock.patch.object(MODULE, "help_document_path", return_value=document), \
+                mock.patch.object(MODULE.Gtk, "show_uri_on_window", return_value=False), \
+                mock.patch.object(self.window, "show_error") as show_error:
+            self.window.on_help(self.window.help_button)
+        show_error.assert_called_once()
+        self.assertIn(str(document), show_error.call_args.args[0])
 
     def test_single_and_pair_selection_update_actions_and_dispatch_comparison(self):
         window = self.window
