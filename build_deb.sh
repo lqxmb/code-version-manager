@@ -40,3 +40,9 @@ install -m 0755 "$project_dir/data/code-version-manager" \
 
 dpkg-deb --root-owner-group --build "$stage" \
     "$output_dir/${package_name}_${package_version}_all.deb"
+
+(
+    cd -- "$output_dir"
+    sha256sum "${package_name}_${package_version}_all.deb" > \
+        "${package_name}_${package_version}_all.deb.sha256"
+)

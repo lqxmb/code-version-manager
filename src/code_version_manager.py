@@ -25,6 +25,8 @@ from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote, unquote, urlencode, urlsplit
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import gi
 
@@ -48,6 +50,19 @@ def load_application_version() -> str:
 APP_ID = "cn.local.CodeVersionManager"
 APP_NAME = "工作空间版本管理"
 APP_VERSION = load_application_version()
+APPLICATION_PACKAGE = "code-version-manager"
+APPLICATION_SOURCE = Path("/usr/lib/code-version-manager/code_version_manager.py")
+UPDATE_REPOSITORY = "lqxmb/code-version-manager"
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
+UPDATE_INTERVAL = 24 * 60 * 60
+UPDATE_TIMEOUT = 20
+UPDATE_MAX_PACKAGE_SIZE = 512 * 1024 * 1024
+UPDATE_DOWNLOAD_RESPONSE = 101
+UPDATE_INSTALL_RESPONSE = 102
+UPDATE_CANCEL_RESPONSE = 103
+UPDATE_RESTART_RESPONSE = 104
+RELEASE_WEB_URL = f"https://github.com/{UPDATE_REPOSITORY}/releases"
+RELEASE_API_PATH = f"repos/{UPDATE_REPOSITORY}"
 HELP_DOCUMENT_NAME = "HELP.md"
 HELP_DOCUMENT_SYSTEM_PATH = Path("/usr/share/doc/code-version-manager") / HELP_DOCUMENT_NAME
 DEFAULT_REPOSITORY = Path.home() / "catkin_ws"
@@ -498,6 +513,752 @@ def _read_settings(config_file: Path) -> configparser.ConfigParser:
     except (OSError, configparser.Error):
         pass
     return parser
+
+
+@dataclass(frozen=True)
+class ApplicationRelease:
+    version: str
+    tag: str
+    notes: str
+    page_url: str
+    package_url: str
+    package_size: int
+    checksum_url: str
+    checksum_size: int
+
+    @property
+    def filename(self) -> str:
+        return f"{APPLICATION_PACKAGE}_{self.version}_all.deb"
+
+
+@dataclass(frozen=True)
+class DownloadedApplicationUpdate:
+    release: ApplicationRelease
+    path: Path
+    sha256: str
+
+
+class UpdateCancelled(GitError):
+    pass
+
+
+def application_update_settings(config_file: Optional[Path] = None) -> Tuple[bool, float]:
+    parser = _read_settings(config_file or settings_file_path())
+    try:
+        automatic = parser.getboolean("updates", "auto_check", fallback=True)
+    except ValueError:
+        automatic = True
+    try:
+        last_success = parser.getfloat("updates", "last_success", fallback=0)
+        if not 0 <= last_success <= time.time():
+            last_success = 0
+    except ValueError:
+        last_success = 0
+    return automatic, last_success
+
+
+def save_application_update_settings(
+    automatic: Optional[bool] = None, last_success: Optional[float] = None,
+    config_file: Optional[Path] = None,
+) -> None:
+    config_file = config_file or settings_file_path()
+    parser = _read_settings(config_file)
+    if not parser.has_section("updates"):
+        parser.add_section("updates")
+    if automatic is not None:
+        parser.set("updates", "auto_check", "true" if automatic else "false")
+    if last_success is not None:
+        parser.set("updates", "last_success", str(last_success))
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=".updates-settings-", dir=str(config_file.parent))
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            parser.write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if config_file.exists():
+            temporary.chmod(stat.S_IMODE(config_file.stat().st_mode))
+        os.replace(temporary, config_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def application_update_due(now: Optional[float] = None) -> bool:
+    automatic, last_success = application_update_settings()
+    return automatic and (time.time() if now is None else now) - last_success >= UPDATE_INTERVAL
+
+
+def _validate_application_version(version: str) -> None:
+    # Versions also become asset names and local file names: never accept paths.
+    if not re.fullmatch(r"[0-9][0-9A-Za-z.+~:-]{0,99}", version):
+        raise GitError("软件发行版本号无效。")
+    result = subprocess.run(["/usr/bin/dpkg", "--validate-version", version],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise GitError("软件发行版本号不符合 Debian 版本规则。")
+
+
+def application_version_is_newer(candidate: str, current: str) -> bool:
+    _validate_application_version(candidate)
+    _validate_application_version(current)
+    result = subprocess.run(["/usr/bin/dpkg", "--compare-versions", candidate, "gt", current],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode not in (0, 1):
+        raise GitError("无法比较软件发行版本。")
+    return result.returncode == 0
+
+
+def _validate_update_url(url: str) -> str:
+    parsed = urlsplit(url)
+    if (parsed.scheme != "https" or parsed.username or parsed.password
+            or parsed.netloc != parsed.hostname or parsed.fragment):
+        raise GitError("升级下载地址必须使用受信任的 GitHub HTTPS 地址。")
+    if url == UPDATE_API_URL:
+        return url
+    if (parsed.hostname == "github.com" and not parsed.query
+            and parsed.path.startswith(f"/{UPDATE_REPOSITORY}/releases/download/")):
+        return url
+    if parsed.hostname in ("release-assets.githubusercontent.com", "objects.githubusercontent.com"):
+        return url
+    raise GitError("升级下载地址不属于指定 GitHub 项目或官方资产服务器。")
+
+
+class _UpdateRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_update_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_update_url(url: str):
+    _validate_update_url(url)
+    request = Request(url, headers={"User-Agent": f"{APPLICATION_PACKAGE}/{APP_VERSION}",
+                                   "Accept": "application/vnd.github+json" if url == UPDATE_API_URL
+                                   else "application/octet-stream"})
+    return build_opener(_UpdateRedirectHandler()).open(request, timeout=UPDATE_TIMEOUT)
+
+
+def check_application_update() -> Optional[ApplicationRelease]:
+    try:
+        with _open_update_url(UPDATE_API_URL) as response:
+            raw = response.read(2 * 1024 * 1024 + 1)
+        if len(raw) > 2 * 1024 * 1024:
+            raise GitError("软件发行信息过大，已停止检查。")
+        record = json.loads(raw.decode("utf-8"))
+        if not isinstance(record, dict):
+            raise ValueError("invalid release")
+        if record.get("draft") or record.get("prerelease"):
+            return None
+        tag = record.get("tag_name", "")
+        if not isinstance(tag, str) or not tag.startswith("v"):
+            raise GitError("软件发行标签应为 v<软件版本>。")
+        version = tag[1:]
+        _validate_application_version(version)
+        filename = f"{APPLICATION_PACKAGE}_{version}_all.deb"
+        assets = record.get("assets", [])
+        if not isinstance(assets, list) or any(not isinstance(asset, dict) for asset in assets):
+            raise ValueError("invalid assets")
+        selected = []
+        for name, limit in ((filename, UPDATE_MAX_PACKAGE_SIZE), (filename + ".sha256", 4096)):
+            matches = [asset for asset in assets if asset.get("name") == name]
+            if len(matches) != 1:
+                raise GitError(f"正式发行版缺少唯一附件：{name}。请联系发布者。")
+            asset = matches[0]
+            expected_url = (f"https://github.com/{UPDATE_REPOSITORY}/releases/download/"
+                            f"{quote(tag, safe='')}/{quote(name, safe='')}")
+            if asset.get("browser_download_url") != expected_url:
+                raise GitError("升级包附件地址与软件发行标签不匹配。")
+            size = asset.get("size")
+            if type(size) is not int or not 0 < size <= limit:
+                raise GitError("升级包附件大小无效。")
+            selected.append((expected_url, size))
+        return ApplicationRelease(version, tag, str(record.get("body") or "暂无更新说明。"),
+                                  f"https://github.com/{UPDATE_REPOSITORY}/releases/tag/{quote(tag, safe='')}",
+                                  *selected[0], *selected[1])
+    except HTTPError as error:
+        if error.code == 404:
+            return None
+        if error.code in (403, 429):
+            raise GitError("GitHub 拒绝检查请求或 API 已限流，请稍后重试。") from error
+        raise GitError(f"检查软件更新失败：GitHub HTTP {error.code}。") from error
+    except (URLError, OSError) as error:
+        raise GitError(f"无法连接软件更新服务器：{error}。请检查网络后重试。") from error
+    except (ValueError, TypeError, UnicodeError) as error:
+        raise GitError("无法解析 GitHub 软件发行信息。") from error
+
+
+def application_update_cache() -> Path:
+    application = Path(GLib.get_user_cache_dir()) / APPLICATION_PACKAGE
+    root = application / "updates"
+    for directory in (application, root):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if directory.is_symlink() or not directory.is_dir():
+            raise GitError("软件更新缓存目录不能是符号链接或特殊文件。")
+    return root
+
+
+def validate_application_package(path: Path, release: ApplicationRelease, expected_hash: str) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size != release.package_size:
+            raise GitError("升级包不是完整的普通 deb 文件。")
+        digest = hashlib.sha256()
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != expected_hash:
+        raise GitError("升级包 SHA-256 校验失败，请重新下载。")
+    result = subprocess.run(["/usr/bin/dpkg-deb", "--show",
+                             "--showformat=${Package}\n${Version}\n${Architecture}\n", str(path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+    if result.returncode or result.stdout.splitlines() != [APPLICATION_PACKAGE, release.version, "all"]:
+        raise GitError("deb 内的包名、版本或架构不匹配，已停止安装。")
+
+
+def download_application_update(
+    release: ApplicationRelease, cancel: threading.Event, progress=None,
+) -> DownloadedApplicationUpdate:
+    root = Path(tempfile.mkdtemp(prefix="download-", dir=str(application_update_cache())))
+    completed = False
+    try:
+        if cancel.is_set():
+            raise UpdateCancelled("下载已取消。")
+        with _open_update_url(release.checksum_url) as response:
+            checksum = response.read(4097)
+        if len(checksum) != release.checksum_size or len(checksum) > 4096:
+            raise GitError("校验文件大小不匹配。")
+        match = re.fullmatch(r"([0-9a-fA-F]{64}) [ *]" + re.escape(release.filename) + r"\r?\n?",
+                             checksum.decode("ascii"))
+        if not match:
+            raise GitError("升级包 SHA-256 校验文件格式无效。")
+        expected_hash = match.group(1).lower()
+        temporary = root / (release.filename + ".part")
+        downloaded = 0
+        started = time.monotonic()
+        with _open_update_url(release.package_url) as response, temporary.open("xb") as output:
+            temporary.chmod(0o600)
+            while True:
+                if cancel.is_set():
+                    raise UpdateCancelled("下载已取消。")
+                if time.monotonic() - started > 900:
+                    raise GitError("升级包下载超过 15 分钟，请稍后重试。")
+                block = response.read(64 * 1024)
+                if not block:
+                    break
+                downloaded += len(block)
+                if downloaded > release.package_size:
+                    raise GitError("升级包大小超过发行信息中的大小。")
+                output.write(block)
+                if progress:
+                    progress(downloaded, release.package_size)
+            output.flush()
+            os.fsync(output.fileno())
+        if cancel.is_set():
+            raise UpdateCancelled("下载已取消。")
+        validate_application_package(temporary, release, expected_hash)
+        if cancel.is_set():
+            raise UpdateCancelled("下载已取消。")
+        final = root / release.filename
+        os.replace(temporary, final)
+        completed = True
+        return DownloadedApplicationUpdate(release, final, expected_hash)
+    except (URLError, OSError, UnicodeError) as error:
+        raise GitError(f"下载软件更新失败：{error}") from error
+    finally:
+        if not completed:
+            shutil.rmtree(root)
+
+
+def installed_application() -> bool:
+    return Path(__file__).resolve() == APPLICATION_SOURCE
+
+
+def install_application_update(update: DownloadedApplicationUpdate) -> str:
+    if not installed_application():
+        raise GitError("源码运行时请按安装指南手动安装已下载的 deb。")
+    validate_application_package(update.path, update.release, update.sha256)
+    log_path = update.path.parent / "install.log"
+    descriptor = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as log:
+        try:
+            # APT must never wait for terminal input or remove another package.
+            result = subprocess.run(["/usr/bin/pkexec", "/usr/bin/apt-get", "--yes",
+                                     "--no-remove", "-o", "Dpkg::Options::=--force-confold",
+                                     "install", str(update.path)],
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        except OSError as error:
+            raise GitError(f"无法启动系统安装程序：{error}。安装日志：{log_path}") from error
+    if result.returncode:
+        detail = log_path.read_text(encoding="utf-8", errors="replace")[-12000:]
+        reason = ("管理员授权已取消或未获准。" if result.returncode in (126, 127)
+                  else "系统安装未完成，请检查 APT 锁占用、依赖或网络后重试。")
+        raise GitError(f"{reason}\n安装包：{update.path}\n安装日志：{log_path}\n\n{detail}")
+    query = subprocess.run(["/usr/bin/dpkg-query", "--show",
+                            "--showformat=${Status}\n${Version}\n", APPLICATION_PACKAGE],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if query.returncode or query.stdout.splitlines() != ["install ok installed", update.release.version]:
+        raise GitError(f"安装程序已结束，但未确认目标版本安装成功。请核对系统包状态。安装日志：{log_path}")
+    return f"软件 {update.release.version} 已安装。安装日志：{log_path}"
+
+
+@dataclass(frozen=True)
+class SoftwareReleasePackage:
+    path: Path
+    version: str
+    size: int
+    sha256: str
+
+    @property
+    def tag(self) -> str:
+        return "v" + self.version
+
+    @property
+    def checksum_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".sha256")
+
+    @property
+    def assets(self) -> Tuple[Path, ...]:
+        return self.path, self.checksum_path
+
+
+@dataclass(frozen=True)
+class SoftwareReleaseAsset:
+    asset_id: int
+    name: str
+    size: int
+    digest: str
+    updated_at: str
+    state: str
+
+
+@dataclass(frozen=True)
+class SoftwareReleaseState:
+    release_id: int
+    tag: str
+    draft: bool
+    prerelease: bool
+    title: str
+    notes: str
+    updated_at: str
+    assets: Tuple[SoftwareReleaseAsset, ...]
+
+    @property
+    def url(self) -> str:
+        return RELEASE_WEB_URL + ("/edit/" if self.draft else "/tag/") + quote(self.tag, safe="")
+
+
+@dataclass(frozen=True)
+class SoftwareReleasePlan:
+    package: SoftwareReleasePackage
+    title: str
+    notes: str
+    tag_oid: str
+    commit_oid: str
+    draft: Optional[SoftwareReleaseState]
+    latest: Optional[SoftwareReleaseState]
+
+
+@dataclass(frozen=True)
+class SoftwareReleaseResult:
+    url: str
+    confirmed: bool
+    message: str
+
+
+def _release_file_hash(path: Path) -> str:
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise GitError("发布附件必须是普通文件。")
+        digest = hashlib.sha256()
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def prepare_software_release(source: Path, cancel: threading.Event) -> SoftwareReleasePackage:
+    root = Path(tempfile.mkdtemp(prefix="publish-", dir=str(application_update_cache())))
+    try:
+        target = root / "package.deb"
+        descriptor = os.open(str(source), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as handle, target.open("xb") as output:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= UPDATE_MAX_PACKAGE_SIZE:
+                raise GitError("请选择不超过 512 MiB 的普通 deb 文件。")
+            copied = 0
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                if cancel.is_set():
+                    raise UpdateCancelled("准备发布已取消。")
+                copied += len(block)
+                if copied > before.st_size:
+                    raise GitError("选择的 deb 在复制期间发生变化，请重新选择。")
+                output.write(block)
+            after = os.fstat(handle.fileno())
+            if copied != before.st_size or (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise GitError("选择的 deb 在复制期间发生变化，请重新选择。")
+        identity = subprocess.run(["/usr/bin/dpkg-deb", "--show",
+                                   "--showformat=${Package}\n${Version}\n${Architecture}\n", str(target)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        fields = identity.stdout.splitlines()
+        if identity.returncode or len(fields) != 3 or fields[0] != APPLICATION_PACKAGE or fields[2] != "all":
+            raise GitError("只可发布 code-version-manager 的 Architecture: all 软件包。")
+        version = fields[1]
+        _validate_application_version(version)
+        final = root / f"{APPLICATION_PACKAGE}_{version}_all.deb"
+        target.rename(final)
+        digest = _release_file_hash(final)
+        adjacent = source.with_name(source.name + ".sha256")
+        if os.path.lexists(str(adjacent)):
+            descriptor = os.open(str(adjacent), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise GitError("相邻校验文件必须是普通文件。")
+                checksum = handle.read(4097).decode("ascii")
+            match = re.fullmatch(r"([0-9a-fA-F]{64}) [ *](.+)\r?\n?", checksum)
+            if (not match or match.group(1).lower() != digest
+                    or match.group(2).rstrip("\r") not in (source.name, final.name)):
+                raise GitError("相邻 SHA-256 校验文件与所选 deb 不一致。")
+        package = SoftwareReleasePackage(final, version, copied, digest)
+        package.checksum_path.write_text(f"{digest}  {final.name}\n", encoding="ascii")
+        for asset in package.assets:
+            asset.chmod(0o400)
+        if cancel.is_set():
+            raise UpdateCancelled("准备发布已取消。")
+        return package
+    except Exception:
+        shutil.rmtree(root)
+        raise
+
+
+class SoftwareReleasePublisher:
+    """Publish application packages; never read or mutate a workspace repository."""
+
+    def __init__(self, cancel: Optional[threading.Event] = None, progress=None):
+        self.cancel = cancel if cancel is not None else threading.Event()
+        self.progress = progress or (lambda _message, _fraction: None)
+        self.executable = shutil.which("gh")
+
+    def _run(self, arguments: Sequence[str], data: Optional[bytes] = None,
+             output=None, timeout: int = 120, raw_command: bool = False):
+        if not self.executable:
+            raise GitError("未安装 GitHub CLI（gh）。请按 INSTALL.md 安装后重试。")
+        if self.cancel.is_set():
+            raise UpdateCancelled("发布已取消。")
+        environment = os.environ.copy()
+        environment.update(GH_HOST="github.com", GH_PROMPT_DISABLED="1", GH_PAGER="cat")
+        environment.pop("GH_DEBUG", None)
+        if raw_command:
+            environment.pop("GH_PROMPT_DISABLED", None)
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr, tempfile.TemporaryFile() as stdin:
+            if data is not None:
+                stdin.write(data)
+                stdin.seek(0)
+            command = list(arguments) if raw_command else [self.executable, *arguments]
+            with subprocess.Popen(command, stdin=stdin, stdout=output or stdout, stderr=stderr,
+                                  env=environment, cwd=tempfile.gettempdir(), start_new_session=True) as process:
+                started = time.monotonic()
+                try:
+                    while process.poll() is None:
+                        if self.cancel.wait(0.1):
+                            raise UpdateCancelled("发布已取消。")
+                        if time.monotonic() - started > timeout:
+                            raise GitError("GitHub 操作超时。")
+                except BaseException:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait()
+                    raise
+                stdout.seek(0)
+                stderr.seek(0)
+                return process.returncode, stdout.read(4 * 1024 * 1024), stderr.read(16000)
+
+    def check_tools(self) -> None:
+        for command, required in ((["api", "--help"], ("--hostname", "--method", "--input")),
+                                  (["auth", "login", "--help"], ("--web", "--git-protocol", "--skip-ssh-key")),
+                                  (["release", "create", "--help"], ("--verify-tag", "--draft", "--notes-file"))):
+            code, stdout, stderr = self._run(command)
+            help_text = (stdout + stderr).decode("utf-8", errors="replace")
+            if code or any(flag not in help_text for flag in required):
+                raise GitError("GitHub CLI 版本不支持所需的发布能力，请按 INSTALL.md 升级 gh。")
+
+    def _api(self, method: str, path: str, payload=None, missing: bool = False):
+        if path != RELEASE_API_PATH and not path.startswith(RELEASE_API_PATH + "/") and path != "user":
+            raise GitError("拒绝访问其他发布目标。")
+        arguments = ["api", "--hostname", "github.com", "--method", method, path,
+                     "--header", "Accept: application/vnd.github+json"]
+        data = None
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            arguments.extend(["--input", "-"])
+        code, stdout, stderr = self._run(arguments, data=data)
+        if code:
+            message = stderr.decode("utf-8", errors="replace")
+            if missing and re.search(r"HTTP 404\b", message):
+                return None
+            if re.search(r"HTTP (401|403)\b", message):
+                raise GitError("GitHub 登录已失效、账号无发布权限或请求受到限制，请核对登录和仓库权限。")
+            raise GitError("GitHub 请求失败，请检查网络和权限后重试。")
+        try:
+            return json.loads(stdout.decode("utf-8"))
+        except (ValueError, UnicodeError) as error:
+            raise GitError("无法解析 GitHub 发布响应，请重新检查。") from error
+
+    def authentication(self) -> str:
+        self.check_tools()
+        code, _stdout, _stderr = self._run(["auth", "status", "--hostname", "github.com"])
+        if code:
+            raise GitError("尚未登录 GitHub 或授权已失效，请点击“登录 GitHub”。")
+        user = self._api("GET", "user")
+        if not isinstance(user, dict) or not isinstance(user.get("login"), str):
+            raise GitError("无法确认 GitHub 登录账号。")
+        return user["login"]
+
+    def login(self) -> str:
+        self.check_tools()
+        if shutil.which("gnome-terminal"):
+            terminal = [shutil.which("gnome-terminal"), "--wait", "--"]
+        elif shutil.which("x-terminal-emulator"):
+            terminal = [shutil.which("x-terminal-emulator"), "-e"]
+        else:
+            raise GitError("找不到桌面终端。请在终端运行 gh auth login --hostname github.com --web --git-protocol ssh --skip-ssh-key，再点击检查登录。")
+        command = terminal + [self.executable, "auth", "login", "--hostname", "github.com",
+                              "--web", "--git-protocol", "ssh", "--skip-ssh-key"]
+        self._run(command, timeout=900, raw_command=True)
+        return self.authentication()
+
+    @staticmethod
+    def _state(record) -> SoftwareReleaseState:
+        try:
+            if (type(record["id"]) is not int or record["id"] <= 0
+                    or type(record["draft"]) is not bool or type(record["prerelease"]) is not bool
+                    or not isinstance(record["tag_name"], str)):
+                raise ValueError("release")
+            assets = tuple(sorted((SoftwareReleaseAsset(
+                item["id"], item["name"], item["size"], item.get("digest") or "",
+                item.get("updated_at", ""), item["state"]) for item in record.get("assets", [])),
+                key=lambda item: (item.name, item.asset_id)))
+            if any(type(item.asset_id) is not int or item.asset_id <= 0 or type(item.size) is not int
+                   or item.size < 0 or not isinstance(item.name, str) for item in assets):
+                raise ValueError("asset")
+            return SoftwareReleaseState(record["id"], record["tag_name"], record["draft"], record["prerelease"],
+                                        record.get("name") or "", record.get("body") or "",
+                                        record.get("updated_at", ""), assets)
+        except (KeyError, TypeError, ValueError, AttributeError) as error:
+            raise GitError("GitHub 发行或附件数据无效，已停止发布。") from error
+
+    def _find(self, tag: str) -> Optional[SoftwareReleaseState]:
+        matches = []
+        for page in range(1, 101):
+            records = self._api("GET", f"{RELEASE_API_PATH}/releases?per_page=100&page={page}")
+            if not isinstance(records, list):
+                raise GitError("无法读取 GitHub 发行列表。")
+            if any(not isinstance(record, dict) for record in records):
+                raise GitError("GitHub 发行列表包含无效记录。")
+            matches.extend(self._state(record) for record in records if record.get("tag_name") == tag)
+            if len(records) < 100:
+                break
+        else:
+            raise GitError("发行记录过多，无法完成唯一性检查。")
+        if len(matches) > 1:
+            raise GitError("同版本有多份发行记录，请到 GitHub 网页处理后重试。\n" + RELEASE_WEB_URL)
+        return matches[0] if matches else None
+
+    def _tag(self, tag: str) -> Tuple[str, str]:
+        record = self._api("GET", f"{RELEASE_API_PATH}/git/ref/tags/{quote(tag, safe='')}", missing=True)
+        if record is None:
+            raise GitError(f"远程缺少标签 {tag}，请先将对应软件版本标签推送到 GitHub。")
+        try:
+            original = record["object"]["sha"]
+            obj = record["object"]
+            for _level in range(16):
+                if not re.fullmatch(r"[0-9a-f]{40,64}", obj["sha"]):
+                    raise ValueError("oid")
+                if obj["type"] == "commit":
+                    return original, obj["sha"]
+                if obj["type"] != "tag":
+                    raise ValueError("tag")
+                obj = self._api("GET", f"{RELEASE_API_PATH}/git/tags/{obj['sha']}")["object"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise GitError("远程标签未指向有效代码提交。") from error
+        raise GitError("远程标签嵌套过深。")
+
+    def _latest(self) -> Optional[SoftwareReleaseState]:
+        record = self._api("GET", RELEASE_API_PATH + "/releases/latest", missing=True)
+        return self._state(record) if record is not None else None
+
+    @staticmethod
+    def _verify_package(package: SoftwareReleasePackage) -> None:
+        expected_checksum = f"{package.sha256}  {package.path.name}\n".encode("ascii")
+        if (package.path.stat().st_size != package.size
+                or _release_file_hash(package.path) != package.sha256
+                or _release_file_hash(package.checksum_path) != hashlib.sha256(expected_checksum).hexdigest()):
+            raise GitError("准备的发布附件发生变化，请重新选择 deb。")
+
+    def _verify_assets(self, state: SoftwareReleaseState, package: SoftwareReleasePackage, complete=False) -> None:
+        files = {path.name: path for path in package.assets}
+        names = [asset.name for asset in state.assets]
+        if len(set(names)) != len(names) or set(names) - set(files) or (complete and set(names) != set(files)):
+            raise GitError("草稿附件不完整、重复或有额外附件，请到网页处理后重试。\n" + state.url)
+        for asset in state.assets:
+            path = files[asset.name]
+            expected = _release_file_hash(path)
+            if asset.state != "uploaded" or asset.size != path.stat().st_size:
+                raise GitError("同名附件未上传完成或内容不一致，请到网页处理。\n" + state.url)
+            if asset.digest:
+                actual = asset.digest
+            else:
+                with tempfile.TemporaryFile() as output:
+                    code, _stdout, _stderr = self._run(
+                        ["api", "--hostname", "github.com", "--method", "GET",
+                         f"{RELEASE_API_PATH}/releases/assets/{asset.asset_id}",
+                         "--header", "Accept: application/octet-stream"], output=output, timeout=900)
+                    if code or output.tell() != asset.size:
+                        raise GitError("无法校验草稿中的已有附件，请重试。")
+                    output.seek(0)
+                    digest = hashlib.sha256()
+                    for block in iter(lambda: output.read(1024 * 1024), b""):
+                        digest.update(block)
+                    actual = "sha256:" + digest.hexdigest()
+            if actual != "sha256:" + expected:
+                raise GitError("同名附件内容不一致，禁止覆盖；请到网页处理。\n" + state.url)
+
+    def preview(self, package: SoftwareReleasePackage, title: str, notes: str) -> SoftwareReleasePlan:
+        title, notes = title.strip(), notes.strip()
+        if not title or not notes or len(title) > 256 or len(notes.encode("utf-8")) > 100000:
+            raise GitError("请填写发行标题（最多 256 字符）和更新说明（最多 100 KB）。")
+        self.progress("检查 GitHub 登录和发布权限…", 0.05)
+        self.authentication()
+        repository = self._api("GET", RELEASE_API_PATH)
+        if not repository.get("permissions", {}).get("push"):
+            raise GitError("当前 GitHub 账号没有该仓库的发布权限。")
+        self._verify_package(package)
+        tag_oid, commit_oid = self._tag(package.tag)
+        draft = self._find(package.tag)
+        if draft is not None and (not draft.draft or draft.prerelease):
+            raise GitError("该版本已公开或标为预发布，禁止覆盖。\n" + draft.url)
+        latest = self._latest()
+        if latest is not None:
+            if not latest.tag.startswith("v") or not application_version_is_newer(package.version, latest.tag[1:]):
+                raise GitError("正式新版必须高于 GitHub 当前最新正式发行版。")
+        if draft is not None:
+            self._verify_assets(draft, package)
+        return SoftwareReleasePlan(package, title, notes, tag_oid, commit_oid, draft, latest)
+
+    def _unchanged(self, expected: SoftwareReleaseState) -> SoftwareReleaseState:
+        current = self._find(expected.tag)
+        if current != expected or not current.draft:
+            raise GitError("确认后草稿或附件发生变化，请重新检查。")
+        return current
+
+    def publish(self, plan: SoftwareReleasePlan) -> SoftwareReleaseResult:
+        package = plan.package
+        current = plan.draft
+        public_request = False
+        stage = "重新检查发布确认"
+        try:
+            if self.preview(package, plan.title, plan.notes) != plan:
+                raise GitError("确认后标签、草稿或最新发行版发生变化，请重新检查。")
+            if current is None:
+                stage = "创建草稿"
+                self.progress(stage, 0.15)
+                notes_path = package.path.parent / "release-notes.md"
+                notes_path.write_text(plan.notes, encoding="utf-8")
+                code, _stdout, _stderr = self._run(
+                    ["release", "create", package.tag, "--repo", "github.com/" + UPDATE_REPOSITORY,
+                     "--verify-tag", "--draft", "--title", plan.title, "--notes-file", str(notes_path)])
+                if code:
+                    raise GitError("创建草稿失败，请重新检查 GitHub 状态。")
+                current = self._find(package.tag)
+                if current is None or not current.draft:
+                    raise GitError("未确认新草稿创建成功。")
+                if current.title != plan.title or current.notes != plan.notes or current.prerelease or current.assets:
+                    raise GitError("新草稿与确认信息不一致，请重新检查。")
+            elif current.title != plan.title or current.notes != plan.notes:
+                self._unchanged(current)
+                changed = self._state(self._api("PATCH", f"{RELEASE_API_PATH}/releases/{current.release_id}",
+                                                {"name": plan.title, "body": plan.notes}))
+                if (not changed.draft or changed.prerelease or changed.tag != package.tag
+                        or changed.release_id != current.release_id or changed.assets != current.assets
+                        or changed.title != plan.title or changed.notes != plan.notes):
+                    raise GitError("草稿状态发生变化，已停止发布。")
+                current = changed
+            for position, path in enumerate(package.assets):
+                self._verify_package(package)
+                self._unchanged(current)
+                if any(asset.name == path.name for asset in current.assets):
+                    self.progress(f"复用已校验附件 {position + 1}/2：{path.name}", 0.3 + position * 0.25)
+                    continue
+                stage = f"上传附件 {position + 1}/2：{path.name}"
+                self.progress(stage, 0.3 + position * 0.25)
+                code, _stdout, _stderr = self._run(
+                    ["release", "upload", package.tag, str(path),
+                     "--repo", "github.com/" + UPDATE_REPOSITORY], timeout=900)
+                if code:
+                    raise GitError("附件上传失败，已上传的附件保留在草稿中。")
+                fresh = self._find(package.tag)
+                if (fresh is None or not fresh.draft or fresh.release_id != current.release_id
+                        or fresh.title != plan.title or fresh.notes != plan.notes or fresh.prerelease
+                        or tuple(asset for asset in fresh.assets if asset.name != path.name) != current.assets):
+                    raise GitError("上传期间草稿发生其他变化，请重新检查。")
+                self._verify_assets(fresh, package)
+                current = fresh
+            stage = "校验完整草稿"
+            self.progress(stage, 0.85)
+            self._unchanged(current)
+            self._verify_package(package)
+            self._verify_assets(current, package, complete=True)
+            if self._tag(package.tag) != (plan.tag_oid, plan.commit_oid) or self._latest() != plan.latest:
+                raise GitError("上传期间远程标签或最新发行版发生变化，请重新检查。")
+            self._unchanged(current)
+            if self.cancel.is_set():
+                raise UpdateCancelled("发布已取消。")
+            stage = "公开正式 Release"
+            self.progress(stage, 0.95)
+            public_request = True
+            self._api("PATCH", f"{RELEASE_API_PATH}/releases/{current.release_id}",
+                      {"draft": False, "prerelease": False, "make_latest": "true"})
+        except Exception as error:
+            if not public_request:
+                known_assets = "、".join(asset.name for asset in current.assets) if current else "尚未确认"
+                draft_url = current.url if current else RELEASE_WEB_URL + "/edit/" + quote(package.tag, safe="")
+                raise GitError(f"{error}\n已执行到：{stage}。\n已确认的附件：{known_assets or '无'}。\n"
+                               f"草稿若已创建将保留；打开网页核对后可继续同版本草稿：{draft_url}") from error
+        # Once the publish request has been sent, never retry it. Cancellation
+        # cannot determine its outcome, so reconcile using fresh read requests.
+        old_cancel = self.cancel
+        self.cancel = threading.Event()
+        url = RELEASE_WEB_URL + "/tag/" + quote(package.tag, safe="")
+        try:
+            state = self._find(package.tag)
+            if state is not None:
+                url = state.url
+            if (state is None or state.draft or state.prerelease or state.release_id != current.release_id
+                    or state.title != plan.title or state.notes != plan.notes):
+                raise GitError("尚未确认公开状态。")
+            self._verify_assets(state, package, complete=True)
+            latest = self._latest()
+            if latest != state or self._tag(package.tag) != (plan.tag_oid, plan.commit_oid):
+                raise GitError("最新正式发行接口或标签尚未确认。")
+            # Also verify the exact public interface consumed by installed clients.
+            release = check_application_update()
+            if (release is None or release.version != package.version or release.package_size != package.size
+                    or release.checksum_size != package.checksum_path.stat().st_size):
+                raise GitError("客户端更新接口尚未显示该版本和附件。")
+            self.progress("发布完成", 1.0)
+            return SoftwareReleaseResult(url, True, "正式 Release 已发布，两个附件已校验，客户端更新接口已确认。")
+        except Exception as error:
+            return SoftwareReleaseResult(url, False, f"公开结果待确认：{error} 请先打开网页核对，不要重复发布。")
+        finally:
+            self.cancel = old_cancel
 
 
 def window_settings(config_file: Optional[Path] = None) -> Tuple[int, int, bool]:
@@ -4656,6 +5417,221 @@ class FileSelectionDialog(Gtk.Dialog):
         return [row[2] for row in self.store if row[0]]
 
 
+class SoftwareReleaseDialog(Gtk.Dialog):
+    def __init__(self, parent):
+        super().__init__(title="发布软件到 GitHub", transient_for=parent, modal=False)
+        self.set_destroy_with_parent(True)
+        self.set_default_size(720, 640)
+        self.alive = True
+        self.busy = False
+        self.cancel = threading.Event()
+        self.package: Optional[SoftwareReleasePackage] = None
+        self.timer: Optional[int] = None
+        self.add_button("关闭", Gtk.ResponseType.CLOSE)
+        self.add_button("取消操作", Gtk.ResponseType.CANCEL)
+        self.add_button("检查并发布", Gtk.ResponseType.OK)
+        content = self.get_content_area()
+        content.set_border_width(16)
+        content.set_spacing(10)
+        content.pack_start(Gtk.Label(label="目标仓库：" + UPDATE_REPOSITORY, xalign=0), False, False, 0)
+        self.inputs = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        content.pack_start(self.inputs, False, False, 0)
+        auth_row = Gtk.Box(spacing=8)
+        self.auth_label = Gtk.Label(label="尚未检查 GitHub 登录", xalign=0)
+        auth_row.pack_start(self.auth_label, True, True, 0)
+        for text, login in (("检查登录", False), ("登录 GitHub", True)):
+            button = Gtk.Button(label=text)
+            button.connect("clicked", self._login, login)
+            auth_row.pack_start(button, False, False, 0)
+        self.inputs.pack_start(auth_row, False, False, 0)
+        self.chooser = Gtk.FileChooserButton(title="选择本软件 deb 升级包", action=Gtk.FileChooserAction.OPEN)
+        package_filter = Gtk.FileFilter()
+        package_filter.set_name("Debian 软件包 (*.deb)")
+        package_filter.add_pattern("*.deb")
+        self.chooser.add_filter(package_filter)
+        self.chooser.connect("file-set", self._select_package)
+        self.inputs.pack_start(self.chooser, False, False, 0)
+        self.version_entry = Gtk.Entry(editable=False)
+        self.version_entry.set_placeholder_text("选择 deb 后读取版本和远程标签")
+        self.inputs.pack_start(self.version_entry, False, False, 0)
+        self.title_entry = Gtk.Entry()
+        self.title_entry.set_placeholder_text("发行标题")
+        self.inputs.pack_start(self.title_entry, False, False, 0)
+        self.inputs.pack_start(Gtk.Label(label="更新说明", xalign=0), False, False, 0)
+        self.notes = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        notes_scroll = Gtk.ScrolledWindow()
+        notes_scroll.set_min_content_height(130)
+        notes_scroll.add(self.notes)
+        self.inputs.pack_start(notes_scroll, True, True, 0)
+        self.progress = Gtk.ProgressBar(show_text=True)
+        content.pack_start(self.progress, False, False, 0)
+        self.details = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        details_scroll = Gtk.ScrolledWindow()
+        details_scroll.set_min_content_height(100)
+        details_scroll.add(self.details)
+        content.pack_start(details_scroll, True, True, 0)
+        self.link = Gtk.LinkButton.new_with_label(RELEASE_WEB_URL, "打开 GitHub Releases")
+        content.pack_start(self.link, False, False, 0)
+        self.connect("response", self._response)
+        self.connect("delete-event", self._delete)
+        self.connect("destroy", self._destroyed)
+        self.show_all()
+        self._sensitivity()
+        self._message("请选择已构建的 deb，并填写更新说明。首次使用请在浏览器完成 GitHub CLI 登录。")
+
+    def _message(self, text: str) -> None:
+        self.details.get_buffer().set_text(text)
+
+    def _sensitivity(self) -> None:
+        self.inputs.set_sensitive(not self.busy)
+        self.get_widget_for_response(Gtk.ResponseType.OK).set_sensitive(not self.busy and self.package is not None)
+        self.get_widget_for_response(Gtk.ResponseType.CANCEL).set_sensitive(self.busy and not self.cancel.is_set())
+
+    def _pulse(self) -> bool:
+        if self.alive and self.busy:
+            self.progress.pulse()
+            return True
+        self.timer = None
+        return False
+
+    def _worker(self, operation, callback) -> None:
+        parent = self.get_transient_for()
+        if parent is not None and getattr(parent, "update_installing", False):
+            self._message("软件正在安装更新，请等待安装完成后再发布。")
+            return
+        self.busy = True
+        self.cancel = threading.Event()
+        self._sensitivity()
+        if self.timer is None:
+            self.timer = GLib.timeout_add(250, self._pulse)
+        cancel = self.cancel
+        def worker():
+            try:
+                result, error = operation(cancel), ""
+            except Exception as exception:
+                result, error = None, str(exception)
+            GLib.idle_add(deliver, result, error)
+        def deliver(result, error):
+            if self.alive:
+                callback(result, error)
+            else:
+                if isinstance(result, SoftwareReleasePackage):
+                    shutil.rmtree(result.path.parent)
+                if self.package is not None:
+                    shutil.rmtree(self.package.path.parent, ignore_errors=True)
+            return False
+        threading.Thread(target=worker, daemon=False).start()
+
+    def _finish(self, message: str) -> None:
+        self.busy = False
+        if self.timer is not None:
+            GLib.source_remove(self.timer)
+            self.timer = None
+        self._sensitivity()
+        self._message(message)
+
+    def _login(self, _button, login: bool) -> None:
+        if self.busy:
+            return
+        self._message("请在打开的终端和浏览器完成登录…" if login else "正在检查 GitHub CLI 登录…")
+        self._worker(lambda cancel: (SoftwareReleasePublisher(cancel).login() if login
+                                    else SoftwareReleasePublisher(cancel).authentication()), self._login_done)
+
+    def _login_done(self, account, error: str) -> None:
+        self.auth_label.set_text("已登录：" + account if not error else "GitHub 登录尚未确认")
+        self._finish(error or "已确认 GitHub 登录，可选择升级包并发布。")
+
+    def _select_package(self, chooser) -> None:
+        if self.busy or not chooser.get_filename():
+            return
+        source = Path(chooser.get_filename())
+        self._message("正在固定升级包副本并校验…")
+        self._worker(lambda cancel: prepare_software_release(source, cancel), self._package_ready)
+
+    def _package_ready(self, package, error: str) -> None:
+        if self.package is not None:
+            shutil.rmtree(self.package.path.parent)
+        self.package = package
+        self.link.set_uri(RELEASE_WEB_URL)
+        self.link.set_label("打开 GitHub Releases")
+        self.progress.set_fraction(0)
+        self.version_entry.set_text(package.tag if package else "")
+        if package:
+            self.title_entry.set_text("Code Version Manager " + package.version)
+        self._finish(error or f"已准备 {package.path.name} 及 SHA-256 校验文件。")
+
+    def _progress(self, message: str, fraction: float) -> None:
+        def deliver():
+            if self.alive:
+                self.progress.set_text(message)
+                self.progress.set_fraction(fraction)
+            return False
+        GLib.idle_add(deliver)
+
+    def _response(self, _dialog, response: int) -> None:
+        if self.busy:
+            if response in (Gtk.ResponseType.CLOSE, Gtk.ResponseType.DELETE_EVENT, Gtk.ResponseType.CANCEL):
+                self.cancel.set()
+                self._message("正在停止操作；已上传内容会保留在草稿中，公开请求若已发出将先核实结果。")
+                self._sensitivity()
+            return
+        if response == Gtk.ResponseType.OK and self.package is not None:
+            buffer = self.notes.get_buffer()
+            notes = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
+            package, title = self.package, self.title_entry.get_text()
+            self._message("正在检查远程标签、草稿、权限和最新正式版…")
+            self._worker(lambda cancel: SoftwareReleasePublisher(cancel, self._progress).preview(package, title, notes),
+                         self._preview_ready)
+        elif response != Gtk.ResponseType.CANCEL:
+            self.destroy()
+
+    def _preview_ready(self, plan, error: str) -> None:
+        if error:
+            self._finish(error)
+            return
+        if self.cancel.is_set():
+            self._finish("预检查已取消，尚未修改远程发行。")
+            return
+        package = plan.package
+        confirmation = Gtk.MessageDialog(transient_for=self, modal=True, buttons=Gtk.ButtonsType.OK_CANCEL,
+                                         message_type=Gtk.MessageType.QUESTION, text="确认发布软件到 GitHub？")
+        confirmation.format_secondary_text(
+            f"目标：{UPDATE_REPOSITORY}\n版本：{package.tag}\n标签对象：{plan.tag_oid}\n代码提交：{plan.commit_oid}\n"
+            + ("将继续已有草稿：" + plan.draft.url + "\n" if plan.draft else "将创建新草稿，附件齐全后公开。\n")
+            + f"附件：{package.path.name}（{format_storage_size(package.size)}）\n"
+            + f"{package.checksum_path.name}（{package.checksum_path.stat().st_size} 字节）\n"
+            + f"标题：{plan.title}\n\n{plan.notes}")
+        response = confirmation.run()
+        confirmation.destroy()
+        if not self.alive:
+            return
+        if response != Gtk.ResponseType.OK or self.cancel.is_set():
+            self._finish("已取消发布确认，尚未修改远程发行。")
+            return
+        self._worker(lambda cancel: SoftwareReleasePublisher(cancel, self._progress).publish(plan), self._published)
+
+    def _published(self, result, error: str) -> None:
+        if result is not None:
+            self.link.set_uri(result.url)
+            self.link.set_label("打开已发布版本" if result.confirmed else "打开网页核对发布结果")
+        self._finish(error or (result.message + "\n" + result.url))
+
+    def _delete(self, *_args) -> bool:
+        if self.busy:
+            self._response(self, Gtk.ResponseType.CLOSE)
+            return True
+        return False
+
+    def _destroyed(self, _dialog) -> None:
+        self.alive = False
+        self.cancel.set()
+        if self.timer is not None:
+            GLib.source_remove(self.timer)
+            self.timer = None
+        if self.package is not None and not self.busy:
+            shutil.rmtree(self.package.path.parent)
+
+
 class VersionManagerWindow(Gtk.ApplicationWindow):
     def __init__(self, application: Gtk.Application, initial_path: Path):
         super().__init__(application=application, title=APP_NAME)
@@ -4678,6 +5654,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.busy = False
         self.background_timer: Optional[int] = None
         self.remote_status_generation = 0
+        self.remote_checks_running = 0
         self.remote_status_snapshot: Optional[RemoteSyncSnapshot] = None
         self.remote_status = RemoteSyncStatus("unavailable", "尚未检查远程状态。")
         self.remote_sync_error: Optional[str] = None
@@ -4687,6 +5664,21 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.branch_choices: Dict[str, BranchChoice] = {}
         self.updating_branch_choices = False
         self.updating_history_scope = False
+        self.update_alive = True
+        self.update_checking = False
+        self.update_manual_check = False
+        self.update_downloading = False
+        self.update_installing = False
+        self.software_release_dialog: Optional[SoftwareReleaseDialog] = None
+        self.update_release: Optional[ApplicationRelease] = None
+        self.downloaded_update: Optional[DownloadedApplicationUpdate] = None
+        self.update_cancel = threading.Event()
+        self.update_dialog: Optional[Gtk.Dialog] = None
+        self.update_timer: Optional[int] = None
+        self.connect("map", self._schedule_application_update)
+        self.connect("delete-event", lambda *_args: self.update_installing or bool(
+            self.software_release_dialog is not None and self.software_release_dialog.busy))
+        self.connect("destroy", self._destroy_application_updates)
         self.connect("destroy", lambda _window: self._invalidate_requests())
         self.connect("configure-event", self._on_window_configure)
         self.connect("window-state-event", self._on_window_state)
@@ -4760,6 +5752,13 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         header.pack_end(self.help_button)
         self.about_button = self._command_button("关于", "help-about-symbolic", self.on_about)
         header.pack_end(self.about_button)
+        self.update_button = self._command_button(
+            "发现软件更新", "software-update-available-symbolic", self.on_application_update_details
+        )
+        self.update_button.show_all()
+        self.update_button.hide()
+        self.update_button.set_no_show_all(True)
+        header.pack_end(self.update_button)
 
         self.workspace_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.workspace_bar.get_style_context().add_class("workspace-bar")
@@ -4802,6 +5801,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         item.set_tooltip_text("以一端为准覆盖所有分支和版本标签，包括回退和删除其他分支")
         item.connect("activate", self.on_advanced_sync)
         menu.append(item)
+        self.publish_software_item = Gtk.MenuItem(label="发布软件到 GitHub")
+        self.publish_software_item.connect("activate", self.on_publish_software)
+        menu.append(self.publish_software_item)
         menu.show_all()
         self.advanced_button.set_popup(menu)
         self.workspace_bar.pack_start(self.advanced_button, False, False, 0)
@@ -5933,15 +6935,22 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         generation = self.remote_status_generation
         self.remote_status_snapshot = snapshot
         self._set_remote_status(RemoteSyncStatus("checking", "正在比较当前分支及所属版本标签，并检查推送权限，不上传版本。"))
+        self.remote_checks_running += 1
 
         def worker() -> None:
             try:
                 status = repository.remote_sync_status(snapshot)
             except Exception as error:
                 status = RemoteSyncStatus("unavailable", f"无法检查远程状态：{error}\n请点击“刷新”重试。")
-            GLib.idle_add(self._remote_status_complete, repository, generation, snapshot, status)
+            GLib.idle_add(self._remote_status_finished, repository, generation, snapshot, status)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _remote_status_finished(self, repository, generation, snapshot, status) -> bool:
+        self.remote_checks_running -= 1
+        if not self.update_alive:
+            return False
+        return self._remote_status_complete(repository, generation, snapshot, status)
 
     def _remote_status_complete(
         self, repository: GitRepository, generation: int,
@@ -6095,8 +7104,299 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.set_version(APP_VERSION)
         dialog.set_comments("Git 工作空间版本管理器，支持本地版本与远程同步")
         dialog.set_logo_icon_name("code-version-manager")
-        dialog.run()
+        dialog.add_button("检查更新", Gtk.ResponseType.APPLY)
+        response = dialog.run()
         dialog.destroy()
+        if response == Gtk.ResponseType.APPLY:
+            self.on_check_application_update(None)
+
+    def on_publish_software(self, _item) -> None:
+        if self.software_release_dialog is None:
+            self.software_release_dialog = SoftwareReleaseDialog(self)
+            self.software_release_dialog.connect("destroy", lambda *_args: setattr(self, "software_release_dialog", None))
+        else:
+            self.software_release_dialog.present()
+
+    def _schedule_application_update(self, _window) -> None:
+        # map can occur again after minimizing; schedule once per application.
+        if not getattr(self, "update_scheduled", False):
+            self.update_scheduled = True
+            self.update_timer = GLib.timeout_add_seconds(5, self._automatic_application_update)
+
+    def _automatic_application_update(self) -> bool:
+        self.update_timer = None
+        if self.update_alive and application_update_due():
+            self._check_application_update(False)
+        return False
+
+    def _destroy_application_updates(self, _window) -> None:
+        self.update_alive = False
+        self.update_cancel.set()
+        if self.update_timer is not None:
+            GLib.source_remove(self.update_timer)
+            self.update_timer = None
+        if self.update_dialog is not None:
+            self.update_dialog.destroy()
+
+    def _application_update_worker(self, operation, callback) -> None:
+        def worker() -> None:
+            try:
+                result, error = operation(), ""
+            except Exception as exception:
+                result, error = None, str(exception)
+            GLib.idle_add(deliver, result, error)
+
+        def deliver(result, error) -> bool:
+            if self.update_alive:
+                callback(result, error)
+            return False
+
+        threading.Thread(target=worker, daemon=not self.update_installing).start()
+
+    def on_check_application_update(self, _button) -> None:
+        if self.update_downloading or self.update_installing:
+            self.on_application_update_details(None)
+            return
+        self._check_application_update(True)
+
+    def _check_application_update(self, manual: bool) -> None:
+        if not self.update_alive or self.update_downloading or self.update_installing:
+            return
+        self.update_manual_check = self.update_manual_check or manual
+        if self.update_checking:
+            if manual:
+                self.on_application_update_details(None)
+            return
+        self.update_checking = True
+        if manual:
+            self.on_application_update_details(None)
+            self.update_description.set_text("正在检查 GitHub 正式发行版…")
+
+        def operation():
+            release = check_application_update()
+            newer = release is not None and application_version_is_newer(release.version, APP_VERSION)
+            return release, newer
+
+        self._application_update_worker(operation, self._application_update_checked)
+
+    def _application_update_checked(self, result, error: str) -> None:
+        self.update_checking = False
+        manual = self.update_manual_check
+        self.update_manual_check = False
+        if error:
+            if manual:
+                self.on_application_update_details(None)
+                self._show_application_update_error(error)
+            return
+        release, newer = result
+        try:
+            save_application_update_settings(last_success=time.time())
+        except (OSError, configparser.Error) as exception:
+            if manual:
+                self.update_description.set_text(f"检查已完成，但无法保存检查时间：{exception}")
+        self.update_release = release if newer else None
+        if self.downloaded_update and self.downloaded_update.release != self.update_release:
+            self.downloaded_update = None
+        self.update_button.set_visible(newer)
+        if newer:
+            self.update_button.set_tooltip_text(f"软件 {release.version} 已发布，点击查看并下载")
+        if manual or self.update_dialog is not None:
+            self.on_application_update_details(None)
+            if release is None:
+                self.update_description.set_text("暂无已发布升级包。")
+            elif not newer:
+                self.update_description.set_text(f"当前软件 {APP_VERSION} 已是最新版本。")
+
+    def on_application_update_details(self, _button) -> None:
+        if self.update_dialog is not None:
+            self.update_dialog.present()
+            self._refresh_application_update_dialog()
+            return
+        dialog = Gtk.Dialog(title="软件更新", transient_for=self, modal=False)
+        self.update_dialog = dialog
+        dialog.set_default_size(620, 430)
+        dialog.add_button("稍后处理", Gtk.ResponseType.CLOSE)
+        dialog.add_button("下载升级包", UPDATE_DOWNLOAD_RESPONSE)
+        dialog.add_button("取消下载", UPDATE_CANCEL_RESPONSE)
+        dialog.add_button("安装更新", UPDATE_INSTALL_RESPONSE)
+        dialog.add_button("重启软件", UPDATE_RESTART_RESPONSE)
+        box = dialog.get_content_area()
+        box.set_spacing(12)
+        box.set_border_width(16)
+        self.update_description = Gtk.Label(xalign=0)
+        self.update_description.set_line_wrap(True)
+        self.update_description.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.update_description.set_max_width_chars(70)
+        self.update_description.set_selectable(True)
+        box.pack_start(self.update_description, False, False, 0)
+        self.update_notes = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(self.update_notes)
+        box.pack_start(scroll, True, True, 0)
+        self.update_progress = Gtk.ProgressBar(show_text=True)
+        box.pack_start(self.update_progress, False, False, 0)
+        dialog.connect("response", self._application_update_response)
+        dialog.connect("delete-event", self._application_update_dialog_delete)
+        dialog.connect("destroy", lambda *_args: setattr(self, "update_dialog", None))
+        dialog.show_all()
+        self._refresh_application_update_dialog()
+
+    def _refresh_application_update_dialog(self) -> None:
+        if self.update_dialog is None:
+            return
+        release = self.update_release
+        ready = self.downloaded_update is not None
+        installed = getattr(self, "update_installed", False)
+        active = self.update_downloading or self.update_installing
+        for response, visible, sensitive in (
+            (UPDATE_DOWNLOAD_RESPONSE, bool(release) and not ready and not installed, not active and not self.update_checking),
+            (UPDATE_CANCEL_RESPONSE, self.update_downloading, not self.update_cancel.is_set()),
+            (UPDATE_INSTALL_RESPONSE, ready and not installed and installed_application(), not active),
+            (UPDATE_RESTART_RESPONSE, installed, not active),
+            (Gtk.ResponseType.CLOSE, True, not self.update_installing),
+        ):
+            button = self.update_dialog.get_widget_for_response(response)
+            button.set_visible(visible)
+            button.set_sensitive(sensitive)
+        self.update_progress.set_visible(self.update_downloading)
+        if release:
+            self.update_description.set_text(f"当前软件：{APP_VERSION}    新版：{release.version}\n来源：{release.page_url}")
+            self.update_notes.get_buffer().set_text(release.notes)
+        elif self.update_checking:
+            self.update_description.set_text("正在检查 GitHub 正式发行版…")
+        else:
+            self.update_description.set_text(f"当前软件：{APP_VERSION}")
+        if self.downloaded_update:
+            self.update_description.set_text(
+                f"升级包已下载并校验：{self.downloaded_update.path}\n" +
+                ("点击安装更新，由系统请求管理员授权。" if installed_application() else
+                 "源码运行时请退出软件，参照 INSTALL.md 使用 APT 手动安装此 deb。")
+            )
+        if self.update_installing:
+            self.update_description.set_text("正在请求系统授权并安装更新，请等待安装结束…")
+        elif installed:
+            self.update_description.set_text("软件更新已安装成功。点击“重启软件”，或稍后退出并重新启动。")
+
+    def _show_application_update_error(self, error: str) -> None:
+        if self.update_dialog is not None:
+            self.update_description.set_text(error.splitlines()[0][:200])
+            self.update_notes.get_buffer().set_text(error)
+
+    def _application_update_dialog_delete(self, *_args) -> bool:
+        if self.update_installing:
+            return True
+        if self.update_downloading:
+            self.update_cancel.set()
+        return False
+
+    def _application_update_response(self, dialog, response: int) -> None:
+        if self.update_installing:
+            return
+        if response == UPDATE_DOWNLOAD_RESPONSE:
+            if self.update_release is None or self.update_downloading:
+                return
+            self.update_downloading = True
+            self.update_cancel = threading.Event()
+            self.update_progress.set_fraction(0)
+            self.update_progress.set_text("准备下载…")
+            self._refresh_application_update_dialog()
+            last_progress = [0.0]
+
+            def progress(done, total):
+                now = time.monotonic()
+                if now - last_progress[0] >= 0.1 or done == total:
+                    last_progress[0] = now
+                    GLib.idle_add(self._application_update_progress, done, total)
+
+            release, cancel = self.update_release, self.update_cancel
+            self._application_update_worker(
+                lambda: download_application_update(release, cancel, progress),
+                self._application_update_downloaded,
+            )
+        elif response == UPDATE_INSTALL_RESPONSE:
+            self._install_downloaded_application_update()
+        elif response == UPDATE_RESTART_RESPONSE:
+            try:
+                self._assert_application_install_idle()
+            except GitError as error:
+                self.update_description.set_text(str(error))
+                return
+            application = self.get_application()
+            if application is not None:
+                self._flush_window_settings(self)
+                application.restart_requested = True
+                application.quit()
+        elif response == UPDATE_CANCEL_RESPONSE or self.update_downloading:
+            self.update_cancel.set()
+            self._refresh_application_update_dialog()
+            self.update_description.set_text("正在取消下载…")
+        else:
+            dialog.destroy()
+
+    def _application_update_progress(self, done: int, total: int) -> bool:
+        if self.update_alive and self.update_dialog is not None and self.update_downloading:
+            self.update_progress.set_fraction(done / total)
+            self.update_progress.set_text(f"{done * 100 // total}% · {format_storage_size(done)} / {format_storage_size(total)}")
+        return False
+
+    def _application_update_downloaded(self, update, error: str) -> None:
+        self.update_downloading = False
+        self.downloaded_update = update
+        self._refresh_application_update_dialog()
+        if error and self.update_dialog is not None:
+            self._show_application_update_error(error)
+
+    def _assert_application_install_idle(self) -> None:
+        if self.software_release_dialog is not None and self.software_release_dialog.busy:
+            raise GitError("软件发布操作尚未结束，请等待或取消后再安装更新或重启。")
+        if self.busy or self.remote_checks_running:
+            raise GitError("后台操作或比较工具尚未结束，请完成后重试。已下载升级包会保留。")
+        if self.repository and self.repository.merge_state().active:
+            raise GitError("请先完成或取消手动合并，再安装更新或重启软件。已下载升级包会保留。")
+
+    def _install_downloaded_application_update(self) -> None:
+        if self.downloaded_update is None or not installed_application():
+            return
+        try:
+            self._assert_application_install_idle()
+        except GitError as error:
+            self.update_description.set_text(str(error))
+            return
+        confirmation = Gtk.MessageDialog(
+            transient_for=self.update_dialog, modal=True, message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL, text="安装软件更新？",
+        )
+        confirmation.format_secondary_text("安装期间暂停工作空间操作。系统将请求管理员授权，成功后需要重启软件。")
+        response = confirmation.run()
+        confirmation.destroy()
+        if response != Gtk.ResponseType.OK or not self.update_alive:
+            return
+        try:
+            self._assert_application_install_idle()
+        except GitError as error:
+            self.update_description.set_text(str(error))
+            return
+        self.update_installing = True
+        self.busy = True
+        self.branch_generation += 1
+        self._invalidate_remote_status()
+        for widget in (self.header, self.workspace_bar, self.main_actions, self.toolbar,
+                       self.branch_bar, self.merge_bar, self.notebook,
+                       self.info_action_button, self.clear_recovery_button):
+            widget.set_sensitive(False)
+        self._refresh_application_update_dialog()
+        update = self.downloaded_update
+        self._application_update_worker(lambda: install_application_update(update),
+                                        self._application_update_installed)
+
+    def _application_update_installed(self, result, error: str) -> None:
+        self.update_installing = False
+        self._end_background()
+        self.refresh(check_remote=False, update_remote=False)
+        self.update_installed = not bool(error)
+        self._refresh_application_update_dialog()
+        if self.update_dialog is not None and error:
+            self._show_application_update_error(error)
 
     def on_help(self, _button) -> None:
         try:
@@ -6172,6 +7472,10 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         note.set_max_width_chars(60)
         grid.attach(note, 0, 5, 2, 1)
         content.pack_start(grid, False, False, 0)
+        auto_update = Gtk.CheckButton(label="自动检查软件更新")
+        auto_update.set_active(application_update_settings()[0])
+        auto_update.set_tooltip_text("启动后在后台检查 GitHub 正式发行版，成功检查的间隔至少 24 小时")
+        content.pack_start(auto_update, False, False, 0)
         # content.pack_start(
         #     Gtk.Label(label=f"当前工作空间：{self.workspace_path}", xalign=0),
         #     False, False, 0,
@@ -6184,6 +7488,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 save_git_default_settings(
                     account_entry.get_text(), name_entry.get_text(), email_entry.get_text(),
                 )
+                save_application_update_settings(automatic=auto_update.get_active())
                 if self.repository:
                     self.repository.configure_compare_tool(combo.get_active_id())
                     self._set_operation_status("应用和工作空间设置已保存")
@@ -7651,7 +8956,11 @@ def configured_repository() -> Path:
 def main() -> int:
     application = VersionManagerApplication()
     try:
-        return application.run(sys.argv)
+        result = application.run(sys.argv)
+        if getattr(application, "restart_requested", False):
+            # run() has left the old main loop; exec closes its D-Bus connection.
+            os.execv("/usr/bin/code-version-manager", ["/usr/bin/code-version-manager"])
+        return result
     except KeyboardInterrupt:
         return 130
 

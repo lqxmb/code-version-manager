@@ -59,4 +59,10 @@ python3 tests/verify_workspace_copy.py /path/to/workspace
 sh build_deb.sh
 ```
 
+脚本同时生成 `dist/code-version-manager_<VERSION>_all.deb.sha256`。发布前先将 `v<VERSION>` 标签推送到 `lqxmb/code-version-manager`，再从“高级操作 → 发布软件到 GitHub”选择 deb 并确认发行信息。应用使用 GitHub CLI 的登录状态，固定本地附件副本，先上传到草稿，校验后公开。操作细节见 HELP；CLI 安装见 INSTALL。仍可到 GitHub 网页手动创建正式 Release 并上传两个附件；不要勾选预发布。客户端按 Debian 版本规则比较最新正式发行版，只推送代码或标签不会提供升级包。根目录 `VERSION` 保持本地忽略；首次提供联网更新的发行号为 0.4.9。
+
+软件更新后端与 GitRepository 独立，使用 Python 标准库 HTTPS 和系统 dpkg/APT/PolicyKit；不引入 Python 包或额外常驻服务。更新回归使用模拟网络、临时缓存和模拟安装进程，禁止在测试中实际请求管理员授权或安装系统软件。
+
+Release 发布回归使用临时 deb 和模拟 gh，不访问真实发布接口。覆盖草稿续传、附件内容核对、确认后状态变化、取消与公开超时核实；不把已公开 Release 当作可覆盖草稿。
+
 构建前运行目标测试和语法检查；修改 SSH、同步、恢复、合并或删除流程时优先运行相应专项测试。包的依赖、安装及卸载指引见 [`INSTALL.md`](INSTALL.md)。不要将真实工作空间或 origin 用于覆盖验证。

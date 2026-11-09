@@ -14,6 +14,8 @@
 | `tests/test_version_deletion.py` | 末尾版本撤回、暂存保护、固定基线、确认快照、恢复及 GTK 删除回调测试 |
 | `tests/test_recovery_cleanup.py` | 恢复文件清理、stash 保护、文件安全、并发变化、失败报告及 GTK 清理回调测试 |
 | `tests/test_ui_layout.py` | 工具栏顺序、帮助按钮与文档路径、最近两项选择、动态比较、独立日志、窗口尺寸记忆及忙碌状态回归 |
+| `tests/test_application_updates.py` | 软件发行检查、下载校验、取消、模拟授权安装与 GTK 更新流程 |
+| `tests/test_software_releases.py` | 本软件 Release 预检查、草稿续传、附件校验、取消与公开核实及 GTK 发布窗口 |
 | `tests/test_version_remarks.py` | 独立版本备注、编辑快照、定向同步、分支隔离、删除恢复及 GTK 备注入口 |
 | `tests/test_provider_and_drop.py` | 工作空间文件夹拖放、GitHub/GitLab 地址与主机校验、仓库隔离配置及 GTK 服务商切换 |
 | `tests/verify_workspace_copy.py` | 仅在工作区隔离副本和临时远程中验证，不改来源和真实 origin |
@@ -238,6 +240,23 @@
 - 本地与 origin 同名分支合成一行；当前分支以绿色标识，不在标签文字添加“当前”。
 
 ## 测试、兼容与打包
+
+### 应用自身联网更新
+
+- 更新源固定为公开仓库 `lqxmb/code-version-manager` 的最新正式 GitHub Release，标签为 `v<Debian软件版本>`，附件为 `code-version-manager_<版本>_all.deb` 和同名 `.sha256`。软件发行号仅从应用 VERSION 读取，不能复用工作空间版本标签解析或 Git origin。
+- 更新逻辑保留在现有单文件，独立于 GitRepository。使用标准库 HTTPS、证书校验和严格的 GitHub 资产重定向校验；下载流式写入用户缓存中的私有临时目录，校验大小、SHA-256、deb 包名、版本及架构后才提供安装。缓存和安装日志不进入工作树或 Git 元数据。
+- 用户 settings.ini 的 `[updates]` 保存 `auto_check` 与 `last_success`，默认启用；显示主窗口 5 秒后检查，成功间隔至少 24 小时。手动检查绕过间隔，自动失败静默；只有成功联网取得有效检查结果才更新检查时间。无 Release 不是“已是最新”。
+- 更新检查、下载与安装均在后台，GTK 和配置保存回主线程；销毁时取消下载、移除定时器并丢弃回调。工作空间切换不重新检查。检查和下载不占用仓库 busy 状态，安装使用 busy 保护并阻止关闭窗口；后台任务或手动合并未完成时拒绝安装。
+- 仅安装版允许调用参数列表形式的 pkexec/apt-get，系统负责管理员授权，不记录密码。执行前重新校验包，安装后核对 dpkg-query 状态和版本，成功才提示重启；失败保留日志和包，不声称回滚系统安装。重启必须先退出旧 Gtk.Application 实例再启动安装入口。
+- build_deb.sh 同时生成 deb 和 SHA-256 附件；维护者可用发布窗口或网页上传 Release。VERSION 继续被忽略。更新测试只用模拟网络与模拟安装，不修改实际用户配置、系统包或真实工作空间。
+
+### 本软件 GitHub Release 发布
+
+- 发布入口位于高级操作，固定主机 github.com 和仓库 lqxmb/code-version-manager，独立于当前工作空间的 GitRepository、origin 和本地发布操作。仅接受已构建的本软件 all 架构 deb，不自动构建、不推送代码、不创建版本标签。
+- gh 为建议依赖；浏览器授权通过系统终端运行 gh auth login --hostname github.com --web --git-protocol ssh --skip-ssh-key。不调用 auth token，不在应用配置、日志或命令行保存访问令牌，不输出 auth status 的原始内容。
+- 后台准备普通 deb 的私有副本及 SHA-256，固定包版本、内容和附件名；存在相邻校验文件时必须核对。不可变预检查固定远程标签对象及提交、草稿和附件状态、最新正式发行版、标题及说明；执行重新核对后才写远程。
+- 先草稿后公开；只续传唯一同版本草稿，同名附件内容相同才复用，缺失则上传，额外或冲突附件拒绝。已公开版本禁止覆盖，正式新版必须高于当前最新版本。上传失败保留草稿，不删除或 clobber。公开请求失败后复查状态及最新接口，无法核实则报告结果待确认，不重复发送公开请求。
+- 发布/登录/准备在独立后台任务执行，GTK 回主线程，固定输入并支持取消；取消子进程时清理进程组。发布活动阻止应用退出和自身更新安装，取消或失败报告已完成阶段及草稿地址。测试仅模拟 gh 与临时文件，禁止创建真实测试 Release。
 
 - `tests/test_backend.py` 覆盖解析、仓库后端、发布、身份配置、远程验证、GTK 回调和文件安全；`tests/test_workflow.py` 使用临时工作仓库与 bare origin 覆盖当前分支同步、显式远程删除、高级整仓覆盖及并发变化；`tests/test_generated_files.py` 覆盖生成文件、旧仓库迁移、分支范围、文件安全和独立忽略模板；`tests/test_merge_comparison.py` 覆盖隔离目录合并；`tests/test_version_deletion.py` 覆盖版本撤回和故障恢复；`tests/test_recovery_cleanup.py` 覆盖恢复清理及受保护备份；`tests/verify_workspace_copy.py` 只操作验证副本和临时 origin，包括清理副本中的恢复目录并核对来源未变。
 - `tests/test_ui_layout.py` 使用临时用户配置和真实 GTK 控件，覆盖工具栏顺序、最近两项选择与比较调度、日志隔离和复制、尺寸记忆、最大化保护、写入失败以及忙碌状态。没有显示服务时 GTK 用例会跳过，配置读写用例仍可运行；验证时检查实际跳过情况。

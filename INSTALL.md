@@ -33,6 +33,10 @@ code-version-manager
 
 ## 升级或重装
 
+从 0.4.9 开始，软件支持从公开项目 [GitHub Releases](https://github.com/lqxmb/code-version-manager/releases) 检查并下载升级包。已有旧版本须先手动安装一次 0.4.9 或更新版本。联网升级的界面操作见 [HELP.md](HELP.md#软件更新)。升级包和同名 `.sha256` 文件来自同一次正式 Release；只有校验通过的包才能在软件内安装。管理员授权由系统 PolicyKit 提供，依赖 `policykit-1`；APT 负责安装及依赖处理。
+
+无法访问 GitHub 或离线时，可在其他联网电脑下载 deb 后拷贝过来，仍按下述方式安装。
+
 安装升级包之前先退出正在运行的版本管理器，然后执行：
 
 ```bash
@@ -61,6 +65,18 @@ sudo apt --fix-broken install
 ### 应用无法启动
 
 从终端运行 `code-version-manager` 并查看错误信息；确认软件包安装成功以及系统 GTK 3、Python GI 和 Git 依赖可用。完整应用操作与远程 SSH 排障见 `HELP.md`。
+
+### 联网更新失败
+
+“暂无已发布升级包”表示项目还没有正式 Release；只有代码或 Git 标签不能提供升级包。连接超时或 GitHub API 限流时可稍后手动检查；不会影响本地版本管理。缺少附件或校验失败时请重新下载完整发行包，不要安装未完成文件。
+
+取消管理员授权会保留现有安装。APT 锁占用时先等待系统其他安装任务结束再重试；依赖或安装中断按上面的修复步骤处理。安装错误窗口包含安装日志位置，下载包和日志位于用户缓存目录 `code-version-manager/updates/`（通常在 `~/.cache/` 下）。
+
+## 可选：安装 GitHub Release 发布工具
+
+仅维护者使用“发布软件到 GitHub”时需要 GitHub CLI（`gh`）和可用的桌面终端。按 [GitHub CLI 官方 Linux 安装说明](https://github.com/cli/cli/blob/trunk/docs/install_linux.md) 安装；系统软件源提供 `gh` 时也可通过 APT 安装。该工具列为建议依赖，不影响普通用户检查、下载和安装软件更新。
+
+发布窗口会检查 CLI 是否支持浏览器登录及 API 上传；旧版本不支持时请先升级 CLI。首次登录由 CLI 打开浏览器授权，凭据的存储方式由 CLI 和系统凭据服务决定。Git 的 SSH 授权用于推送代码和标签，创建 Release 和上传附件仍通过 CLI 的 HTTPS 授权完成。
 
 ## 卸载
 
