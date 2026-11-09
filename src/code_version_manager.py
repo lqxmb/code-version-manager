@@ -5969,6 +5969,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.downloaded_update: Optional[DownloadedApplicationUpdate] = None
         self.update_cancel = threading.Event()
         self.update_dialog: Optional[Gtk.Dialog] = None
+        self.help_dialog: Optional[Gtk.Dialog] = None
         self.update_timer: Optional[int] = None
         self.connect("map", self._schedule_application_update)
         self.connect("delete-event", lambda *_args: self.update_installing or bool(
@@ -6042,18 +6043,35 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         header.props.title = APP_NAME
         self.set_titlebar(header)
 
-        self.help_button = self._command_button("帮助", "help-browser-symbolic", self.on_help)
-        self.help_button.set_tooltip_text("打开用户帮助 HELP.md")
+        self.help_button = Gtk.MenuButton(label="帮助")
+        self.help_button.set_image(Gtk.Image.new_from_icon_name("help-browser-symbolic", Gtk.IconSize.BUTTON))
+        self.help_button.set_always_show_image(True)
+        self.help_button.set_tooltip_text("使用帮助、检查更新和关于")
+        self.help_menu = Gtk.Menu()
+        self.help_item = Gtk.MenuItem(label="使用帮助")
+        self.help_menu.append(self.help_item)
+        self.check_updates_item = Gtk.MenuItem(label="检查更新")
+        self.help_menu.append(self.check_updates_item)
+        self.help_menu.append(Gtk.SeparatorMenuItem())
+        self.about_item = Gtk.MenuItem(label="关于")
+        self.help_menu.append(self.about_item)
+        self.help_item.connect("activate", self.on_help)
+        self.check_updates_item.connect("activate", self.on_check_application_update)
+        self.about_item.connect("activate", self.on_about)
+        self.help_accel_group = Gtk.AccelGroup()
+        self.add_accel_group(self.help_accel_group)
+        key, modifiers = Gtk.accelerator_parse("F1")
+        self.help_item.add_accelerator("activate", self.help_accel_group, key, modifiers, Gtk.AccelFlags.VISIBLE)
+        self.help_menu.show_all()
+        self.help_button.set_popup(self.help_menu)
         header.pack_end(self.help_button)
-        self.about_button = self._command_button("关于", "help-about-symbolic", self.on_about)
-        header.pack_end(self.about_button)
-        self.update_button = self._command_button(
+
+        self.update_notice = self._command_button(
             "发现软件更新", "software-update-available-symbolic", self.on_application_update_details
         )
-        self.update_button.show_all()
-        self.update_button.hide()
-        self.update_button.set_no_show_all(True)
-        header.pack_end(self.update_button)
+        self.update_notice.show_all()
+        self.update_notice.hide()
+        self.update_notice.set_no_show_all(True)
 
         self.workspace_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.workspace_bar.get_style_context().add_class("workspace-bar")
@@ -6482,9 +6500,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.clear_recovery_button.set_sensitive(False)
         self.status_label = self._single_line_label()
         self.status_label.get_style_context().add_class("operation-status")
+        self.footer = footer
         self.log_button = self._command_button("日志", "text-x-generic-symbolic", self.on_operation_log)
         footer.pack_start(self.repo_label, False, True, 0)
         footer.pack_start(self.status_label, True, True, 0)
+        footer.pack_start(self.update_notice, False, False, 0)
         footer.pack_start(self.storage_label, False, False, 0)
         footer.pack_start(self.clear_recovery_button, False, False, 0)
         footer.pack_start(self.log_button, False, False, 0)
@@ -7411,10 +7431,13 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.set_version(APP_VERSION)
         dialog.set_comments("Git 工作空间版本管理器，支持本地版本与远程同步")
         dialog.set_logo_icon_name("code-version-manager")
+        dialog.add_button("帮助", Gtk.ResponseType.HELP)
         dialog.add_button("检查更新", Gtk.ResponseType.APPLY)
         response = dialog.run()
         dialog.destroy()
-        if response == Gtk.ResponseType.APPLY:
+        if response == Gtk.ResponseType.HELP:
+            self.on_help(None)
+        elif response == Gtk.ResponseType.APPLY:
             self.on_check_application_update(None)
 
     def on_publish_software(self, _item) -> None:
@@ -7504,9 +7527,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.update_release = release if newer else None
         if self.downloaded_update and self.downloaded_update.release != self.update_release:
             self.downloaded_update = None
-        self.update_button.set_visible(newer)
+        self.update_notice.set_visible(newer)
         if newer:
-            self.update_button.set_tooltip_text(f"软件 {release.version} 已发布，点击查看并下载")
+            self.update_notice.set_tooltip_text(f"软件 {release.version} 已发布，点击查看并下载")
         if manual or self.update_dialog is not None:
             self.on_application_update_details(None)
             if release is None:
@@ -7706,13 +7729,93 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             self._show_application_update_error(error)
 
     def on_help(self, _button) -> None:
+        if self.help_dialog is not None:
+            self.help_dialog.present()
+            return
         try:
             path = help_document_path()
-            uri = Gio.File.new_for_path(str(path)).get_uri()
-            if not Gtk.show_uri_on_window(self, uri, Gdk.CURRENT_TIME):
-                raise GitError(f"无法使用系统默认程序打开帮助文件：{path}")
-        except (GitError, GLib.Error, OSError) as error:
+            content = path.read_text(encoding="utf-8")
+        except (GitError, OSError, UnicodeError) as error:
             self.show_error(str(error))
+            return
+
+        dialog = Gtk.Dialog(title="Code Version Manager 使用帮助", transient_for=self, modal=False)
+        self.help_dialog = dialog
+        dialog.set_destroy_with_parent(True)
+        dialog.set_default_size(900, 700)
+        dialog.add_button("关闭", Gtk.ResponseType.CLOSE)
+        dialog.connect("response", lambda widget, _response: widget.destroy())
+        dialog.connect("destroy", lambda *_args: setattr(self, "help_dialog", None))
+
+        view = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        view.set_left_margin(20)
+        view.set_right_margin(20)
+        view.set_top_margin(16)
+        view.set_bottom_margin(16)
+        self._render_help_text(view.get_buffer(), content)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(view)
+        dialog.get_content_area().pack_start(scroll, True, True, 0)
+        dialog.show_all()
+
+    @staticmethod
+    def _render_help_text(buffer, markdown: str) -> None:
+        heading_tags = {
+            1: buffer.create_tag("help-heading-1", weight=Pango.Weight.BOLD, size_points=20.0),
+            2: buffer.create_tag("help-heading-2", weight=Pango.Weight.BOLD, size_points=16.0),
+            3: buffer.create_tag("help-heading-3", weight=Pango.Weight.BOLD, size_points=13.0),
+        }
+        bold_tag = buffer.create_tag("help-bold", weight=Pango.Weight.BOLD)
+        code_tag = buffer.create_tag("help-code", family="monospace")
+        pattern = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))")
+        in_code = False
+
+        def inline(text: str, code: bool = False) -> None:
+            if code:
+                buffer.insert_with_tags(buffer.get_end_iter(), text + "\n", code_tag)
+                return
+            cursor = 0
+            for match in pattern.finditer(text):
+                if match.start() > cursor:
+                    buffer.insert(buffer.get_end_iter(), text[cursor:match.start()])
+                token = match.group(0)
+                if token.startswith("**"):
+                    buffer.insert_with_tags(buffer.get_end_iter(), token[2:-2], bold_tag)
+                elif token.startswith("`"):
+                    buffer.insert_with_tags(buffer.get_end_iter(), token[1:-1], code_tag)
+                else:
+                    link = re.fullmatch(r"\[([^\]]+)\]\(([^)]+)\)", token)
+                    buffer.insert(buffer.get_end_iter(), f"{link.group(1)} ({link.group(2)})")
+                cursor = match.end()
+            if cursor < len(text):
+                buffer.insert(buffer.get_end_iter(), text[cursor:])
+            buffer.insert(buffer.get_end_iter(), "\n")
+
+        for line in markdown.splitlines():
+            if line.startswith("```"):
+                in_code = not in_code
+                continue
+            if in_code:
+                inline(line, code=True)
+                continue
+            heading = re.match(r"^(#{1,3})\s+(.*)$", line)
+            if heading:
+                level = len(heading.group(1))
+                buffer.insert_with_tags(buffer.get_end_iter(), heading.group(2) + "\n", heading_tags[level])
+                continue
+            if re.fullmatch(r"\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*", line):
+                continue
+            table_cells = line.strip().strip("|").split("|") if "|" in line else None
+            if table_cells is not None:
+                inline("  |  ".join(cell.strip() for cell in table_cells))
+                continue
+            listing = re.match(r"^(\s*)([-*]|\d+\.)\s+(.*)$", line)
+            if listing:
+                marker = "• " if listing.group(2) in ("-", "*") else listing.group(2) + " "
+                inline(listing.group(1) + marker + listing.group(3))
+                continue
+            inline(line)
 
     def on_settings(self, _button) -> None:
         try:

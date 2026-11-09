@@ -224,14 +224,17 @@ class WindowLayoutTest(unittest.TestCase):
 
     def test_layout_keeps_actions_visible_and_in_confirmed_order(self):
         window = self.window
-        self.assertEqual("关于", window.about_button.get_label())
         self.assertEqual("帮助", window.help_button.get_label())
-        self.assertIs(window.about_button.get_parent(), window.header)
         self.assertIs(window.help_button.get_parent(), window.header)
+        self.assertIsNone(getattr(window, "about_button", None))
+        self.assertIsNot(window.update_notice.get_parent(), window.header)
+        self.assertIs(window.update_notice.get_parent(), window.footer)
+        self.assertEqual(["使用帮助", "检查更新", "", "关于"],
+                         [item.get_label() if isinstance(item, MODULE.Gtk.MenuItem) else ""
+                          for item in window.help_menu.get_children()])
         window.show_all()
         self.drain_events()
-        self.assertLess(window.about_button.get_allocation().x,
-                        window.help_button.get_allocation().x)
+        self.assertTrue(window.help_button.get_visible())
         self.assertEqual([window.history_scope_combo, window.compare_button, window.delete_button,
                           window.export_button, window.edit_message_button, window.changelog_button,
                           window.download_changelog_button], window.toolbar.get_children())
@@ -243,15 +246,26 @@ class WindowLayoutTest(unittest.TestCase):
                          window.history_action_scroll.get_policy())
         self.assertTrue(window.advanced_button.get_popup().get_children())
 
-    def test_help_button_opens_the_resolved_markdown_with_system_handler(self):
+    def test_help_menu_opens_markdown_in_builtin_reader(self):
         document = self.path / "HELP.md"
-        document.write_text("help", encoding="utf-8")
+        document.write_text("# Guide\n\n**Important** text and `code`.\n\n- first item\n", encoding="utf-8")
         with mock.patch.object(MODULE, "help_document_path", return_value=document), \
-                mock.patch.object(MODULE.Gtk, "show_uri_on_window", return_value=True) as open_uri:
-            self.window.on_help(self.window.help_button)
-        open_uri.assert_called_once_with(
-            self.window, document.as_uri(), MODULE.Gdk.CURRENT_TIME,
-        )
+                mock.patch.object(MODULE.Gtk, "show_uri_on_window") as open_uri:
+            self.window.on_help(self.window.help_item)
+            dialog = self.window.help_dialog
+            self.window.on_help(self.window.help_item)
+        self.assertIs(dialog, self.window.help_dialog)
+        self.assertEqual("Code Version Manager 使用帮助", dialog.get_title())
+        scroll = dialog.get_content_area().get_children()[0]
+        view = scroll.get_child()
+        buffer = view.get_buffer()
+        text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
+        self.assertIn("Guide", text)
+        self.assertIn("Important", text)
+        self.assertIn("code", text)
+        self.assertIn("• first item", text)
+        self.assertNotIn("**", text)
+        open_uri.assert_not_called()
 
     def test_help_open_errors_use_the_existing_error_dialog(self):
         with mock.patch.object(MODULE, "help_document_path", side_effect=MODULE.GitError("missing help")), \
@@ -259,13 +273,29 @@ class WindowLayoutTest(unittest.TestCase):
             self.window.on_help(self.window.help_button)
         show_error.assert_called_once_with("missing help")
 
-        document = self.path / "HELP.md"
+        document = mock.Mock()
+        document.read_text.side_effect = OSError("permission denied")
         with mock.patch.object(MODULE, "help_document_path", return_value=document), \
-                mock.patch.object(MODULE.Gtk, "show_uri_on_window", return_value=False), \
                 mock.patch.object(self.window, "show_error") as show_error:
             self.window.on_help(self.window.help_button)
         show_error.assert_called_once()
-        self.assertIn(str(document), show_error.call_args.args[0])
+        self.assertIn("permission denied", show_error.call_args.args[0])
+
+    def test_f1_opens_help(self):
+        document = self.path / "HELP.md"
+        document.write_text("F1 help", encoding="utf-8")
+        self.window.show_all()
+        self.drain_events()
+        with mock.patch.object(MODULE, "help_document_path", return_value=document):
+            activated = MODULE.Gtk.accel_groups_activate(self.window, MODULE.Gdk.KEY_F1,
+                                                         MODULE.Gdk.ModifierType(0))
+        self.assertTrue(activated)
+        self.assertIsNotNone(self.window.help_dialog)
+
+    def test_help_menu_check_updates_starts_manual_check(self):
+        with mock.patch.object(self.window, "_check_application_update") as check:
+            self.window.check_updates_item.emit("activate")
+        check.assert_called_once_with(True)
 
     def test_single_and_pair_selection_update_actions_and_dispatch_comparison(self):
         window = self.window

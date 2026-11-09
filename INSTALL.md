@@ -1,6 +1,6 @@
 # Code Version Manager 安装、升级与卸载
 
-面向 Ubuntu 20.04 及兼容环境中的安装和运维用户。应用帮助（界面操作、发布、分支、SSH 同步和恢复）请使用软件标题栏“关于”旁的“帮助”，或打开 deb 安装的 `/usr/share/doc/code-version-manager/HELP.md`。
+面向 Ubuntu 20.04 及兼容环境中的安装和运维用户。应用帮助（界面操作、发布、分支、SSH 同步和恢复）请使用软件标题栏“帮助”菜单中的“使用帮助”，或打开 deb 安装的 `/usr/share/doc/code-version-manager/HELP.md`。
 
 ## 系统要求
 

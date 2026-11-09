@@ -10,7 +10,7 @@ Python 3、GTK 3 桌面 Git 管理器，用于在任意独立工作空间中离�
 | [`INSTALL.md`](INSTALL.md) | 安装、升级和卸载软件的用户 | 系统要求、预构建 deb 安装与升级、启动和安装故障排查 |
 | [`AGENTS.md`](AGENTS.md) | 项目维护者和编程代理 | 当前业务规则、源码入口、数据边界、测试和实现约束 |
 
-已安装软件可从标题栏“关于”旁的“帮助”打开 `HELP.md`。deb 将三份用户文档安装到 `/usr/share/doc/code-version-manager/`。
+已安装软件可从标题栏“帮助”菜单打开内置帮助窗口、手动检查更新或查看关于信息；F1 打开帮助，新版本提示显示在主窗口底部。应用从 `/usr/share/doc/code-version-manager/HELP.md` 读取帮助，源码运行时回退到项目根目录。deb 将三份用户文档安装到 `/usr/share/doc/code-version-manager/`。
 
 ## 项目结构
 

@@ -294,8 +294,10 @@ class ApplicationUpdateUiTest(ApplicationUpdateFixtures, unittest.TestCase):
     def test_new_release_nonmodal_and_no_release_different_from_latest(self):
         release = self.release()
         self.window._application_update_checked((release, True), "")
-        self.assertTrue(self.window.update_button.get_visible())
-        self.assertTrue(self.window.update_button.get_child().get_visible())
+        self.assertTrue(self.window.update_notice.get_visible())
+        self.assertTrue(self.window.update_notice.get_child().get_visible())
+        self.assertIs(self.window.update_notice.get_parent(), self.window.footer)
+        self.assertIsNot(self.window.update_notice.get_parent(), self.window.header)
         self.assertIsNone(self.window.update_dialog)
         self.assertGreater(MODULE.application_update_settings()[1], 0)
         self.window.on_application_update_details(None)
@@ -337,8 +339,23 @@ class ApplicationUpdateUiTest(ApplicationUpdateFixtures, unittest.TestCase):
                 mock.patch.object(self.window, "on_check_application_update") as check:
             dialog.return_value.run.return_value = MODULE.Gtk.ResponseType.APPLY
             self.window.on_about(None)
-            dialog.return_value.add_button.assert_called_with("检查更新", MODULE.Gtk.ResponseType.APPLY)
+            self.assertEqual([mock.call("帮助", MODULE.Gtk.ResponseType.HELP),
+                              mock.call("检查更新", MODULE.Gtk.ResponseType.APPLY)],
+                             dialog.return_value.add_button.call_args_list)
             check.assert_called_once_with(None)
+
+        with mock.patch.object(MODULE.Gtk, "AboutDialog") as dialog, \
+                mock.patch.object(self.window, "on_help") as help_action:
+            dialog.return_value.run.return_value = MODULE.Gtk.ResponseType.HELP
+            self.window.on_about(None)
+            help_action.assert_called_once_with(None)
+
+    def test_bottom_update_notice_opens_update_details(self):
+        self.window.update_release = self.release()
+        self.window.update_notice.show_all()
+        self.window.update_notice.emit("clicked")
+        self.assertIsNotNone(self.window.update_dialog)
+        self.assertIn(self.window.update_release.version, self.window.update_description.get_text())
 
     def test_close_download_dialog_cancels_and_install_dialog_cannot_close(self):
         self.window.update_downloading = True

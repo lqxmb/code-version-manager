@@ -13,7 +13,7 @@
 | `tests/test_merge_comparison.py` | 手动合并隔离副本、忽略规则、提交及取消测试 |
 | `tests/test_version_deletion.py` | 末尾版本撤回、暂存保护、固定基线、确认快照、恢复及 GTK 删除回调测试 |
 | `tests/test_recovery_cleanup.py` | 恢复文件清理、stash 保护、文件安全、并发变化、失败报告及 GTK 清理回调测试 |
-| `tests/test_ui_layout.py` | 工具栏顺序、帮助按钮与文档路径、最近两项选择、动态比较、独立日志、窗口尺寸记忆及忙碌状态回归 |
+| `tests/test_ui_layout.py` | 工具栏顺序、帮助菜单和内置阅读器、文档路径、最近两项选择、动态比较、独立日志、窗口尺寸记忆及忙碌状态回归 |
 | `tests/test_application_updates.py` | 软件发行检查、下载校验、取消、模拟授权安装与 GTK 更新流程 |
 | `tests/test_software_releases.py` | 任意软件 Release 目标配置、多架构附件、初始化、预检查、续传、取消及 GTK 发布窗口 |
 | `tests/test_version_remarks.py` | 独立版本备注、编辑快照、定向同步、分支隔离、删除恢复及 GTK 备注入口 |
@@ -26,7 +26,7 @@
 | `VERSION` | 软件发行版本，与受管理工作空间的 Git 版本无关 |
 | `data/`、`debian/`、`build_deb.sh` | 图标、启动器、Beyond Compare 配置、`workspace.gitignore` 默认工作区模板及 Debian 打包 |
 
-入口为 `main()`，应用 ID 为 `cn.local.CodeVersionManager`。安装启动器 `/usr/bin/code-version-manager` 加载 `/usr/lib/code-version-manager/code_version_manager.py`。启动工作空间依次读取 `CODE_VERSION_MANAGER_REPOSITORY`、GTK 用户配置 `code-version-manager/settings.ini`、`~/catkin_ws`。最近工作空间最多保存 10 个。GTK 初始化、窗口、对话框及主线程事件回调均位于同一源码文件；后端操作由 `GitRepository` 负责。标题栏“关于”旁的“帮助”按钮打开用户帮助文档：优先使用 `/usr/share/doc/code-version-manager/HELP.md`，源码运行时回退到项目根目录 `HELP.md`。
+入口为 `main()`，应用 ID 为 `cn.local.CodeVersionManager`。安装启动器 `/usr/bin/code-version-manager` 加载 `/usr/lib/code-version-manager/code_version_manager.py`。启动工作空间依次读取 `CODE_VERSION_MANAGER_REPOSITORY`、GTK 用户配置 `code-version-manager/settings.ini`、`~/catkin_ws`。最近工作空间最多保存 10 个。GTK 初始化、窗口、对话框及主线程事件回调均位于同一源码文件；后端操作由 `GitRepository` 负责。标题栏唯一“帮助”菜单提供使用帮助、检查更新和关于；内置帮助优先读取 `/usr/share/doc/code-version-manager/HELP.md`，源码运行时回退到项目根目录 `HELP.md`。
 
 ## 文档职责与更新规则
 
@@ -36,7 +36,7 @@
 - `AGENTS.md` 面向编程代理和维护者，保存详细业务规则、源码导航、存储边界、并发约束、测试边界和实现注意事项；不安装到用户 deb 文档目录。
 - `CHANGELOG.rst` 只记录版本变更；`VERSION` 只记录软件包版本。不要把用户工作空间的生成文件说明混入软件包版本文件。
 - 新增或修改用户可见行为时，先更新 `HELP.md`；涉及安装或升级时更新 `INSTALL.md`；涉及源码、测试或打包流程时更新 `README.md`；业务规则和实现约束同步更新本文件。避免在多个文件复制同一段操作说明。
-- `build_deb.sh` 将 `README.md`、`INSTALL.md` 和 `HELP.md` 安装到 `/usr/share/doc/code-version-manager/`；源码运行时帮助从项目根目录回退读取。帮助按钮使用系统默认程序打开 Markdown 文件，不在应用内嵌浏览器。
+- `build_deb.sh` 将 `README.md`、`INSTALL.md` 和 `HELP.md` 安装到 `/usr/share/doc/code-version-manager/`；源码运行时帮助从项目根目录回退读取。帮助在应用自己的 GTK 滚动文本窗口中显示，不调用系统 URI 阅读器。
 
 所选目录必须是独立 Git 根目录。初始化用 `git init`，默认分支为 main。已管理仓库的 Git 身份、唯一 origin、服务商、自建 GitLab 主机、推送超时、比较工具和分支基线都保存在仓库本地配置。用户级 `code-version-manager/settings.ini` 另存 GitHub 账号、默认提交姓名和邮箱，作为新启用工作空间的默认值；打开已有仓库的“Git 账号”时，非空默认姓名和邮箱逐项预填，只有保存该窗口才写入仓库本地配置，单独保存设置不会修改已有仓库。应用元数据保存在实际 Git 目录下 `code-version-manager/`，不进入用户工作树或远程同步。
 
@@ -218,7 +218,7 @@
 
 ### 主窗口、选择与状态
 
-- 独立标题栏只放应用名称、关于及窗口控制；工作空间工具行放打开、最近、刷新、Git 账号、设置及高级操作菜单。主要操作行按发布、分支选择、新建、合并、删除排序，右侧为单行远程摘要及同步。高级整仓覆盖从高级操作菜单进入。
+- 标题栏只放应用名称、唯一“帮助”菜单及窗口控制；工作空间工具行放打开、最近、刷新、Git 账号、设置及高级操作菜单。新版提示位于窗口底部状态区。主要操作行按发布、分支选择、新建、合并、删除排序，右侧为单行远程摘要及同步。高级整仓覆盖从高级操作菜单进入。
 - 主窗口的 `configure-event` 用 `Gtk.Window.get_size()` 记录普通窗口宽高，避免把客户端装饰尺寸重复计入；`window-state-event` 单独记录最大化。最大化、全屏、最小化的配置事件不覆盖普通尺寸。连续拖动合并为停止 400 毫秒后保存，销毁时移除定时器并补存最新值；只保存变化，写入失败不阻断主窗口关闭。
 - 窗口设置通过同目录临时文件、`fsync` 和原子替换保存，保留原文件权限和其他配置节；不记录窗口位置，也不把日志、对话框的临时尺寸混入主窗口记录。
 - 历史操作条按范围、动态比较、删除版本、下载版本、修改说明、查看 CHANGELOG、下载 CHANGELOG 排列；保持单行并在窄窗口允许横向滚动，显示“已选 N / 2”。单选比较当前工作空间，双选比较两个版本；删除、下载和修改说明仅单选启用。最近两项按选中时间维护，第三项淘汰最早项，取消重选视为最新，一次加入多项按列表顺序处理；重建历史时清空选择顺序，保留 Ctrl／Shift 的 GTK 选择行为。
@@ -247,6 +247,7 @@
 - 更新源固定为公开仓库 `lqxmb/code-version-manager` 的最新正式 GitHub Release，标签为 `v<Debian软件版本>`，附件为 `code-version-manager_<版本>_all.deb` 和同名 `.sha256`。软件发行号仅从应用 VERSION 读取，不能复用工作空间版本标签解析或 Git origin。
 - 更新逻辑保留在现有单文件，独立于 GitRepository。使用标准库 HTTPS、证书校验和严格的 GitHub 资产重定向校验；下载流式写入用户缓存中的私有临时目录，校验大小、SHA-256、deb 包名、版本及架构后才提供安装。缓存和安装日志不进入工作树或 Git 元数据。
 - 用户 settings.ini 的 `[updates]` 保存 `auto_check` 与 `last_success`，默认启用；显示主窗口 5 秒后检查，成功间隔至少 24 小时。手动检查绕过间隔，自动失败静默；只有成功联网取得有效检查结果才更新检查时间。无 Release 不是“已是最新”。
+- 标题栏只保留“帮助”菜单，依次提供“使用帮助”“检查更新”和“关于”；F1 绑定使用帮助。“关于”窗口提供帮助及手动检查更新快捷按钮。帮助在 GTK 可滚动文本窗口中打开，读取系统文档路径并回退源码 HELP.md，不调用系统 URI 阅读器；新版入口显示在主窗口底部，不另占标题栏。
 - 更新检查、下载与安装均在后台，GTK 和配置保存回主线程；销毁时取消下载、移除定时器并丢弃回调。工作空间切换不重新检查。检查和下载不占用仓库 busy 状态，安装使用 busy 保护并阻止关闭窗口；后台任务或手动合并未完成时拒绝安装。
 - 仅安装版允许调用参数列表形式的 pkexec/apt-get，系统负责管理员授权，不记录密码。执行前重新校验包，安装后核对 dpkg-query 状态和版本，成功才提示重启；失败保留日志和包，不声称回滚系统安装。重启必须先退出旧 Gtk.Application 实例再启动安装入口。
 - build_deb.sh 同时生成 deb 和 SHA-256 附件；维护者可用发布窗口或网页上传 Release。VERSION 继续被忽略。更新测试只用模拟网络与模拟安装，不修改实际用户配置、系统包或真实工作空间。
