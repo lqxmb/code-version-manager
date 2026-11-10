@@ -180,6 +180,7 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
     def test_prepare_private_copy_and_checksum(self):
         self.assertEqual('v0.4.10', self.package.tag)
         self.assertNotEqual(self.source, self.package.path)
+        self.assertEqual(self.source.name, self.package.path.name)
         self.assertEqual(self.source.read_bytes(), self.package.path.read_bytes())
         self.assertEqual(0o700, self.package.path.parent.stat().st_mode & 0o777)
         self.assertEqual(0o400, self.package.path.stat().st_mode & 0o777)
@@ -191,7 +192,8 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
     def test_accept_other_package_architecture_and_reject_bad_checksum(self):
         for source in (self.make_deb(name='another-package'), self.make_deb(architecture='amd64')):
             package = MODULE.prepare_software_release(source, threading.Event())
-            self.assertEqual(f'{package.name}_{package.version}_{package.architecture}.deb', package.path.name)
+            self.addCleanup(lambda package=package: MODULE.SoftwareReleaseBatch((package,)).cleanup())
+            self.assertEqual(source.name, package.path.name)
         adjacent = self.source.with_name(self.source.name + '.sha256')
         adjacent.write_text('0' * 64 + '  ' + self.source.name + '\n')
         with self.assertRaisesRegex(MODULE.GitError, '不一致'):
@@ -199,6 +201,48 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
         adjacent.write_text(self.package.sha256 + '  ' + self.source.name + '\n')
         result = MODULE.prepare_software_release(self.source, threading.Event())
         self.assertEqual(self.package.sha256, result.sha256)
+
+    def test_original_filenames_and_utf8_checksums_are_independent_of_package_metadata(self):
+        source = self.make_deb(name='generic-editor', version='1.2.3', architecture='amd64')
+        content = source.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        for filename in ('sample_app-1.2.3-x86_64.deb', 'Different.Release_1.2.3-amd64.deb',
+                         '发布包_1.2.3_x86_64.deb'):
+            with self.subTest(filename=filename):
+                original = self.root / filename
+                original.write_bytes(content)
+                adjacent = original.with_name(filename + '.sha256')
+                adjacent.write_text(digest + ' *' + filename + '\r\n', encoding='utf-8')
+                before = adjacent.read_bytes()
+                package = MODULE.prepare_software_release(original, threading.Event())
+                self.addCleanup(lambda package=package: MODULE.SoftwareReleaseBatch((package,)).cleanup())
+                self.assertEqual(('generic-editor', '1.2.3', 'amd64'),
+                                 (package.name, package.version, package.architecture))
+                self.assertEqual(filename, package.path.name)
+                self.assertEqual(filename + '.sha256', package.checksum_path.name)
+                self.assertEqual((digest + '  ' + filename + '\n').encode('utf-8'),
+                                 package.checksum_path.read_bytes())
+                self.assertEqual(content, package.path.read_bytes())
+                self.assertEqual(content, original.read_bytes())
+                self.assertEqual(before, adjacent.read_bytes())
+                MODULE.SoftwareReleasePublisher._verify_package(MODULE.SoftwareReleaseBatch((package,)))
+
+    def test_adjacent_checksum_filename_must_match_original_and_failures_clean_cache(self):
+        adjacent = self.source.with_name(self.source.name + '.sha256')
+        legacy_name = f'{self.package.name}_{self.package.version}_{self.package.architecture}.deb'
+        for filename in (legacy_name, 'unrelated.deb'):
+            with self.subTest(filename=filename):
+                adjacent.write_text(self.package.sha256 + '  ' + filename + '\n', encoding='utf-8')
+                before = set(MODULE.application_update_cache().iterdir())
+                with self.assertRaisesRegex(MODULE.GitError, '不一致'):
+                    MODULE.prepare_software_release(self.source, threading.Event())
+                self.assertEqual(before, set(MODULE.application_update_cache().iterdir()))
+                self.assertEqual(self.package.path.read_bytes(), self.source.read_bytes())
+        adjacent.write_bytes(b'\xff')
+        before = set(MODULE.application_update_cache().iterdir())
+        with self.assertRaisesRegex(MODULE.GitError, 'UTF-8'):
+            MODULE.prepare_software_release(self.source, threading.Event())
+        self.assertEqual(before, set(MODULE.application_update_cache().iterdir()))
 
     def test_reject_symlinks_special_files_and_cancelled_preparation(self):
         linked = self.root / 'link.deb'
@@ -417,10 +461,11 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
 
 class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
     def batch(self):
-        return MODULE.prepare_software_release_batch([
-            self.make_deb(name='p7-lane-editor', version='1.2.3', architecture='arm64'),
-            self.make_deb(name='p7-lane-editor', version='1.2.3', architecture='amd64'),
-        ], threading.Event())
+        sources = []
+        for architecture, label in (('arm64', 'aarch64'), ('amd64', 'x86_64')):
+            source = self.make_deb(name='p7-lane-editor', version='1.2.3', architecture=architecture)
+            sources.append(source.rename(source.with_name(f'custom_editor-1.2.3-{label}.deb')))
+        return MODULE.prepare_software_release_batch(sources, threading.Event())
 
     def test_target_address_normalization_and_rejection(self):
         for value in (' lqxmb/p7_lane_editor ', 'https://github.com/lqxmb/p7_lane_editor',
@@ -449,6 +494,32 @@ class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
         uploads = [call for call in publisher.calls if call[:2] == ('release', 'upload')]
         self.assertEqual(4, len(uploads))
         self.assertTrue(all(call[-1] == 'github.com/lqxmb/p7_lane_editor' for call in uploads))
+        expected = {'custom_editor-1.2.3-x86_64.deb', 'custom_editor-1.2.3-x86_64.deb.sha256',
+                    'custom_editor-1.2.3-aarch64.deb', 'custom_editor-1.2.3-aarch64.deb.sha256'}
+        self.assertEqual(expected, {Path(call[3]).name for call in uploads})
+        self.assertEqual(expected, {asset['name'] for asset in publisher.records[0]['assets']})
+
+    def test_unicode_original_filename_publishes_and_missing_checksum_is_generated(self):
+        source = self.source.rename(self.source.with_name('发布包_0.4.10.deb'))
+        batch = MODULE.prepare_software_release_batch([source], threading.Event())
+        publisher = FakePublisher(batch)
+        result = publisher.publish(publisher.preview(batch, 'Title', 'Notes'))
+        self.assertTrue(result.confirmed, result.message)
+        self.assertEqual({'发布包_0.4.10.deb', '发布包_0.4.10.deb.sha256'},
+                         {asset['name'] for asset in publisher.records[0]['assets']})
+        package = batch.packages[0]
+        self.assertEqual(package.sha256 + '  ' + source.name + '\n',
+                         package.checksum_path.read_text(encoding='utf-8'))
+
+    def test_old_renamed_draft_is_rejected_without_upload_or_replacement(self):
+        asset = self.publisher.asset(self.package.path)
+        asset['name'] = f'{self.package.name}_{self.package.version}_{self.package.architecture}.deb'
+        draft = self.publisher.draft([asset])
+        before = copy.deepcopy(draft)
+        with self.assertRaisesRegex(MODULE.GitError, '额外附件'):
+            self.preview()
+        self.assertEqual(before, draft)
+        self.assertFalse(any(call[:2] == ('release', 'upload') for call in self.publisher.calls))
 
     def test_batch_rejects_mixed_names_versions_duplicate_architectures_and_cleans_up(self):
         for other in (self.make_deb(name='different-package'), self.make_deb(version='0.4.11'), self.source):
@@ -458,6 +529,18 @@ class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
             self.assertEqual(before, set(MODULE.application_update_cache().iterdir()))
         with self.assertRaises(MODULE.GitError):
             MODULE.prepare_software_release_batch([], threading.Event())
+
+    def test_different_architectures_with_same_filename_are_rejected_and_copies_cleaned(self):
+        other = self.make_deb(architecture='arm64')
+        directory = self.root / 'other-architecture'
+        directory.mkdir()
+        other = other.rename(directory / self.source.name)
+        before = set(MODULE.application_update_cache().iterdir())
+        with self.assertRaisesRegex(MODULE.GitError, '同名附件'):
+            MODULE.prepare_software_release_batch([self.source, other], threading.Event())
+        self.assertEqual(before, set(MODULE.application_update_cache().iterdir()))
+        self.assertTrue(self.source.is_file())
+        self.assertTrue(other.is_file())
 
     def test_version_must_be_valid_git_tag(self):
         source = self.make_deb(version='1:0.4.10')
@@ -600,6 +683,10 @@ class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
         result = publisher.publish(publisher.preview(batch, 'Title', 'Notes'))
         self.assertTrue(result.confirmed, result.message)
         self.assertEqual(4, len(publisher.records[0]['assets']))
+        names = [asset['name'] for asset in publisher.records[0]['assets']]
+        self.assertEqual({path.name for path in batch.assets}, set(names))
+        self.assertEqual(1, names.count('custom_editor-1.2.3-x86_64.deb'))
+        self.assertEqual(1, names.count('custom_editor-1.2.3-aarch64.deb'))
 
     def test_anonymous_release_response_and_redirects_are_checked_without_credentials(self):
         draft = self.publisher.draft([self.publisher.asset(path, 20 + i)
@@ -831,9 +918,31 @@ class SoftwareReleaseUiTest(ReleaseFixtures, unittest.TestCase):
         self.dialog._package_ready(batch, '')
         buffer = self.dialog.package_details.get_buffer()
         text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
-        for expected in ('all', 'arm64', 'code-version-manager_0.4.10_arm64.deb.sha256'):
+        for expected in ('包内信息：包名', '架构 all', '架构 arm64', self.source.name, second.name + '.sha256'):
             self.assertIn(expected, text)
         self.assertEqual(4, len(self.dialog.batch.assets))
+
+    def test_original_filename_and_internal_architecture_displayed_and_confirmed(self):
+        source = self.make_deb(name='generic-editor', version='1.2.3', architecture='amd64')
+        source = source.rename(source.with_name('custom_editor-1.2.3-x86_64.deb'))
+        batch = MODULE.prepare_software_release_batch([source], threading.Event())
+        self.dialog.repository_entry.set_text('owner/releases')
+        self.dialog._package_ready(batch, '')
+        buffer = self.dialog.package_details.get_buffer()
+        text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
+        for expected in ('包名 generic-editor', '版本 1.2.3', '架构 amd64',
+                         '附件：' + source.name, source.name + '.sha256'):
+            self.assertIn(expected, text)
+        publisher = FakePublisher(batch, 'owner/releases')
+        plan = publisher.preview(batch, 'Title', 'Notes')
+        with mock.patch.object(MODULE.Gtk, 'MessageDialog') as confirmation, \
+                mock.patch.object(self.dialog, '_worker') as worker:
+            confirmation.return_value.run.return_value = MODULE.Gtk.ResponseType.CANCEL
+            self.dialog._preview_ready(plan, '')
+        text = confirmation.return_value.format_secondary_text.call_args.args[0]
+        self.assertIn(source.name, text)
+        self.assertIn(source.name + '.sha256', text)
+        worker.assert_not_called()
 
     def test_dialog_keeps_original_workspace_target_after_workspace_switch(self):
         first = self.repository('first', 'git@github.com:lqxmb/p7_lane_editor_core.git')

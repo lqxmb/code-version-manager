@@ -867,6 +867,9 @@ class SoftwareReleaseBatch:
             raise GitError("同一次发布的 deb 包名和版本必须一致。")
         if len({item.architecture for item in self.packages}) != len(self.packages):
             raise GitError("同一次发布不能包含重复架构。")
+        filenames = [path.name for path in self.assets]
+        if len(set(filenames)) != len(filenames):
+            raise GitError("同一次发布不能包含同名附件，请调整文件名后重新选择。")
 
     @property
     def version(self) -> str:
@@ -995,7 +998,7 @@ def _release_file_hash(path: Path) -> str:
 def prepare_software_release(source: Path, cancel: threading.Event) -> SoftwareReleasePackage:
     root = Path(tempfile.mkdtemp(prefix="publish-", dir=str(application_update_cache())))
     try:
-        target = root / "package.deb"
+        target = root / source.name
         descriptor = os.open(str(source), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as handle, target.open("xb") as output:
             before = os.fstat(handle.fileno())
@@ -1026,22 +1029,23 @@ def prepare_software_release(source: Path, cancel: threading.Event) -> SoftwareR
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if valid_tag.returncode:
             raise GitError("软件版本无法组成有效 Git 标签 v<版本>，请调整 deb 版本后重试。")
-        final = root / f"{name}_{version}_{architecture}.deb"
-        target.rename(final)
-        digest = _release_file_hash(final)
+        digest = _release_file_hash(target)
         adjacent = source.with_name(source.name + ".sha256")
         if os.path.lexists(str(adjacent)):
             descriptor = os.open(str(adjacent), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(descriptor, "rb") as handle:
                 if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                     raise GitError("相邻校验文件必须是普通文件。")
-                checksum = handle.read(4097).decode("ascii")
+                try:
+                    checksum = handle.read(4097).decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise GitError("相邻 SHA-256 校验文件须为 UTF-8 文本。") from error
             match = re.fullmatch(r"([0-9a-fA-F]{64}) [ *](.+)\r?\n?", checksum)
             if (not match or match.group(1).lower() != digest
-                    or match.group(2).rstrip("\r") not in (source.name, final.name)):
+                    or match.group(2).rstrip("\r") != source.name):
                 raise GitError("相邻 SHA-256 校验文件与所选 deb 不一致。")
-        package = SoftwareReleasePackage(final, version, copied, digest, name, architecture)
-        package.checksum_path.write_text(f"{digest}  {final.name}\n", encoding="ascii")
+        package = SoftwareReleasePackage(target, version, copied, digest, name, architecture)
+        package.checksum_path.write_text(f"{digest}  {target.name}\n", encoding="utf-8")
         for asset in package.assets:
             asset.chmod(0o400)
         if cancel.is_set():
@@ -1361,7 +1365,7 @@ class SoftwareReleasePublisher:
     @staticmethod
     def _verify_package(batch: SoftwareReleaseBatch) -> None:
         for package in batch.packages:
-            expected_checksum = f"{package.sha256}  {package.path.name}\n".encode("ascii")
+            expected_checksum = f"{package.sha256}  {package.path.name}\n".encode("utf-8")
             if (package.path.stat().st_size != package.size
                     or _release_file_hash(package.path) != package.sha256
                     or _release_file_hash(package.checksum_path) != hashlib.sha256(expected_checksum).hexdigest()):
@@ -6100,8 +6104,8 @@ class SoftwareReleaseDialog(Gtk.Dialog):
         text = ""
         if batch:
             self.title_entry.set_text(batch.packages[0].name + " " + batch.version)
-            text = "\n".join(f"{package.name}  {package.version}  {package.architecture}\n"
-                             + "\n".join(f"  {path.name}（{format_storage_size(path.stat().st_size)}）"
+            text = "\n".join(f"包内信息：包名 {package.name}；版本 {package.version}；架构 {package.architecture}\n"
+                             + "\n".join(f"  附件：{path.name}（{format_storage_size(path.stat().st_size)}）"
                                          for path in package.assets) for package in batch.packages)
         self.package_details.get_buffer().set_text(text)
         self._finish(error or f"已准备 {len(batch.packages)} 个 deb 及各自 SHA-256 校验文件。")
