@@ -168,6 +168,13 @@ class ReleaseFixtures:
     def preview(self):
         return self.publisher.preview(self.package, 'Title', 'Notes')
 
+    def repository(self, name, origin=''):
+        workspace = self.root / name
+        subprocess.run(['git', 'init', '-q', str(workspace)], check=True)
+        if origin:
+            subprocess.run(['git', '-C', str(workspace), 'remote', 'add', 'origin', origin], check=True)
+        return MODULE.GitRepository(workspace)
+
 
 class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
     def test_prepare_private_copy_and_checksum(self):
@@ -634,19 +641,13 @@ class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
 
 
 class ReleaseRepositorySettingsTest(ReleaseFixtures, unittest.TestCase):
-    def repository(self, name, origin=''):
-        workspace = self.root / name
-        subprocess.run(['git', 'init', '-q', str(workspace)], check=True)
-        if origin:
-            subprocess.run(['git', '-C', str(workspace), 'remote', 'add', 'origin', origin], check=True)
-        return MODULE.GitRepository(workspace)
-
     def test_targets_are_local_and_origin_is_only_a_default(self):
         first = self.repository('core', 'git@github.com:lqxmb/p7_lane_editor_core.git')
         second = self.repository('other', 'git@github.com:other/project.git')
         self.assertEqual('lqxmb/p7_lane_editor_core', first.release_repository())
         first.configure_release_repository('https://github.com/lqxmb/p7_lane_editor/releases')
         self.assertEqual('lqxmb/p7_lane_editor', first.release_repository())
+        self.assertEqual([], first.release_repository_history())
         self.assertEqual('other/project', second.release_repository())
         self.assertEqual('git@github.com:lqxmb/p7_lane_editor_core.git', first.remote_url())
         self.assertFalse(self.settings.exists())
@@ -659,6 +660,53 @@ class ReleaseRepositorySettingsTest(ReleaseFixtures, unittest.TestCase):
             repo = self.repository(str(index), origin)
             self.assertEqual('', repo.release_repository())
 
+    def test_success_history_persists_all_targets_newest_first_and_deduplicates(self):
+        first = self.repository('first', 'git@github.com:owner/source.git')
+        second = self.repository('second', 'git@github.com:other/source.git')
+        first.configure_release_repository('owner/legacy')
+        for index in range(12):
+            first.record_release_repository(f'owner/release-{index}')
+        first.record_release_repository('https://github.com/Owner/Release-0/releases')
+        history = ['Owner/Release-0'] + [f'owner/release-{index}' for index in range(11, 0, -1)]
+        reopened = MODULE.GitRepository(first.path)
+        self.assertEqual(history, reopened.release_repository_history())
+        self.assertEqual(history[0], reopened.release_repository())
+        self.assertEqual('owner/legacy', first.run([
+            'config', '--local', '--get', 'codeversionmanager.releaseRepository']).strip())
+        self.assertEqual([], second.release_repository_history())
+        self.assertEqual('other/source', second.release_repository())
+        self.assertEqual('git@github.com:owner/source.git', first.remote_url())
+        self.assertFalse(self.settings.exists())
+
+    def test_invalid_history_is_filtered_without_writing_config(self):
+        repo = self.repository('workspace', 'git@github.com:owner/source.git')
+        config = repo.metadata_path.parent / 'config'
+        for value, expected in (
+                ('invalid JSON', []), ('null', []), ('{}', []), ('"owner/release"', []),
+                (json.dumps([None, 5, {}, 'https://evil.example/owner/repo', 'owner/first',
+                             'OWNER/FIRST', 'https://github.com/owner/second/releases']),
+                 ['owner/first', 'owner/second'])):
+            with self.subTest(value=value):
+                repo.run(['config', '--local', 'codeversionmanager.releaseRepositoryHistory', value])
+                before = config.read_bytes()
+                self.assertEqual(expected, repo.release_repository_history())
+                self.assertEqual(expected[0] if expected else 'owner/source', repo.release_repository())
+                self.assertEqual(before, config.read_bytes())
+
+    def test_invalid_target_and_config_write_failure_preserve_previous_history(self):
+        repo = self.repository('workspace')
+        repo.record_release_repository('owner/first')
+        with self.assertRaises(MODULE.GitError):
+            repo.record_release_repository('https://evil.example/owner/repo')
+        self.assertEqual(['owner/first'], repo.release_repository_history())
+        config = repo.metadata_path.parent / 'config'
+        before = config.read_bytes()
+        config.with_name('config.lock').touch()
+        with self.assertRaises(MODULE.GitError):
+            repo.record_release_repository('owner/second')
+        self.assertEqual(before, config.read_bytes())
+        self.assertEqual(['owner/first'], repo.release_repository_history())
+
 
 class SoftwareReleaseUiTest(ReleaseFixtures, unittest.TestCase):
     def setUp(self):
@@ -670,6 +718,42 @@ class SoftwareReleaseUiTest(ReleaseFixtures, unittest.TestCase):
         self.addCleanup(self.window.destroy)
         self.window.on_publish_software(None)
         self.dialog = self.window.software_release_dialog
+
+    def open_repository(self, repo):
+        self.dialog.destroy()
+        self.window.repository = repo
+        self.window.on_publish_software(None)
+        self.dialog = self.window.software_release_dialog
+
+    def confirmed_publish_worker(self, plan):
+        self.dialog.batch = plan.batch
+        self.dialog.busy = True
+        with mock.patch.object(MODULE.Gtk, 'MessageDialog') as confirmation, \
+                mock.patch.object(self.dialog, '_worker') as worker:
+            confirmation.return_value.run.return_value = MODULE.Gtk.ResponseType.OK
+            self.dialog._preview_ready(plan, '')
+        return worker.call_args.args
+
+    def test_target_history_dropdown_and_legacy_prefill_support_manual_input(self):
+        repo = self.repository('workspace', 'git@github.com:owner/source.git')
+        repo.configure_release_repository('owner/legacy')
+        self.open_repository(repo)
+        self.assertEqual('owner/legacy', self.dialog.repository_entry.get_text())
+        self.assertEqual(0, len(self.dialog.repository_combo.get_model()))
+        repo.record_release_repository('owner/first')
+        repo.record_release_repository('owner/second')
+        self.open_repository(repo)
+        self.assertEqual('owner/second', self.dialog.repository_entry.get_text())
+        self.assertEqual(['owner/second', 'owner/first'],
+                         [row[0] for row in self.dialog.repository_combo.get_model()])
+        self.dialog.repository_combo.set_active(1)
+        self.assertEqual('owner/first', self.dialog.repository_entry.get_text())
+        self.assertEqual('https://github.com/owner/first/releases', self.dialog.link.get_uri())
+        self.dialog.repository_entry.set_text('https://github.com/owner/new/releases')
+        self.assertEqual('https://github.com/owner/new/releases', self.dialog.repository_entry.get_text())
+        self.assertEqual(['owner/second', 'owner/first'], repo.release_repository_history())
+        self.open_repository(repo)
+        self.assertEqual('owner/second', self.dialog.repository_entry.get_text())
 
     def test_menu_opens_single_dialog_package_autofills_version(self):
         self.assertEqual('发布软件到 GitHub', self.window.publish_software_item.get_label())
@@ -752,31 +836,124 @@ class SoftwareReleaseUiTest(ReleaseFixtures, unittest.TestCase):
         self.assertEqual(4, len(self.dialog.batch.assets))
 
     def test_dialog_keeps_original_workspace_target_after_workspace_switch(self):
-        def repository(name, origin):
-            path = self.root / name
-            subprocess.run(['git', 'init', '-q', str(path)], check=True)
-            subprocess.run(['git', '-C', str(path), 'remote', 'add', 'origin', origin], check=True)
-            return MODULE.GitRepository(path)
-        first = repository('first', 'git@github.com:lqxmb/p7_lane_editor_core.git')
-        second = repository('second', 'git@github.com:other/project.git')
-        self.dialog.destroy()
-        self.window.repository = first
-        self.window.on_publish_software(None)
-        self.dialog = self.window.software_release_dialog
+        first = self.repository('first', 'git@github.com:lqxmb/p7_lane_editor_core.git')
+        second = self.repository('second', 'git@github.com:other/project.git')
+        self.open_repository(first)
         self.assertEqual('lqxmb/p7_lane_editor_core', self.dialog.repository_entry.get_text())
         self.window.repository = second
         self.dialog.repository_entry.set_text('https://github.com/lqxmb/p7_lane_editor/releases')
         self.dialog._package_ready(MODULE.SoftwareReleaseBatch((self.package,)), '')
         self.dialog.notes.get_buffer().set_text('Changes')
-        with mock.patch.object(MODULE.SoftwareReleasePublisher, 'preview', return_value=self.preview()) as preview, \
+        self.publisher.repository = 'lqxmb/p7_lane_editor'
+        plan = self.preview()
+        with mock.patch.object(MODULE.SoftwareReleasePublisher, 'preview', return_value=plan) as preview, \
                 mock.patch.object(self.dialog, '_worker') as worker:
             self.dialog._response(self.dialog, MODULE.Gtk.ResponseType.OK)
             worker.call_args.args[0](threading.Event())
-        self.assertEqual('lqxmb/p7_lane_editor', first.release_repository())
+        self.assertEqual('lqxmb/p7_lane_editor_core', first.release_repository())
+        self.assertEqual([], first.release_repository_history())
         self.assertEqual('other/project', second.release_repository())
         self.assertEqual('lqxmb/p7_lane_editor', self.dialog.repository_entry.get_text())
         preview.assert_called_once()
         self.assertIn('/lqxmb/p7_lane_editor/releases', self.dialog.link.get_uri())
+        operation, callback = self.confirmed_publish_worker(plan)
+        with mock.patch.object(MODULE.SoftwareReleasePublisher, 'publish', return_value=MODULE.SoftwareReleaseResult(
+                'https://github.com/lqxmb/p7_lane_editor/releases/tag/' + self.package.tag, True, '发布成功')):
+            result = operation(threading.Event())
+        self.assertEqual(['lqxmb/p7_lane_editor'], first.release_repository_history())
+        self.assertEqual([], second.release_repository_history())
+        callback(result, '')
+        self.assertEqual(['lqxmb/p7_lane_editor'], [row[0] for row in self.dialog.repository_combo.get_model()])
+        self.assertIn('公开', self.dialog.visibility_label.get_text())
+        self.assertEqual(result.url, self.dialog.link.get_uri())
+        self.open_repository(first)
+        self.assertEqual('lqxmb/p7_lane_editor', self.dialog.repository_entry.get_text())
+
+    def test_unconfirmed_and_failed_publications_do_not_change_saved_target(self):
+        repo = self.repository('workspace')
+        repo.record_release_repository('owner/success')
+        self.open_repository(repo)
+        plan = self.preview()
+        for outcome in (MODULE.SoftwareReleaseResult(self.publisher.web_url, False, '发布结果待确认'),
+                        MODULE.GitError('上传失败，草稿保留'), MODULE.UpdateCancelled('发布已取消')):
+            with self.subTest(outcome=outcome):
+                operation, callback = self.confirmed_publish_worker(plan)
+                with mock.patch.object(MODULE.SoftwareReleasePublisher, 'publish', side_effect=[outcome]):
+                    if isinstance(outcome, Exception):
+                        with self.assertRaises(type(outcome)):
+                            operation(threading.Event())
+                        callback(None, str(outcome))
+                    else:
+                        callback(operation(threading.Event()), '')
+                self.assertEqual(['owner/success'], repo.release_repository_history())
+                self.assertEqual('owner/success', repo.release_repository())
+
+    def test_failed_precheck_and_declined_confirmation_do_not_save_target(self):
+        repo = self.repository('workspace')
+        repo.configure_release_repository('owner/legacy')
+        self.open_repository(repo)
+        self.dialog.repository_entry.set_text(MODULE.UPDATE_REPOSITORY)
+        self.dialog.batch = MODULE.SoftwareReleaseBatch((self.package,))
+        with mock.patch.object(MODULE.SoftwareReleasePublisher, 'preview', side_effect=MODULE.GitError('预检查失败')), \
+                mock.patch.object(self.dialog, '_worker') as worker:
+            self.dialog._response(self.dialog, MODULE.Gtk.ResponseType.OK)
+            with self.assertRaisesRegex(MODULE.GitError, '预检查失败'):
+                worker.call_args.args[0](threading.Event())
+        self.dialog._preview_ready(None, '预检查失败')
+        with mock.patch.object(MODULE.Gtk, 'MessageDialog') as confirmation, \
+                mock.patch.object(self.dialog, '_worker') as worker:
+            confirmation.return_value.run.return_value = MODULE.Gtk.ResponseType.CANCEL
+            self.dialog._preview_ready(self.preview(), '')
+        worker.assert_not_called()
+        self.assertEqual([], repo.release_repository_history())
+        self.assertEqual('owner/legacy', repo.release_repository())
+
+    def test_creating_repository_only_updates_current_form(self):
+        repo = self.repository('workspace')
+        repo.record_release_repository('owner/success')
+        self.open_repository(repo)
+        self.dialog.repository_entry.set_text('owner/new')
+        creation_plan = MODULE.SoftwareReleaseRepositoryCreationPlan('owner/new', 'owner', False)
+        target = MODULE.SoftwareReleaseTarget('owner/new', 12, False, 'main', '')
+        outcome = MODULE.SoftwareReleaseRepositoryCreationResult(creation_plan, target, '已创建')
+        with mock.patch.object(MODULE.Gtk.Dialog, 'run', return_value=MODULE.Gtk.ResponseType.OK), \
+                mock.patch.object(MODULE.SoftwareReleasePublisher, 'create_repository', return_value=outcome), \
+                mock.patch.object(self.dialog, '_worker') as worker:
+            self.dialog._repository_creation_ready(creation_plan, '')
+            operation, callback = worker.call_args.args
+            callback(operation(threading.Event()), '')
+        self.assertEqual('owner/new', self.dialog.repository_entry.get_text())
+        self.assertEqual(['owner/success'], repo.release_repository_history())
+        self.assertEqual('owner/success', repo.release_repository())
+
+    def test_success_with_history_save_failure_keeps_published_result_and_link(self):
+        repo = self.repository('workspace')
+        repo.record_release_repository('owner/success')
+        self.open_repository(repo)
+        plan = self.preview()
+        operation, callback = self.confirmed_publish_worker(plan)
+        published = MODULE.SoftwareReleaseResult(self.publisher.web_url, True, '正式 Release 已发布')
+        with mock.patch.object(MODULE.SoftwareReleasePublisher, 'publish', return_value=published), \
+                mock.patch.object(repo, 'record_release_repository', side_effect=MODULE.GitError('config locked')):
+            result = operation(threading.Event())
+        self.assertTrue(result.confirmed)
+        callback(result, '')
+        buffer = self.dialog.details.get_buffer()
+        self.assertIn('历史保存失败', buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True))
+        self.assertEqual(published.url, self.dialog.link.get_uri())
+        self.assertEqual('打开已发布版本', self.dialog.link.get_label())
+        self.assertEqual(['owner/success'], repo.release_repository_history())
+
+    def test_confirmed_target_is_recorded_even_if_dialog_is_destroyed(self):
+        repo = self.repository('workspace')
+        self.open_repository(repo)
+        plan = self.preview()
+        operation, _callback = self.confirmed_publish_worker(plan)
+        self.dialog.destroy()
+        with mock.patch.object(MODULE.SoftwareReleasePublisher, 'publish', return_value=MODULE.SoftwareReleaseResult(
+                self.publisher.web_url, True, '已发布')):
+            operation(threading.Event())
+        self.assertEqual([plan.target.repository], repo.release_repository_history())
 
     def test_confirmation_lists_initialization_private_visibility_and_all_assets(self):
         batch = MODULE.SoftwareReleaseBatch((self.package,))

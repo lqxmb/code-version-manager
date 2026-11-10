@@ -2245,6 +2245,9 @@ class GitRepository:
         return self.run(["config", "--get", "remote.origin.url"], check=False).strip()
 
     def release_repository(self) -> str:
+        history = self.release_repository_history()
+        if history:
+            return history[0]
         configured = self.run(["config", "--local", "--get", "codeversionmanager.releaseRepository"],
                               check=False).strip()
         if configured:
@@ -2255,6 +2258,36 @@ class GitRepository:
     def configure_release_repository(self, repository: str) -> None:
         self.run(["config", "--local", "codeversionmanager.releaseRepository",
                   validate_release_repository(repository)])
+
+    def release_repository_history(self) -> List[str]:
+        value = self.run(["config", "--local", "--get", "codeversionmanager.releaseRepositoryHistory"],
+                         check=False)
+        try:
+            values = json.loads(value)
+        except ValueError:
+            return []
+        if not isinstance(values, list):
+            return []
+        history, seen = [], set()
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            try:
+                repository = validate_release_repository(value)
+            except GitError:
+                continue
+            if repository.lower() not in seen:
+                history.append(repository)
+                seen.add(repository.lower())
+        return history
+
+    def record_release_repository(self, repository: str) -> None:
+        """Remember a target only after its formal Release was confirmed."""
+        repository = validate_release_repository(repository)
+        history = [repository] + [item for item in self.release_repository_history()
+                                  if item.lower() != repository.lower()]
+        self.run(["config", "--local", "codeversionmanager.releaseRepositoryHistory",
+                  json.dumps(history, ensure_ascii=False)])
 
     def git_provider(self) -> str:
         configured = self.run(["config", "--get", "codeversionmanager.gitProvider"], check=False).strip()
@@ -5804,9 +5837,11 @@ class SoftwareReleaseDialog(Gtk.Dialog):
         content.pack_start(self.inputs, False, False, 0)
         target_row = Gtk.Box(spacing=8)
         target_row.pack_start(Gtk.Label(label="目标仓库", xalign=0), False, False, 0)
-        self.repository_entry = Gtk.Entry()
+        self.repository_combo = Gtk.ComboBoxText.new_with_entry()
+        self.repository_entry = self.repository_combo.get_child()
         self.repository_entry.set_placeholder_text("owner/repo 或 https://github.com/owner/repo/releases")
-        target_row.pack_start(self.repository_entry, True, True, 0)
+        self.repository_combo.set_tooltip_text("选择本工作空间成功发布过的仓库，或直接输入新目标")
+        target_row.pack_start(self.repository_combo, True, True, 0)
         self.create_repository_button = Gtk.Button(label="创建发行仓库")
         self.create_repository_button.set_tooltip_text("使用当前 GitHub 登录创建空的发行仓库")
         self.create_repository_button.connect("clicked", self._create_repository)
@@ -5862,7 +5897,7 @@ class SoftwareReleaseDialog(Gtk.Dialog):
                    or "请选择已构建的 deb，并填写更新说明。首次使用请在浏览器完成 GitHub CLI 登录。")
         try:
             if self.workspace_repository:
-                self.repository_entry.set_text(self.workspace_repository.release_repository())
+                self._refresh_repository_choices(self.workspace_repository.release_repository())
             self._target_changed()
         except GitError as error:
             message += "\n\n" + str(error)
@@ -5871,6 +5906,13 @@ class SoftwareReleaseDialog(Gtk.Dialog):
 
     def _message(self, text: str) -> None:
         self.details.get_buffer().set_text(text)
+
+    def _refresh_repository_choices(self, repository: str) -> None:
+        history = self.workspace_repository.release_repository_history()
+        self.repository_combo.remove_all()
+        for item in history:
+            self.repository_combo.append_text(item)
+        self.repository_entry.set_text(repository)
 
     def _target_changed(self, *_args) -> None:
         self.visibility_label.set_text("目标可见性：预检查后显示")
@@ -6011,18 +6053,9 @@ class SoftwareReleaseDialog(Gtk.Dialog):
             self._finish("已取消创建确认，尚未发送仓库创建请求。")
             return
         plan = replace(plan, private=private)
-        workspace = self.workspace_repository
-        def create(cancel):
-            result = SoftwareReleasePublisher(plan.repository, cancel, self._progress).create_repository(plan)
-            if result.target is not None and workspace is not None:
-                try:
-                    workspace.configure_release_repository(result.target.repository)
-                except Exception as exception:
-                    result = replace(result, message=result.message
-                                     + f"\n仓库已确认，但工作空间的发布目标保存失败：{exception}。下次请手动填写此目标。")
-            return result
         self._message("正在重新核对账号和目标，然后创建发行仓库…")
-        self._worker(create, self._repository_created)
+        self._worker(lambda cancel: SoftwareReleasePublisher(plan.repository, cancel, self._progress)
+                     .create_repository(plan), self._repository_created)
 
     def _repository_created(self, result, error: str) -> None:
         if error:
@@ -6099,11 +6132,8 @@ class SoftwareReleaseDialog(Gtk.Dialog):
             notes = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
             batch, title = self.batch, self.title_entry.get_text()
             self._message("正在检查远程标签、草稿、权限和最新正式版…")
-            def preview(cancel):
-                if self.workspace_repository:
-                    self.workspace_repository.configure_release_repository(repository)
-                return SoftwareReleasePublisher(repository, cancel, self._progress).preview(batch, title, notes)
-            self._worker(preview, self._preview_ready)
+            self._worker(lambda cancel: SoftwareReleasePublisher(repository, cancel, self._progress)
+                         .preview(batch, title, notes), self._preview_ready)
         elif response != Gtk.ResponseType.CANCEL:
             self.destroy()
 
@@ -6140,14 +6170,32 @@ class SoftwareReleaseDialog(Gtk.Dialog):
         if response != Gtk.ResponseType.OK or self.cancel.is_set():
             self._finish("已取消发布确认，尚未修改远程发行。")
             return
-        self._worker(lambda cancel: SoftwareReleasePublisher(plan.target.repository, cancel, self._progress).publish(plan),
-                     self._published)
+        workspace = self.workspace_repository
+        def publish(cancel):
+            result = SoftwareReleasePublisher(plan.target.repository, cancel, self._progress).publish(plan)
+            if result.confirmed and workspace is not None:
+                try:
+                    workspace.record_release_repository(plan.target.repository)
+                except Exception as exception:
+                    result = replace(result, message=result.message
+                                     + f"\n正式 Release 已发布，但发布目标历史保存失败：{exception}。"
+                                     + f"下次请手动填写 {plan.target.repository}。")
+            return result
+        self._worker(publish, lambda result, error: self._published(result, error, plan.target.repository))
 
-    def _published(self, result, error: str) -> None:
+    def _published(self, result, error: str, repository: str = "") -> None:
+        message = error or (result.message + "\n" + result.url)
         if result is not None:
+            if result.confirmed and repository and self.workspace_repository is not None:
+                try:
+                    visibility = self.visibility_label.get_text()
+                    self._refresh_repository_choices(repository)
+                    self.visibility_label.set_text(visibility)
+                except GitError as exception:
+                    message += f"\n目标历史列表刷新失败：{exception}。请重新打开发布窗口。"
             self.link.set_uri(result.url)
             self.link.set_label("打开已发布版本" if result.confirmed else "打开网页核对发布结果")
-        self._finish(error or (result.message + "\n" + result.url))
+        self._finish(message)
 
     def _delete(self, *_args) -> bool:
         if self.busy:

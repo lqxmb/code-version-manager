@@ -70,7 +70,7 @@ python3 tests/verify_workspace_copy.py /path/to/workspace
 sh build_deb.sh
 ```
 
-脚本同时生成 `dist/code-version-manager_<VERSION>_all.deb.sha256`。从“高级操作 → 发布软件到 GitHub”将本软件 deb 及校验文件发布到构建配置指定的更新仓库，确认发行信息后执行。若希望发行标签关联实际源码提交，应先推送 `v<VERSION>` 标签；缺少标签时，发布器在已确认的目标默认分支提交上创建标签。发布器也支持其他软件、独立公开或私有发行仓库及同版多架构 deb，目标按工作空间保存在本地 Git 配置 `codeversionmanager.releaseRepository`；这一发布目标不会改变本软件的构建配置。空发行仓库在确认后仅初始化 README，不读取或上传源码工作空间。应用使用 GitHub CLI 登录状态，固定本地附件副本，先上传到草稿，校验后发布。操作细节见 HELP；CLI 安装见 INSTALL。仍可到 GitHub 网页手动创建正式 Release 并上传附件；不要勾选预发布。客户端按 Debian 版本规则比较最新正式发行版，只推送代码或标签不会提供升级包。根目录 `VERSION` 保持本地忽略；首次提供联网更新的发行号为 0.4.9。
+脚本同时生成 `dist/code-version-manager_<VERSION>_all.deb.sha256`。从“高级操作 → 发布软件到 GitHub”将本软件 deb 及校验文件发布到构建配置指定的更新仓库，确认发行信息后执行。若希望发行标签关联实际源码提交，应先推送 `v<VERSION>` 标签；缺少标签时，发布器在已确认的目标默认分支提交上创建标签。发布器也支持其他软件、独立公开或私有发行仓库及同版多架构 deb，确认正式发布成功后，将目标写入工作空间本地 Git 配置 `codeversionmanager.releaseRepositoryHistory`，供下次回填和下拉选择；无成功历史时兼容旧 `codeversionmanager.releaseRepository`。这一发布目标不会改变本软件的构建配置。空发行仓库在确认后仅初始化 README，不读取或上传源码工作空间。应用使用 GitHub CLI 登录状态，固定本地附件副本，先上传到草稿，校验后发布。操作细节见 HELP；CLI 安装见 INSTALL。仍可到 GitHub 网页手动创建正式 Release 并上传附件；不要勾选预发布。客户端按 Debian 版本规则比较最新正式发行版，只推送代码或标签不会提供升级包。根目录 `VERSION` 保持本地忽略；首次提供联网更新的发行号为 0.4.9。
 
 发布窗口打开时仅查找本机的 `gh` 和桌面终端，缺少时直接显示可复制的官方安装说明地址；CLI 能力和授权仍在操作时检查。依赖提示和终端启动共用终端检测逻辑，缺少终端不阻止已有授权的登录检查及发布。
 
