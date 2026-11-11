@@ -86,6 +86,7 @@ UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/lat
 UPDATE_INTERVAL = 24 * 60 * 60
 UPDATE_TIMEOUT = 20
 UPDATE_MAX_PACKAGE_SIZE = 512 * 1024 * 1024
+SOFTWARE_RELEASE_MAX_ASSET_SIZE = 512 * 1024 * 1024
 UPDATE_DOWNLOAD_RESPONSE = 101
 UPDATE_INSTALL_RESPONSE = 102
 UPDATE_CANCEL_RESPONSE = 103
@@ -120,16 +121,7 @@ GIT_PROVIDER_GITHUB = "github"
 GIT_PROVIDER_GITLAB = "gitlab"
 GITLAB_DEFAULT_HOST = "https://gitlab.com"
 GITLAB_NAMESPACE_PLACEHOLDER = "<GitLab用户或组路径>"
-DEFAULT_EXCLUDED_DIRECTORIES = {
-    ".git",
-    ".cache",
-    "__pycache__",
-    "build",
-    "devel",
-    "install",
-    "log",
-    "logs",
-}
+DEFAULT_EXCLUDED_DIRECTORIES = {".git"}
 WORKSPACE_GENERATED_FILES = (WORKSPACE_VERSION, WORKSPACE_CHANGELOG)
 # Ubuntu's bcompare launcher re-quotes arguments, so this must not end in a backslash.
 # The order is the same as Beyond Compare's Name Filters view: include files,
@@ -535,13 +527,51 @@ def help_document_path() -> Path:
     raise GitError(f"找不到帮助文件 HELP.md。已检查：{searched}")
 
 
-def _read_settings(config_file: Path) -> configparser.ConfigParser:
-    parser = configparser.ConfigParser()
+def _read_settings(
+    config_file: Path, *, strict: bool = False,
+) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser(interpolation=None)
     try:
-        parser.read(config_file, encoding="utf-8")
-    except (OSError, configparser.Error):
+        descriptor = os.open(str(config_file), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise OSError("设置目标必须是普通文件，不能是链接或特殊文件。")
+            parser.read_file(handle)
+    except FileNotFoundError:
         pass
+    except (OSError, UnicodeError, configparser.Error) as error:
+        if strict:
+            raise GitError(f"无法读取设置文件 {config_file}：{error}") from error
+        return configparser.ConfigParser(interpolation=None)
     return parser
+
+
+def _save_settings(parser: configparser.ConfigParser, config_file: Path) -> None:
+    """Atomically save user settings without discarding other sections."""
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        info = config_file.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise GitError(f"无法写入设置文件 {config_file}：目标必须是普通文件。")
+        existing_mode = stat.S_IMODE(info.st_mode)
+    except FileNotFoundError:
+        existing_mode = 0o600
+    descriptor, name = tempfile.mkstemp(prefix=".settings-", dir=str(config_file.parent))
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            parser.write(handle)
+            os.fchmod(handle.fileno(), existing_mode)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, config_file)
+        directory_fd = os.open(str(config_file.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -591,26 +621,14 @@ def save_application_update_settings(
     config_file: Optional[Path] = None,
 ) -> None:
     config_file = config_file or settings_file_path()
-    parser = _read_settings(config_file)
+    parser = _read_settings(config_file, strict=True)
     if not parser.has_section("updates"):
         parser.add_section("updates")
     if automatic is not None:
         parser.set("updates", "auto_check", "true" if automatic else "false")
     if last_success is not None:
         parser.set("updates", "last_success", str(last_success))
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(prefix=".updates-settings-", dir=str(config_file.parent))
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            parser.write(handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if config_file.exists():
-            temporary.chmod(stat.S_IMODE(config_file.stat().st_mode))
-        os.replace(temporary, config_file)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _save_settings(parser, config_file)
 
 
 def application_update_due(now: Optional[float] = None) -> bool:
@@ -996,13 +1014,15 @@ def _release_file_hash(path: Path) -> str:
 
 
 def prepare_software_release(source: Path, cancel: threading.Event) -> SoftwareReleasePackage:
+    if not source.name or any(ord(char) < 32 or 127 <= ord(char) <= 159 or char == "\\" for char in source.name):
+        raise GitError("发布附件名不能包含控制字符或反斜杠。")
     root = Path(tempfile.mkdtemp(prefix="publish-", dir=str(application_update_cache())))
     try:
         target = root / source.name
         descriptor = os.open(str(source), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as handle, target.open("xb") as output:
             before = os.fstat(handle.fileno())
-            if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= UPDATE_MAX_PACKAGE_SIZE:
+            if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= SOFTWARE_RELEASE_MAX_ASSET_SIZE:
                 raise GitError("请选择不超过 512 MiB 的普通 deb 文件。")
             copied = 0
             for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -1150,14 +1170,21 @@ class SoftwareReleasePublisher:
                 stderr.seek(0)
                 return process.returncode, stdout.read(4 * 1024 * 1024), stderr.read(16000)
 
-    def check_tools(self) -> None:
-        for command, required in ((["api", "--help"], ("--hostname", "--method", "--input")),
-                                  (["auth", "login", "--help"], ("--web", "--git-protocol", "--skip-ssh-key")),
-                                  (["release", "create", "--help"], ("--verify-tag", "--draft", "--notes-file"))):
+    def check_tools(self, capability: str = "publish") -> None:
+        commands = [(["api", "--help"], ("--hostname", "--method")),
+                    (["auth", "status", "--help"], ("--hostname",))]
+        if capability == "login":
+            commands.append((["auth", "login", "--help"], ("--web", "--git-protocol", "--skip-ssh-key")))
+        elif capability == "create":
+            commands.append((["repo", "create", "--help"], ("--public", "--private")))
+        elif capability == "publish":
+            commands.extend([(["api", "--help"], ("--input", "--header")),
+                             (["release", "create", "--help"], ("--verify-tag", "--draft", "--notes-file"))])
+        for command, required in commands:
             code, stdout, stderr = self._run(command)
             help_text = (stdout + stderr).decode("utf-8", errors="replace")
             if code or any(flag not in help_text for flag in required):
-                raise GitError("GitHub CLI 版本不支持所需的发布能力，请按以下官方说明升级 gh。\n\n"
+                raise GitError("GitHub CLI 版本不支持当前操作所需的能力，请按以下官方说明升级 gh。\n\n"
                                + GITHUB_CLI_INSTALL_HELP)
 
     def _api(self, method: str, path: str, payload=None, missing: bool = False):
@@ -1192,7 +1219,7 @@ class SoftwareReleasePublisher:
             raise GitError("无法解析 GitHub 发布响应，请重新检查。") from error
 
     def authentication(self) -> str:
-        self.check_tools()
+        self.check_tools("auth")
         code, _stdout, _stderr = self._run(["auth", "status", "--hostname", "github.com"])
         if code:
             raise GitError("尚未登录 GitHub 或授权已失效，请点击“登录 GitHub”。")
@@ -1202,7 +1229,7 @@ class SoftwareReleasePublisher:
         return user["login"]
 
     def login(self) -> str:
-        self.check_tools()
+        self.check_tools("login")
         terminal = software_release_terminal_command()
         if not terminal:
             raise GitError("找不到桌面终端。请安装桌面终端（如 gnome-terminal）后重试登录。\n"
@@ -1218,11 +1245,7 @@ class SoftwareReleasePublisher:
             raise GitError("请选择公开或私有仓库。")
         self.progress("检查 GitHub 登录和目标仓库…", 0.1)
         account = self.authentication()
-        code, stdout, stderr = self._run(["repo", "create", "--help"])
-        help_text = (stdout + stderr).decode("utf-8", errors="replace")
-        if code or any(flag not in help_text for flag in ("--public", "--private")):
-            raise GitError("GitHub CLI 版本不支持创建仓库，请按以下官方说明升级 gh。\n\n"
-                           + GITHUB_CLI_INSTALL_HELP)
+        self.check_tools("create")
         if self._api("GET", self.api_path, missing=True) is not None:
             raise GitError(f"目标仓库 {self.repository} 已存在，无需创建。\n"
                            "请核对当前账号的发布权限，然后点击“检查并发布”。\n"
@@ -1273,24 +1296,52 @@ class SoftwareReleasePublisher:
         self.progress("已确认发行仓库", 1.0)
         return SoftwareReleaseRepositoryCreationResult(plan, target, message)
 
+    @staticmethod
+    def _asset(record) -> SoftwareReleaseAsset:
+        if (not isinstance(record, dict) or type(record.get("id")) is not int or record["id"] <= 0
+                or type(record.get("size")) is not int or record["size"] < 0
+                or not isinstance(record.get("name"), str) or not record["name"]
+                or not isinstance(record.get("state"), str)
+                or not isinstance(record.get("updated_at", ""), str)
+                or (record.get("digest") is not None and not isinstance(record["digest"], str))):
+            raise GitError("GitHub 附件数据无效，已停止发布。")
+        return SoftwareReleaseAsset(record["id"], record["name"], record["size"], record.get("digest") or "",
+                                    record.get("updated_at", ""), record["state"])
+
     def _state(self, record) -> SoftwareReleaseState:
+        if (not isinstance(record, dict) or type(record.get("id")) is not int or record["id"] <= 0
+                or type(record.get("draft")) is not bool or type(record.get("prerelease")) is not bool
+                or not isinstance(record.get("tag_name"), str) or not record["tag_name"]
+                or not isinstance(record.get("assets"), list)
+                or not isinstance(record.get("updated_at", ""), str)
+                or any(record.get(key) is not None and not isinstance(record[key], str) for key in ("name", "body"))):
+            raise GitError("GitHub 发行或附件数据无效，已停止发布。")
+        assets = tuple(sorted((self._asset(item) for item in record["assets"]),
+                              key=lambda item: (item.name, item.asset_id)))
+        if len({item.asset_id for item in assets}) != len(assets):
+            raise GitError("GitHub 发行包含重复附件 ID，已停止发布。")
+        return SoftwareReleaseState(record["id"], record["tag_name"], record["draft"], record["prerelease"],
+                                    record.get("name") or "", record.get("body") or "",
+                                    record.get("updated_at", ""), assets, self.repository)
+
+    def _upload_asset(self, state: SoftwareReleaseState, path: Path) -> SoftwareReleaseAsset:
+        endpoint = (f"https://uploads.github.com/{self.api_path}/releases/{state.release_id}/assets"
+                    + "?name=" + quote(path.name, safe=""))
+        code, stdout, _stderr = self._run(
+            ["api", "--hostname", "github.com", "--method", "POST", endpoint,
+             "--header", "Accept: application/vnd.github+json",
+             "--header", "Content-Type: application/octet-stream", "--input", str(path)], timeout=900)
+        if code:
+            raise GitError("附件上传失败，已上传的附件保留在草稿中。")
         try:
-            if (type(record["id"]) is not int or record["id"] <= 0
-                    or type(record["draft"]) is not bool or type(record["prerelease"]) is not bool
-                    or not isinstance(record["tag_name"], str)):
-                raise ValueError("release")
-            assets = tuple(sorted((SoftwareReleaseAsset(
-                item["id"], item["name"], item["size"], item.get("digest") or "",
-                item.get("updated_at", ""), item["state"]) for item in record.get("assets", [])),
-                key=lambda item: (item.name, item.asset_id)))
-            if any(type(item.asset_id) is not int or item.asset_id <= 0 or type(item.size) is not int
-                   or item.size < 0 or not isinstance(item.name, str) for item in assets):
-                raise ValueError("asset")
-            return SoftwareReleaseState(record["id"], record["tag_name"], record["draft"], record["prerelease"],
-                                        record.get("name") or "", record.get("body") or "",
-                                        record.get("updated_at", ""), assets, self.repository)
-        except (KeyError, TypeError, ValueError, AttributeError) as error:
-            raise GitError("GitHub 发行或附件数据无效，已停止发布。") from error
+            asset = self._asset(json.loads(stdout.decode("utf-8")))
+        except (ValueError, UnicodeError) as error:
+            raise GitError("无法解析附件上传结果，请打开草稿核对。") from error
+        if asset.name != path.name:
+            raise GitError(f"GitHub 返回的附件名称与原名不一致：预期 {path.name!r}，实际 {asset.name!r}。草稿已保留。")
+        if asset.state != "uploaded" or asset.size != path.stat().st_size:
+            raise GitError("附件上传结果的状态或大小不一致，草稿已保留。")
+        return asset
 
     def _find(self, tag: str) -> Optional[SoftwareReleaseState]:
         matches = []
@@ -1300,7 +1351,8 @@ class SoftwareReleasePublisher:
                 raise GitError("无法读取 GitHub 发行列表。")
             if any(not isinstance(record, dict) for record in records):
                 raise GitError("GitHub 发行列表包含无效记录。")
-            matches.extend(self._state(record) for record in records if record.get("tag_name") == tag)
+            states = [self._state(record) for record in records]
+            matches.extend(state for state in states if state.tag == tag)
             if len(records) < 100:
                 break
         else:
@@ -1340,8 +1392,11 @@ class SoftwareReleasePublisher:
                     or type(record["private"]) is not bool
                     or not isinstance(record["default_branch"], str) or not record["default_branch"]):
                 raise ValueError("repository")
-            if (record.get("archived") or record.get("disabled")
-                    or not record.get("permissions", {}).get("push")):
+            permissions = record.get("permissions")
+            if (not isinstance(permissions, dict) or type(permissions.get("push")) is not bool
+                    or any(key in record and type(record[key]) is not bool for key in ("archived", "disabled"))):
+                raise ValueError("permissions")
+            if (record.get("archived") or record.get("disabled") or not permissions["push"]):
                 raise GitError("当前 GitHub 账号没有该仓库的发布权限，或仓库已归档／禁用。")
             # Asset URLs use GitHub's canonical spelling even for case-insensitive input.
             self.repository = record["full_name"]
@@ -1407,6 +1462,7 @@ class SoftwareReleasePublisher:
             raise GitError("请填写发行标题（最多 256 字符）和更新说明（最多 100 KB）。")
         self.progress("检查 GitHub 登录和发布权限…", 0.05)
         self.authentication()
+        self.check_tools("publish")
         self._verify_package(batch)
         tag_oid, commit_oid = self._tag(batch.tag)
         target = self._target(needs_branch=not tag_oid)
@@ -1545,16 +1601,15 @@ class SoftwareReleasePublisher:
                 stage = f"上传附件 {position + 1}/{len(batch.assets)}：{path.name}"
                 self.progress(stage, fraction)
                 self._assert_target(plan.target)
-                code, _stdout, _stderr = self._run(
-                    ["release", "upload", batch.tag, str(path),
-                     "--repo", "github.com/" + self.repository], timeout=900)
-                if code:
-                    raise GitError("附件上传失败，已上传的附件保留在草稿中。")
+                uploaded = self._upload_asset(current, path)
                 fresh = self._find(batch.tag)
                 if (fresh is None or not fresh.draft or fresh.release_id != current.release_id
                         or fresh.title != plan.title or fresh.notes != plan.notes or fresh.prerelease
                         or tuple(asset for asset in fresh.assets if asset.name != path.name) != current.assets):
                     raise GitError("上传期间草稿发生其他变化，请重新检查。")
+                if not any((asset.asset_id, asset.name, asset.size, asset.state)
+                           == (uploaded.asset_id, uploaded.name, uploaded.size, uploaded.state) for asset in fresh.assets):
+                    raise GitError("草稿附件与上传返回结果不一致，请打开草稿核对。")
                 self._verify_assets(fresh, batch)
                 current = fresh
             stage = "校验完整草稿"
@@ -1632,25 +1687,13 @@ def save_window_settings(
 ) -> None:
     """Persist main-window geometry without replacing other settings sections."""
     config_file = config_file or settings_file_path()
-    parser = _read_settings(config_file)
+    parser = _read_settings(config_file, strict=True)
     if not parser.has_section("window"):
         parser.add_section("window")
     parser.set("window", "width", str(width))
     parser.set("window", "height", str(height))
     parser.set("window", "maximized", "true" if maximized else "false")
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(prefix=".settings-", dir=str(config_file.parent))
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            parser.write(handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if config_file.exists():
-            temporary.chmod(stat.S_IMODE(config_file.stat().st_mode))
-        os.replace(temporary, config_file)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _save_settings(parser, config_file)
 
 
 def validate_github_account(value: str) -> str:
@@ -1694,15 +1737,13 @@ def save_git_default_settings(
     email = email.strip()
     if any(ord(char) < 32 for char in name + email):
         raise GitError("默认提交姓名和邮箱不能包含换行或控制字符。")
-    parser = _read_settings(config_file)
+    parser = _read_settings(config_file, strict=True)
     parser[GIT_DEFAULTS_SECTION] = {
         "github_account": account,
         "user_name": name,
         "user_email": email,
     }
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    with config_file.open("w", encoding="utf-8") as handle:
-        parser.write(handle)
+    _save_settings(parser, config_file)
     return account, name, email
 
 
@@ -1919,14 +1960,12 @@ def save_workspace_history(
     paths.extend(candidate for candidate in recent_workspaces(config_file) if candidate != resolved)
     paths = paths[:RECENT_WORKSPACE_LIMIT]
 
-    parser = _read_settings(config_file)
+    parser = _read_settings(config_file, strict=True)
     parser["repository"] = {"path": str(resolved)}
     parser["recent_workspaces"] = {
         "paths": json.dumps([str(candidate) for candidate in paths], ensure_ascii=False)
     }
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    with config_file.open("w", encoding="utf-8") as handle:
-        parser.write(handle)
+    _save_settings(parser, config_file)
     return paths
 
 
@@ -1934,22 +1973,18 @@ def remove_recent_workspace(path: Path, config_file: Optional[Path] = None) -> N
     config_file = config_file or settings_file_path()
     resolved = path.expanduser().resolve()
     paths = [candidate for candidate in recent_workspaces(config_file) if candidate != resolved]
-    parser = _read_settings(config_file)
+    parser = _read_settings(config_file, strict=True)
     parser["recent_workspaces"] = {
         "paths": json.dumps([str(candidate) for candidate in paths], ensure_ascii=False)
     }
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    with config_file.open("w", encoding="utf-8") as handle:
-        parser.write(handle)
+    _save_settings(parser, config_file)
 
 
 def clear_recent_workspaces(config_file: Optional[Path] = None) -> None:
     config_file = config_file or settings_file_path()
-    parser = _read_settings(config_file)
+    parser = _read_settings(config_file, strict=True)
     parser["recent_workspaces"] = {"paths": "[]"}
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    with config_file.open("w", encoding="utf-8") as handle:
-        parser.write(handle)
+    _save_settings(parser, config_file)
 
 
 @dataclass(frozen=True)
@@ -3320,6 +3355,18 @@ class GitRepository:
         if len(commands) > 1:
             self.run(["update-ref", "--stdin"], input="\n".join(commands) + "\n")
 
+    @contextmanager
+    def _after_ref_change(self, action: str, refs: Dict[str, Optional[str]], recovery: str = ""):
+        """Describe committed effects when subsequent local bookkeeping fails."""
+        try:
+            yield
+        except Exception as error:
+            actual = "\n".join(f"{ref}：{oid or '已删除'}" for ref, oid in sorted(refs.items()))
+            location = recovery or "本次操作没有独立恢复点，请按以上对象 OID 核对。"
+            raise GitError(f"{action}已完成，但后续元数据或生成文件刷新失败：{error}\n"
+                           f"已完成的引用：\n{actual}\n恢复位置：{location}\n"
+                           "请修复后刷新或重新切换当前分支；无需重复执行已完成的操作。") from error
+
     def sync_local_from_remote(
         self, snapshot: RemoteSyncSnapshot, status: RemoteSyncStatus,
     ) -> str:
@@ -3343,7 +3390,8 @@ class GitRepository:
             backup = self._save_metadata_recovery(namespace)
             self._validate_sync_confirmation(snapshot, status)
             self._replace_managed_refs(selected_before, selected_after)
-            self._delete_fetched_refs(snapshot, incoming, namespace + "/incoming")
+            with self._after_ref_change("本地备注覆盖", selected_after, f"{namespace}/before；{backup}"):
+                self._delete_fetched_refs(snapshot, incoming, namespace + "/incoming")
             return f"本地版本备注已按远程覆盖。引用恢复点：{namespace}/before；恢复资料：{backup}。"
         self._validate_generated_files()
         current_snapshot = RemoteSyncSnapshot(snapshot.remote_url, snapshot.branch_ref, tuple(sorted(before.items())), snapshot.scope)
@@ -3402,16 +3450,19 @@ class GitRepository:
                 except GitError:
                     pass  # Never overwrite concurrent changes to force a rollback.
                 raise GitError(f"远程覆盖本地未完成：{error}\n引用恢复点：{namespace}/before\n配置和元数据：{backup}\n工作区恢复点：{stash_ref or '无'}") from error
-        for ref in sorted(set(selected_before) | set(selected_after)):
-            if ref.startswith("refs/heads/") and ref not in desired:
-                self.run(["config", "--local", "--remove-section", "branch." + ref[len("refs/heads/"):]], check=False)
-            if ref.startswith("refs/tags/") and before.get(ref) != desired.get(ref):
-                (self.metadata_path / MANIFEST_DIRECTORY / (ref[len("refs/tags/"):] + MANIFEST_SUFFIX)).unlink(missing_ok=True)
-        self._refresh_tracking_refs(remote, rebuild_bases=True, snapshot=snapshot)
-        self._write_changelog(None)
-        self.remember_working_branch()
-        self._delete_fetched_refs(snapshot, self._sync_refs(snapshot, remote), namespace + "/incoming")
-        self.refresh_workspace_generated_files()
+        completed_refs = {**{ref: f"已删除（原 OID：{oid}）" for ref, oid in selected_before.items()
+                             if ref not in selected_after}, **selected_after}
+        with self._after_ref_change("本地覆盖", completed_refs, f"{namespace}/before；{backup}"):
+            for ref in sorted(set(selected_before) | set(selected_after)):
+                if ref.startswith("refs/heads/") and ref not in desired:
+                    self.run(["config", "--local", "--remove-section", "branch." + ref[len("refs/heads/"):]], check=False)
+                if ref.startswith("refs/tags/") and before.get(ref) != desired.get(ref):
+                    (self.metadata_path / MANIFEST_DIRECTORY / (ref[len("refs/tags/"):] + MANIFEST_SUFFIX)).unlink(missing_ok=True)
+            self._refresh_tracking_refs(remote, rebuild_bases=True, snapshot=snapshot)
+            self._write_changelog(None)
+            self.remember_working_branch()
+            self._delete_fetched_refs(snapshot, self._sync_refs(snapshot, remote), namespace + "/incoming")
+            self.refresh_workspace_generated_files()
         message = f"本地{self._sync_scope_label(snapshot)}已按远程覆盖。引用恢复点：{namespace}/before；配置、版本清单和 CHANGELOG：{backup}。"
         if target != snapshot.branch_ref:
             message += "原工作分支已被来源端删除，当前已转到 main。"
@@ -3452,12 +3503,15 @@ class GitRepository:
         actual = self._remote_refs(snapshot.remote_url)
         if self._sync_refs(snapshot, actual) != desired:
             raise GitError(f"推送后远程状态又发生变化，请刷新；远程旧引用恢复点：{namespace}/before。")
-        if not remarks_only:
-            self._refresh_tracking_refs(actual, snapshot=snapshot)
-        self._delete_fetched_refs(snapshot, selected_remote, namespace + "/incoming")
-        if remarks_only:
-            return f"远程版本备注已按本地覆盖。远程旧引用：{namespace}/before；恢复资料：{backup}。"
-        self.refresh_workspace_generated_files()
+        completed_refs = {**{ref: f"已删除（原 OID：{oid}）" for ref, oid in selected_remote.items()
+                             if ref not in desired}, **desired}
+        with self._after_ref_change("远程覆盖", completed_refs, f"{namespace}/before；{backup}"):
+            if not remarks_only:
+                self._refresh_tracking_refs(actual, snapshot=snapshot)
+            self._delete_fetched_refs(snapshot, selected_remote, namespace + "/incoming")
+            if remarks_only:
+                return f"远程版本备注已按本地覆盖。远程旧引用：{namespace}/before；恢复资料：{backup}。"
+            self.refresh_workspace_generated_files()
         return f"远程{self._sync_scope_label(snapshot)}已按本地覆盖。远程旧引用：{namespace}/before；本地配置备份：{backup}。"
 
     def current_branch(self) -> Optional[str]:
@@ -3658,18 +3712,59 @@ class GitRepository:
 
     def merge_state(self) -> MergeState:
         path = self.metadata_path / "merge.json"
+        active = os.path.lexists(str(path))
+        if not active:
+            return MergeState(False, "", (), "", False, False)
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, AttributeError):
-            record = {}
-        active = path.is_file()
-        # A legacy in-progress Git merge can only be cancelled after upgrading.
-        tool_closed = bool(active and (record.get("tool_closed") or record.get("schema") != 1))
-        return MergeState(
-            active, record.get("source", "") if active else "", (),
-            record.get("notice", "") if active else "",
-            tool_closed, bool(tool_closed and record.get("output_signature")),
-        )
+            record = self._read_merge_record()
+        except GitError as error:
+            return MergeState(True, "", (), str(error), True, False)
+        closed = record["tool_closed"]
+        return MergeState(True, record["source"], (), record.get("notice", ""),
+                          closed, bool(closed and record.get("output_signature")))
+
+    @staticmethod
+    def _valid_oid(value) -> bool:
+        return isinstance(value, str) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is not None
+
+    @classmethod
+    def _valid_record_refs(cls, refs) -> bool:
+        return (isinstance(refs, list) and bool(refs)
+                and all(isinstance(item, (list, tuple)) and len(item) == 2
+                        and isinstance(item[0], str) and item[0].startswith("refs/")
+                        and not any(ord(char) <= 32 for char in item[0])
+                        and cls._valid_oid(item[1]) for item in refs)
+                and len({item[0] for item in refs}) == len(refs))
+
+    def _read_merge_record(self) -> dict:
+        message = "手动合并记录不可用；请备份对比副本后取消并重新开始。"
+        try:
+            path = self.metadata_path / "merge.json"
+            descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise ValueError("file type")
+                record = json.load(handle)
+            if (not isinstance(record, dict) or type(record.get("schema")) is not int or record["schema"] != 1
+                    or type(record.get("tool_closed")) is not bool
+                    or any(not isinstance(record.get(key), str) or not record[key]
+                           for key in ("source", "source_tag", "target_version", "original_branch", "comparison_session"))
+                    or not re.fullmatch(r"[0-9a-f]{32}", record["comparison_session"])
+                    or any(not self._valid_oid(record.get(key)) for key in ("source_oid", "target_oid", "original_head"))
+                    or not self._valid_record_refs(record.get("local_refs"))
+                    or not isinstance(record.get("notice", ""), str)
+                    or ("output_signature" in record and (not isinstance(record["output_signature"], str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", record["output_signature"])))):
+                raise ValueError("fields")
+            parsed = parse_version_tag(record["source_tag"])
+            if (record["source"] == "main" or not parsed or parsed[0] != record["source"]
+                    or not VERSION_PATTERN.fullmatch(record["target_version"])):
+                raise ValueError("versions")
+            self._validate_branch_name(record["source"])
+            self._validate_branch_name(record["original_branch"])
+            return record
+        except (OSError, ValueError, TypeError, GitError) as error:
+            raise GitError(message) from error
 
     def _assert_branch_not_in_other_worktree(self, name: str) -> None:
         worktree = ""
@@ -3857,18 +3952,22 @@ class GitRepository:
                 record["completed_commit"] = commit
                 self._write_review_json(backup / "merge.json", record)
                 (self.metadata_path / "merge.json").unlink(missing_ok=True)
-            raise GitError(f"手动合并未全部完成，已尝试恢复；对比副本：{root}；恢复资料：{backup}\n{error}") from error
-        (self.metadata_path / "merge.json").unlink(missing_ok=True)
+            raise GitError(f"手动合并{'引用已完成，提交 OID：' + commit if applied else '写回未完成，已尝试恢复'}；"
+                           f"对比副本：{root}；恢复资料：{backup}；引用恢复点：{recovery}/before\n{error}") from error
         message = "合并结果已保存为 main 的普通提交；尚未发布，也未创建标签。"
         try:
+            (self.metadata_path / "merge.json").unlink(missing_ok=True)
             if delete_source:
                 self._remove_branch_metadata(record["source"], deleted)
                 message += f"已删除本地 {record['source']} 及其全部 beta 标签；远程分支及 beta 标签可在“删除分支”中单独确认删除。"
             self.remember_working_branch()
             self.refresh_workspace_generated_files()
         except (GitError, OSError) as error:
-            message += f"\n提交已完成，元数据清理未完成：{error}；恢复资料：{backup}"
-        self._remove_review_session(root)
+            message += f"\n提交已完成，OID：{commit}；元数据清理未完成：{error}；恢复资料：{backup}；引用恢复点：{recovery}/before。无需重复合并。"
+        try:
+            self._remove_review_session(root)
+        except OSError as error:
+            message += f"\n提交已完成，OID：{commit}；对比副本清理失败：{error}；恢复资料：{backup}；副本：{root}。无需重复合并。"
         return message
 
     def abort_merge(self) -> str:
@@ -3877,9 +3976,10 @@ class GitRepository:
         if self._git_path("MERGE_HEAD").exists():
             self.run(["merge", "--abort"])
         try:
-            record = json.loads((self.metadata_path / "merge.json").read_text(encoding="utf-8"))
-            session_id = record.get("comparison_session", "")
-        except (OSError, ValueError):
+            record = self._read_merge_record()
+            session_id = record["comparison_session"]
+            self._review_session_data(MergeComparisonSession(session_id, ""))
+        except GitError:
             session_id = ""
         if re.fullmatch(r"[0-9a-f]{32}", session_id):
             self._remove_review_session(self.metadata_path / "merge-review" / session_id)
@@ -3889,13 +3989,13 @@ class GitRepository:
             self.metadata_path.rmdir()
         except OSError:
             pass
-        return "合并已取消；工作区、分支和标签未更改。"
+        message = "合并已取消；工作区、分支和标签未更改。"
+        if not session_id:
+            message += f"记录损坏，无法确认归属的对比副本已保留，请备份核对：{self.metadata_path / 'merge-review'}"
+        return message
 
     def _merge_review_record(self) -> dict:
-        try:
-            record = json.loads((self.metadata_path / "merge.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raise GitError("手动合并记录不可用；请备份对比副本后取消并重新开始。") from None
+        record = self._read_merge_record()
         source = record.get("source", "")
         refs = self._local_refs()
         expected_refs = {ref: oid for ref, oid in record.get("local_refs", [])}
@@ -4018,11 +4118,54 @@ class GitRepository:
         if root.is_symlink() or root.parent.is_symlink():
             raise GitError("合并对比会话目录不可用。")
         try:
-            data = json.loads((root / "session.json").read_text(encoding="utf-8"))
+            descriptor = os.open(str(root / "session.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise ValueError("file type")
+                data = json.load(handle)
         except (OSError, ValueError):
             raise GitError("合并对比会话记录不可用，已保存的副本请先手动备份。") from None
-        if data.get("id") != session.session_id:
-            raise GitError("合并对比会话记录不匹配。")
+        try:
+            if (not isinstance(data, dict) or data.get("id") != session.session_id
+                    or not isinstance(data.get("source_label"), str)):
+                raise ValueError("identity")
+            for key in ("paths", "ignored_paths", "editable"):
+                values = data.get(key)
+                if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+                    raise ValueError("paths")
+                if len(set(values)) != len(values):
+                    raise ValueError("duplicate paths")
+                for value in values:
+                    self._review_path(root, value)
+            if (not set(data["editable"]).issubset(data["paths"])
+                    or set(data["editable"]) & set(WORKSPACE_GENERATED_FILES)
+                    or set(data["paths"]) & set(data["ignored_paths"])
+                    or not isinstance(data.get("write_modes"), dict)
+                    or set(data["write_modes"]) != set(data["editable"])
+                    or any(type(mode) is not int or mode not in (0o644, 0o755)
+                           for mode in data["write_modes"].values())):
+                raise ValueError("editable")
+            snapshot = data.get("snapshot")
+            if (not isinstance(snapshot, dict) or not self._valid_record_refs(snapshot.get("refs"))
+                    or not isinstance(snapshot.get("branch"), str) or not self._valid_oid(snapshot.get("head"))
+                    or any(not isinstance(snapshot.get(key), str) for key in ("index", "status"))):
+                raise ValueError("snapshot")
+            for side in ("left", "right"):
+                tree = data.get(side)
+                if not isinstance(tree, dict):
+                    raise ValueError("tree")
+                for relative, info in tree.items():
+                    self._review_path(root, relative)
+                    if (not isinstance(info, dict) or info.get("kind") not in ("file", "directory", "link", "special")
+                            or type(info.get("mode")) is not int or not 0 <= info["mode"] <= 0o7777):
+                        raise ValueError("file state")
+                    if info["kind"] == "file" and (not isinstance(info.get("sha256"), str)
+                            or not re.fullmatch(r"[0-9a-f]{64}", info["sha256"])):
+                        raise ValueError("hash")
+                    if info["kind"] == "link" and not isinstance(info.get("target"), str):
+                        raise ValueError("link")
+        except (ValueError, TypeError, KeyError, AttributeError, GitError) as error:
+            raise GitError("合并对比会话记录损坏，禁止提交及写回；请备份副本后取消。") from error
         return root, data
 
     @staticmethod
@@ -4053,17 +4196,14 @@ class GitRepository:
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
             )
             result = subprocess.run(
-                ["git", "-C", str(root), "check-ignore", "--no-index", "--stdin", "-z"],
+                ["git", "-C", str(root), "check-ignore", "--no-index", "--verbose", "--stdin", "-z"],
                 input=("\0".join(paths) + ("\0" if paths else "")).encode("utf-8", "surrogateescape"),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
             )
             if result.returncode not in (0, 1):
                 message = result.stderr.decode("utf-8", errors="replace").strip()
                 raise GitError(message or "无法读取版本中的 .gitignore 规则。")
-            return {
-                value.decode("utf-8", errors="surrogateescape")
-                for value in result.stdout.split(b"\0") if value
-            }
+            return ignored_paths_from_git(result.stdout)
         finally:
             shutil.rmtree(git_directory, ignore_errors=True)
 
@@ -4323,8 +4463,9 @@ class GitRepository:
         remaining = self._sync_refs(snapshot, self._remote_refs(plan.remote_url))
         if remaining:
             raise GitError(f"远程删除请求已执行，但该分支或 beta 又发生变化；请刷新核对。恢复点：{namespace}/before。")
-        self.run(["update-ref", "-d", f"refs/remotes/origin/{name}"], check=False)
-        self._delete_fetched_refs(snapshot, selected, namespace + "/incoming")
+        with self._after_ref_change("远程分支删除", {ref: f"已删除（原 OID：{oid}）" for ref, oid in selected.items()}, namespace + "/before"):
+            self.run(["update-ref", "-d", f"refs/remotes/origin/{name}"], check=False)
+            self._delete_fetched_refs(snapshot, selected, namespace + "/incoming")
         return f"已删除 origin/{name} 及其全部 beta 标签。远程旧引用恢复点：{namespace}/before。"
 
     def delete_branch_with_remote(
@@ -4386,9 +4527,10 @@ class GitRepository:
             if switched and self.current_branch() == "main":
                 self.run(["switch", "--no-guess", "--no-overwrite-ignore", "--", name], check=False)
             raise
-        self._remove_branch_metadata(name, deleted)
-        self.remember_working_branch()
-        self.refresh_workspace_generated_files()
+        with self._after_ref_change("本地分支删除", {ref: f"已删除（原 OID：{oid}）" for ref, oid in deleted.items()}, namespace + "/before"):
+            self._remove_branch_metadata(name, deleted)
+            self.remember_working_branch()
+            self.refresh_workspace_generated_files()
         return f"已删除本地分支 {name} 及其全部 beta 标签。远程分支需单独确认删除。恢复点：{namespace}。"
 
     def delete_merged_branch(self, name: str, expected: Optional[BranchDeletionPlan] = None) -> str:
@@ -4454,7 +4596,12 @@ class GitRepository:
 
     def storage_size(self) -> int:
         git_directory = self.run(["rev-parse", "--absolute-git-dir"]).strip()
-        return allocated_disk_usage(Path(git_directory)) if git_directory else 0
+        common = self.run(["rev-parse", "--git-common-dir"]).strip()
+        roots = [Path(git_directory)] if git_directory else []
+        if common:
+            roots.append((self.path / common).resolve())
+        seen = set()
+        return sum(allocated_disk_usage(root, seen) for root in roots)
 
     def candidate_files(self) -> List[str]:
         raw = self.run(["ls-files", "-co", "--exclude-standard", "-z"])
@@ -4958,19 +5105,15 @@ class GitRepository:
             return []
         payload = "\0".join(paths) + "\0"
         result = subprocess.run(
-            ["git", "-C", str(self.path), "check-ignore", "--no-index", "--stdin", "-z"],
-            input=payload.encode("utf-8"),
+            ["git", "-C", str(self.path), "check-ignore", "--no-index", "--verbose", "--stdin", "-z"],
+            input=payload.encode("utf-8", "surrogateescape"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
         if result.returncode not in (0, 1):
             message = result.stderr.decode("utf-8", errors="replace").strip()
             raise GitError(message or "无法读取工作空间的 Git 忽略规则。")
-        ignored = {
-            value.decode("utf-8", errors="surrogateescape")
-            for value in result.stdout.split(b"\0")
-            if value
-        }
+        ignored = ignored_paths_from_git(result.stdout)
         return [path for path in paths if path not in ignored and path not in WORKSPACE_GENERATED_FILES]
 
     def ignored_tracked_files(self) -> List[str]:
@@ -5020,6 +5163,8 @@ class GitRepository:
         previous_ignore = gitignore.read_bytes() if gitignore.is_file() and not gitignore.is_symlink() else None
         had_changelog = (self.path / WORKSPACE_CHANGELOG).exists()
         committed = False
+        created_commit = ""
+        version_created = False
         try:
             added = prepare_workspace_release_files(self.path)
             selected = validate_selected_files(self.path, sorted(set(selected_files) | set(added)))
@@ -5057,9 +5202,11 @@ class GitRepository:
                          input="\0".join(ignored_removals) + "\0", env=environment)
                 self.run(["commit", "--allow-empty", "-m", commit_message], env=environment)
                 committed = True
+                created_commit = self.run(["rev-parse", "HEAD"]).strip()
                 self.run(["--literal-pathspecs", "reset", "--quiet", "HEAD",
                           "--pathspec-from-file=-", "--pathspec-file-nul"], input="\0".join(paths) + "\0")
             self.run(["tag", "-a", version, "-m", commit_message])
+            version_created = True
             self._write_manifest(version, selected)
             self._write_changelog(None)
             try:
@@ -5076,7 +5223,7 @@ class GitRepository:
                     f"版本 {display_version(version)} 已发布到本地，但自动下载 VERSION / CHANGELOG.rst 失败：{error}。"
                     "请修复文件问题后重新切换当前分支重试，无需重复发布。"
                 ) from error
-        except Exception:
+        except Exception as error:
             if not committed:
                 if previous_ignore is None:
                     if gitignore.is_file() and not gitignore.is_symlink():
@@ -5085,6 +5232,11 @@ class GitRepository:
                     gitignore.write_bytes(previous_ignore)
                 if not had_changelog:
                     (self.path / WORKSPACE_CHANGELOG).unlink(missing_ok=True)
+            if committed:
+                stage = f"版本 {display_version(version)} 已发布到本地" if version_created else "代码提交已完成，但版本标签尚未创建"
+                raise GitError(f"{stage}，后续处理失败：{error}\n提交 OID：{created_commit or '请检查 HEAD'}；"
+                               f"分支：{branch}；版本标签：{version}。\n"
+                               "本次发布没有独立恢复点；请按提交 OID 核对并修复，无需重复提交。") from error
             raise
         finally:
             for temporary in prepared.values():
@@ -5102,9 +5254,16 @@ class GitRepository:
             commit_message += "\n\n" + "\n".join(changes[1:])
         commit = self.run(["rev-list", "-n", "1", version]).strip()
         ensure_git_identity(self)
+        old_oid = self.run(["rev-parse", "refs/tags/" + version]).strip()
+        namespace = self._recovery_namespace("update-version-message")
+        self._save_recovery_refs(namespace, {"refs/tags/" + version: old_oid}, "before")
+        backup = self._save_metadata_recovery(namespace)
         self.run(["tag", "-f", "-a", version, "-m", commit_message, commit])
-        self._write_changelog(None)
-        self.refresh_workspace_generated_files()
+        new_oid = self.run(["rev-parse", "refs/tags/" + version]).strip()
+        with self._after_ref_change("版本说明修改", {"refs/tags/" + version: new_oid}, f"{namespace}/before；{backup}"):
+            (self.metadata_path / MANIFEST_DIRECTORY / (version + MANIFEST_SUFFIX)).unlink(missing_ok=True)
+            self._write_changelog(None)
+            self.refresh_workspace_generated_files()
 
     def switch_main(self) -> None:
         self.switch_branch("main")
@@ -5163,8 +5322,15 @@ class GitRepository:
         commands = ["option no-deref", f"delete refs/tags/{version} {tag_oid}"]
         commands.append(f"delete {remark_ref} {remark_oid}" if remark_oid else
                         f"verify {remark_ref} {'0' * len(tag_oid)}")
+        namespace = self._recovery_namespace("delete-version")
+        old_refs = {"refs/tags/" + version: tag_oid}
+        if remark_oid:
+            old_refs[remark_ref] = remark_oid
+        self._save_recovery_refs(namespace, old_refs, "before")
+        backup = self._save_metadata_recovery(namespace)
         self.run(["update-ref", "--stdin"], input="\n".join(commands) + "\n")
-        self._remove_version_metadata(version)
+        with self._after_ref_change("版本删除", {ref: f"已删除（原 OID：{oid}）" for ref, oid in old_refs.items()}, f"{namespace}/before；{backup}"):
+            self._remove_version_metadata(version)
 
     def delete_latest_version_commit(
         self, version: str, expected: Optional[VersionDeletionPlan] = None,
@@ -5253,7 +5419,7 @@ class GitRepository:
         except (GitError, OSError) as error:
             raise GitError(
                 f"版本 {display_version(plan.version)} 及其分支末尾提交已删除，当前文件和原有暂存内容已保留；"
-                f"元数据或生成文件刷新未完成：{error}\n恢复资料：{backup}；引用恢复点：{namespace}/before。"
+                f"元数据或生成文件刷新未完成：{error}\n当前分支 OID：{plan.parent_oid}\n恢复资料：{backup}；引用恢复点：{namespace}/before。"
                 "请修复后重新切换当前分支刷新生成文件，无需重复删除。"
             ) from error
         return (f"版本 {display_version(plan.version)} 及其分支末尾提交已删除；{plan.branch} 已退回 {plan.parent_oid[:12]}。"
@@ -5272,35 +5438,62 @@ class GitRepository:
         self._write_changelog(None)
         self.refresh_workspace_generated_files()
 
-    def _archive_bytes(self, reference: str) -> bytes:
-        paths = self.manifest(reference)
-        if paths == []:
-            archive = io.BytesIO()
-            with tarfile.open(fileobj=archive, mode="w:"):
-                pass
-            return archive.getvalue()
-        args = ["--literal-pathspecs", "archive", "--format=tar", reference]
-        if paths:
-            args.extend(["--", *paths])
-        raw = self.run_bytes(args)
-        output = io.BytesIO()
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as source:
-            with tarfile.open(fileobj=output, mode="w:") as bundle:
-                for member in source:
-                    if member.name.rstrip("/") in WORKSPACE_GENERATED_FILES:
-                        continue
-                    bundle.addfile(member, source.extractfile(member) if member.isfile() else None)
-        return output.getvalue()
+    @contextmanager
+    def _history_archive(self, reference: str):
+        """Keep historical content on disk and never extract archive links."""
+        with tempfile.TemporaryDirectory(prefix="cvm-history-") as temporary:
+            archive = Path(temporary) / "archive.tar"
+            paths = self.manifest(reference)
+            if paths == []:
+                with tarfile.open(archive, "w:"):
+                    pass
+            else:
+                arguments = ["--literal-pathspecs", "archive", "--format=tar",
+                             f"--output={archive}", reference]
+                if paths:
+                    arguments.extend(["--", *paths])
+                self.run(arguments)
+            with tarfile.open(archive, "r:") as bundle:
+                yield bundle
+
+    @staticmethod
+    def _archive_name(name: str) -> str:
+        value = name.rstrip("/")
+        if (not value or value.startswith("/") or "\\" in value or "\0" in value
+                or any(part in ("", ".", "..") or part.lower() == ".git"
+                       for part in value.split("/"))):
+            raise GitError(f"版本包包含不安全的文件路径：{name!r}")
+        return value
 
     def materialize(self, reference: str, destination: Path) -> None:
         destination.mkdir(parents=True, exist_ok=True)
-        archive = self._archive_bytes(reference)
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
-            for member in bundle.getmembers():
-                target = (destination / member.name).resolve()
-                if destination.resolve() not in target.parents and target != destination.resolve():
-                    raise GitError("版本包包含不安全的文件路径。")
-            bundle.extractall(destination)
+        if destination.is_symlink():
+            raise GitError("历史副本目录不能是符号链接。")
+        seen = set()
+        with self._history_archive(reference) as bundle:
+            for member in bundle:
+                name = self._archive_name(member.name)
+                if not (member.isdir() or member.isfile() or member.issym()):
+                    raise GitError(f"版本包包含硬链接或特殊成员：{member.name}")
+                if name in WORKSPACE_GENERATED_FILES:
+                    continue
+                if name in seen:
+                    raise GitError(f"版本包包含重复路径：{name}")
+                seen.add(name)
+                target = self._review_path(destination, name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if member.isdir():
+                    if target.is_symlink():
+                        raise GitError("历史副本包含不安全链接。")
+                    target.mkdir(exist_ok=True)
+                else:
+                    with target.open("xb") as output:
+                        if member.issym():
+                            output.write(("[read-only symbolic link] " + member.linkname + "\n").encode("utf-8"))
+                        else:
+                            with bundle.extractfile(member) as incoming:
+                                shutil.copyfileobj(incoming, output)
+                    target.chmod(0o444 if member.issym() else (0o755 if member.mode & 0o111 else 0o644))
 
     def compare(self, left: str, right: Optional[str] = None) -> None:
         compare_tool = self.compare_tool()
@@ -5309,10 +5502,10 @@ class GitRepository:
             raise GitError(f"没有找到 {tool_label}，请先安装或在“设置”中选择其他对比工具。")
         with tempfile.TemporaryDirectory(prefix="code-version-manager-compare-") as temporary:
             root = Path(temporary)
-            left_directory = root / reference_folder_name(left, "left")
+            left_directory = root / "left"
             self.materialize(left, left_directory)
             if right:
-                right_directory = root / reference_folder_name(right, "right")
+                right_directory = root / "right"
                 self.materialize(right, right_directory)
                 read_only_option = "-readonly"
             else:
@@ -5335,28 +5528,57 @@ class GitRepository:
             if result.returncode not in (0, 1):
                 raise GitError(result.stderr.strip() or f"{tool_label} 启动失败。")
 
+    @staticmethod
+    def _export_target_state(destination: Path):
+        try:
+            info = destination.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            raise GitError("导出目标必须是普通文件，不能是目录、链接或特殊文件。")
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
     def export(self, reference: str, destination: Path) -> None:
-        paths = self.manifest(reference)
-        if paths == []:
-            with zipfile.ZipFile(destination, "w"):
-                pass
-            return
-        # Keep large exports on disk; filtering old Git trees must not require
-        # loading the complete ZIP (or a large member) into application memory.
-        with tempfile.TemporaryDirectory(prefix="code-version-manager-export-") as temporary:
-            original = Path(temporary) / "archive.zip"
-            args = ["--literal-pathspecs", "archive", "--format=zip", f"--output={original}", reference]
-            if paths:
-                args.extend(["--", *paths])
-            self.run(args)
-            with zipfile.ZipFile(original) as source:
-                with zipfile.ZipFile(destination, "w") as bundle:
-                    bundle.comment = source.comment
-                    for member in source.infolist():
-                        if member.filename.rstrip("/") in WORKSPACE_GENERATED_FILES:
-                            continue
-                        with source.open(member) as incoming, bundle.open(member, "w") as outgoing:
-                            shutil.copyfileobj(incoming, outgoing)
+        destination = Path(destination)
+        before = self._export_target_state(destination)
+        descriptor, name = tempfile.mkstemp(prefix=".cvm-export-", suffix=".zip", dir=str(destination.parent))
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "w+b") as output:
+                paths = self.manifest(reference)
+                with zipfile.ZipFile(output, "w") as bundle:
+                    if paths != []:
+                        with tempfile.TemporaryDirectory(prefix="code-version-manager-export-") as workspace:
+                            original = Path(workspace) / "archive.zip"
+                            args = ["--literal-pathspecs", "archive", "--format=zip", f"--output={original}", reference]
+                            if paths:
+                                args.extend(["--", *paths])
+                            self.run(args)
+                            with zipfile.ZipFile(original) as source:
+                                bundle.comment = source.comment
+                                seen = set()
+                                for member in source.infolist():
+                                    relative = self._archive_name(member.filename)
+                                    kind = stat.S_IFMT(member.external_attr >> 16)
+                                    if kind not in (0, stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK):
+                                        raise GitError("版本包包含特殊成员。")
+                                    if relative in WORKSPACE_GENERATED_FILES:
+                                        continue
+                                    if relative in seen:
+                                        raise GitError("版本包包含重复路径。")
+                                    seen.add(relative)
+                                    with source.open(member) as incoming, bundle.open(member, "w") as outgoing:
+                                        shutil.copyfileobj(incoming, outgoing)
+                output.flush()
+                os.fsync(output.fileno())
+            if before != self._export_target_state(destination):
+                raise GitError("导出期间目标文件发生变化，未覆盖；请重新选择导出位置。")
+            if before is not None:
+                temporary.chmod(stat.S_IMODE(before[2]))
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def commit_details(self, reference: str) -> str:
         return self.run(["show", "--stat", "--format=fuller", reference])
@@ -5367,9 +5589,10 @@ def version_key(value: str):
     return tuple(int(item) for item in match.group(1).split(".")) if match else (-1,)
 
 
-def allocated_disk_usage(path: Path) -> int:
+def allocated_disk_usage(path: Path, seen: Optional[set] = None) -> int:
     total = 0
-    seen = set()
+    if seen is None:
+        seen = set()
     for current, directories, filenames in os.walk(path, followlinks=False):
         for candidate in [Path(current), *[Path(current) / name for name in directories + filenames]]:
             try:
@@ -5547,9 +5770,11 @@ def top_level_package_groups(
                 groups[f"{entry.name}/"] = [f"{entry.name}/{item}" for item in nested]
         elif entry.is_file() or entry.is_symlink():
             groups[entry.name] = [entry.name]
-    # Deleted top-level entries cannot be discovered by walking the workspace.
-    # Keep them selectable so git add -u can record the removals too.
-    for relative in deleted_files:
+    allowed = set(filter_workspace_paths(root, [item for paths in groups.values() for item in paths]))
+    groups = {entry: [item for item in paths if item in allowed]
+              for entry, paths in groups.items() if any(item in allowed for item in paths)}
+    # Add deletions after filtering: ignored remnants must not hide their scope.
+    for relative in filter_workspace_paths(root, deleted_files):
         parts = Path(relative).parts
         if parts:
             entry = parts[0]
@@ -5557,6 +5782,47 @@ def top_level_package_groups(
                 continue
             groups[entry + "/" if len(parts) > 1 else entry] = []
     return dict(sorted(groups.items(), key=lambda item: item[0].lower()))
+
+
+def ignored_paths_from_git(output: bytes) -> set:
+    # check-ignore also reports matching !patterns. Only positive matches exclude.
+    fields = output.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) % 4:
+        raise GitError("Git 忽略规则响应不完整。")
+    return {fields[index + 3].decode("utf-8", errors="surrogateescape")
+            for index in range(0, len(fields), 4)
+            if fields[index + 2] and not fields[index + 2].startswith(b"!")}
+
+
+def filter_workspace_paths(root: Path, paths: Sequence[str]) -> List[str]:
+    """Use Git itself, including before a standalone workspace is enabled."""
+    if not paths:
+        return []
+    if os.path.lexists(str(root / ".git")):
+        return GitRepository(root).filter_ignored(paths)
+    with tempfile.TemporaryDirectory(prefix="cvm-ignore-") as temporary:
+        environment = os.environ.copy()
+        # Keep all metadata outside the source, including when it has a parent repo.
+        for key in tuple(environment):
+            if key.startswith("GIT_"):
+                environment.pop(key)
+        git_directory = Path(temporary) / "repository.git"
+        result = subprocess.run(["git", "init", "--bare", "-q", str(git_directory)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
+        if result.returncode:
+            raise GitError("无法建立临时 Git 忽略规则解析环境。")
+        environment.update(GIT_DIR=str(git_directory), GIT_WORK_TREE=str(root))
+        result = subprocess.run(
+            ["git", "-C", str(root), "-c", "core.bare=false", "check-ignore",
+             "--no-index", "--verbose", "--stdin", "-z"],
+            input=("\0".join(paths) + ("\0" if paths else "")).encode("utf-8", "surrogateescape"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
+        if result.returncode not in (0, 1):
+            raise GitError(result.stderr.decode("utf-8", errors="replace") or "无法读取 Git 忽略规则。")
+        ignored = ignored_paths_from_git(result.stdout)
+        return [item for item in paths if item not in ignored and item not in WORKSPACE_GENERATED_FILES]
 
 
 def expand_package_groups(
@@ -5938,7 +6204,7 @@ class SoftwareReleaseDialog(Gtk.Dialog):
             valid_target = False
         self.create_repository_button.set_sensitive(not self.busy and valid_target)
         self.get_widget_for_response(Gtk.ResponseType.OK).set_sensitive(
-            not self.busy and self.batch is not None and bool(self.repository_entry.get_text().strip()))
+            not self.busy and self.batch is not None and valid_target)
         self.get_widget_for_response(Gtk.ResponseType.CANCEL).set_sensitive(self.busy and not self.cancel.is_set())
 
     def _pulse(self) -> bool:
@@ -6250,6 +6516,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.updating_branch_choices = False
         self.updating_history_scope = False
         self.update_alive = True
+        self.background_alive = True
+        self.background_generation = 0
         self.update_checking = False
         self.update_manual_check = False
         self.update_downloading = False
@@ -6262,7 +6530,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.help_dialog: Optional[Gtk.Dialog] = None
         self.update_timer: Optional[int] = None
         self.connect("map", self._schedule_application_update)
-        self.connect("delete-event", lambda *_args: self.update_installing or bool(
+        self.connect("delete-event", lambda *_args: self.busy or self.update_installing or bool(
             self.software_release_dialog is not None and self.software_release_dialog.busy))
         self.connect("destroy", self._destroy_application_updates)
         self.connect("destroy", lambda _window: self._invalidate_requests())
@@ -6313,7 +6581,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if settings != self.saved_window_settings:
             try:
                 save_window_settings(*settings, config_file=self.window_settings_path)
-            except (OSError, configparser.Error) as error:
+            except (OSError, configparser.Error, GitError) as error:
                 print(f"无法保存窗口大小：{error}", file=sys.stderr)
             else:
                 self.saved_window_settings = settings
@@ -7038,6 +7306,9 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         if not resolved.is_dir():
             self.show_error("所选工作空间不存在。")
             return
+        self.background_generation += 1
+        if self.busy:
+            self._end_background()
         self.workspace_path = resolved
         self.remote_sync_error = None
         self.branch_generation += 1
@@ -7052,14 +7323,26 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.updating_history_scope = True
         self.history_scope_combo.set_active_id("current")
         self.updating_history_scope = False
-        self._save_repository_path(self.workspace_path)
+        history_error = ""
+        try:
+            self._save_repository_path(self.workspace_path)
+        except (OSError, configparser.Error, GitError) as error:
+            history_error = f"工作空间已打开，但最近记录保存失败：{error}"
         self.workspace_name_label.set_text(self.workspace_path.name)
         self.workspace_name_label.set_tooltip_text(str(self.workspace_path))
         if self.log_window is not None:
             self._refresh_operation_log()
         self.refresh()
 
+        if history_error:
+            self.show_error(history_error)
+
     def _invalidate_requests(self) -> None:
+        self.background_alive = False
+        self.background_generation += 1
+        if self.background_timer is not None:
+            GLib.source_remove(self.background_timer)
+            self.background_timer = None
         self.branch_generation += 1
         self._invalidate_remote_status()
         if self.log_window is not None:
@@ -7125,6 +7408,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         else:
             message += "请在对比工具内逐项同步，保存后关闭工具。"
         message += "完成前禁止切换、发布和同步。"
+        if state.notice:
+            message += "\n" + state.notice
         self.merge_status_label.set_text(message)
         self.complete_merge_button.set_no_show_all(not state.tool_closed)
         self.abort_merge_button.set_no_show_all(not state.tool_closed)
@@ -7211,6 +7496,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                                 "合并清单已就绪。", merge_preview=True)
 
     def _background_merge_ready(self, plan: BranchMergePlan) -> bool:
+        repository = self.repository
+        generation = self.background_generation
         self._end_background()
         self.refresh()
         if not self.repository:
@@ -7228,8 +7515,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         dialog.set_default_response(Gtk.ResponseType.CANCEL)
         response = dialog.run()
         dialog.destroy()
+        if (not self.background_alive or repository is not self.repository
+                or generation != self.background_generation):
+            return False
         if response == Gtk.ResponseType.OK:
-            repo = self.repository
+            repo = repository
             self.run_background(
                 "正在准备手动合并目录…", lambda: repo.merge_to_main(plan.source, expected=plan),
                 "对比副本已就绪。", result_callback=self._background_comparison_prepared,
@@ -7266,6 +7556,8 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                             result_callback=self._confirm_complete_merge)
 
     def _confirm_complete_merge(self, result: MergeComparisonResult) -> bool:
+        repository = self.repository
+        generation = self.background_generation
         self._end_background()
         self.refresh()
         if not self.repository:
@@ -7292,8 +7584,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         response = dialog.run()
         delete_source = cleanup.get_active()
         dialog.destroy()
+        if (not self.background_alive or repository is not self.repository
+                or generation != self.background_generation):
+            return False
         if response == Gtk.ResponseType.OK:
-            repo = self.repository
+            repo = repository
             self.run_background("正在保存 main 并完成合并…",
                                 lambda: repo.complete_merge(delete_source=delete_source), "合并已完成。")
         return False
@@ -7683,7 +7978,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
             remove_recent_workspace(path)
             self.on_recent_popover_show(self.recent_popover)
             self._set_operation_status(f"已从最近列表移除：{path}")
-        except OSError as error:
+        except (OSError, GitError, configparser.Error) as error:
             self.show_error(str(error))
 
     def on_clear_recent_workspaces(self, _button) -> None:
@@ -7708,7 +8003,7 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         try:
             clear_recent_workspaces()
             self._set_operation_status("最近打开的工作空间已清空")
-        except OSError as error:
+        except (OSError, GitError, configparser.Error) as error:
             self.show_error(str(error))
 
     def on_refresh(self, _button) -> None:
@@ -7809,11 +8104,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 self._show_application_update_error(error)
             return
         release, newer = result
+        save_error = ""
         try:
             save_application_update_settings(last_success=time.time())
-        except (OSError, configparser.Error) as exception:
-            if manual:
-                self.update_description.set_text(f"检查已完成，但无法保存检查时间：{exception}")
+        except (OSError, configparser.Error, GitError) as exception:
+            save_error = f"检查已完成，但无法保存检查时间：{exception}"
         self.update_release = release if newer else None
         if self.downloaded_update and self.downloaded_update.release != self.update_release:
             self.downloaded_update = None
@@ -7826,6 +8121,11 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
                 self.update_description.set_text("暂无已发布升级包。")
             elif not newer:
                 self.update_description.set_text(f"当前软件 {APP_VERSION} 已是最新版本。")
+
+        if save_error:
+            self._set_operation_status(save_error, level="warning")
+            if manual:
+                self.update_description.set_text(self.update_description.get_text() + "\n" + save_error)
 
     def on_application_update_details(self, _button) -> None:
         if self.update_dialog is not None:
@@ -9515,9 +9815,16 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
         self.clear_recovery_button.set_sensitive(False)
         self._set_operation_status(busy, record=False)
         started = time.monotonic()
+        repository = self.repository
+        self.background_generation += 1
+        generation = self.background_generation
+
+        def current() -> bool:
+            return (self.background_alive and generation == self.background_generation
+                    and repository is self.repository)
 
         def update_elapsed() -> bool:
-            if not self.busy:
+            if not current() or not self.busy:
                 return False
             elapsed = int(time.monotonic() - started)
             self._set_operation_status(f"{busy} · 已等待 {elapsed} 秒", record=False)
@@ -9525,25 +9832,29 @@ class VersionManagerWindow(Gtk.ApplicationWindow):
 
         self.background_timer = GLib.timeout_add_seconds(1, update_elapsed)
 
+        def deliver(result, error) -> bool:
+            if not current():
+                return False
+            if error is not None:
+                if error_callback is not None:
+                    error_callback(error)
+                else:
+                    self._background_failed(error, remote_sync)
+            elif result_callback is not None:
+                result_callback(result)
+            elif merge_preview:
+                self._background_merge_ready(result)
+            else:
+                message = result if isinstance(result, str) and result else success
+                self._background_complete(message, reload_workspace, show_result)
+            return False
+
         def worker() -> None:
             try:
-                result = operation()
-                message = result if isinstance(result, str) and result else success
-                if result_callback is not None:
-                    GLib.idle_add(result_callback, result)
-                elif merge_preview:
-                    GLib.idle_add(self._background_merge_ready, result)
-                elif show_result:
-                    GLib.idle_add(self._background_complete, message, reload_workspace, True)
-                else:
-                    GLib.idle_add(self._background_complete, message, reload_workspace)
-            except Exception as error:  # GTK must receive subprocess errors on the main thread.
-                if error_callback is not None:
-                    GLib.idle_add(error_callback, str(error))
-                elif remote_sync:
-                    GLib.idle_add(self._background_failed, str(error), True)
-                else:
-                    GLib.idle_add(self._background_failed, str(error))
+                result, error = operation(), None
+            except Exception as exception:
+                result, error = None, str(exception)
+            GLib.idle_add(deliver, result, error)
 
         threading.Thread(target=worker, daemon=True).start()
 

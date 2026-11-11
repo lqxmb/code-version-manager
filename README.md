@@ -52,6 +52,8 @@ python3 tests/verify_workspace_copy.py /path/to/workspace
 
 没有显示服务时，依赖真实 GTK 控件的用例会跳过；运行 UI 回归时需要可用显示服务或已安装的 Xvfb。测试使用 `importlib` 独立加载源码模块；配置测试应将设置路径重定向到临时目录。
 
+`tests/test_general_robustness.py` 覆盖配置原子保存、Git 忽略反选、历史归档与 ZIP 失败保护、附件 API 编码、后台回调失效、引用完成后的刷新失败及 linked worktree 存储统计。Release 测试只模拟 gh 与 HTTP 响应，同步测试只访问临时 bare 仓库；完整验证应记录实际执行和跳过的 GTK 用例。历史物化使用磁盘归档逐项读取，软件 Release 上传使用 gh 授权的二进制附件 API，不增加 Python 依赖。
+
 ## 构建 Debian 软件包
 
 项目发行号取自根目录 `VERSION`。构建前可调整 `data/workspace.gitignore`，它作为新建工作空间的忽略模板。脚本把程序安装至 `/usr/lib/code-version-manager/`，将 `README.md`、`INSTALL.md` 和 `HELP.md` 安装至 `/usr/share/doc/code-version-manager/`，并在 `dist/` 生成 `Architecture: all` 软件包。

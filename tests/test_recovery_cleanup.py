@@ -328,7 +328,7 @@ class RecoveryCleanupUITest(unittest.TestCase):
                                           (("1700000001-1234abcd", "含工作区 stash"),))
 
     def test_click_uses_background_scan_and_busy_or_missing_repository_does_nothing(self):
-        window = mock.Mock(busy=False, branch_generation=7)
+        window = mock.Mock(busy=False, branch_generation=7, background_generation=0, background_alive=True)
         MODULE.VersionManagerWindow.on_clear_recovery_files(window, None)
         args = window.run_background.call_args
         self.assertEqual(window.repository.plan_recovery_cleanup, args.args[1])
@@ -353,7 +353,7 @@ class RecoveryCleanupUITest(unittest.TestCase):
                 window.clear_recovery_button.set_sensitive.assert_called_once_with(state == "normal")
 
     def test_background_failure_uses_main_thread_error_callback_and_disables_button(self):
-        window = mock.Mock(busy=False, branch_generation=7)
+        window = mock.Mock(busy=False, branch_generation=7, background_generation=0, background_alive=True)
         error_callback = mock.Mock()
         operation = mock.Mock(side_effect=MODULE.GitError("cleanup failed"))
         with mock.patch.object(MODULE.GLib, "timeout_add_seconds", return_value=42), \
@@ -364,8 +364,10 @@ class RecoveryCleanupUITest(unittest.TestCase):
             )
             thread.call_args.kwargs["target"]()
         window.clear_recovery_button.set_sensitive.assert_called_once_with(False)
-        idle_add.assert_called_once_with(error_callback, "cleanup failed")
+        callback, result, error = idle_add.call_args.args
         error_callback.assert_not_called()
+        callback(result, error)
+        error_callback.assert_called_once_with("cleanup failed")
 
     def test_real_window_places_cleanup_button_next_to_storage(self):
         if not MODULE.Gtk.init_check()[0]:

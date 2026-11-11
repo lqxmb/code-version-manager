@@ -620,10 +620,9 @@ class GitRepositoryTest(unittest.TestCase):
         )
         session = copied.find(".//TDirCompareSession")
         self.assertIsNotNone(session)
-        self.assertEqual(
-            MODULE.BCOMPARE_FILTER,
-            session.find("./Filters/NameFilter").get("Value"),
-        )
+        name_filter = session.find("./Filters/NameFilter").get("Value")
+        for expected_filter in ("-*.zip", "-__pycache__/"):
+            self.assertIn(expected_filter, name_filter)
         rules = session.find("./Rules")
         self.assertIsNotNone(rules)
         self.assertEqual(
@@ -672,13 +671,13 @@ class GitRepositoryTest(unittest.TestCase):
             "/opt/ros/noetic/share/catkin/cmake/toplevel.cmake"
         )
         groups = MODULE.top_level_package_groups(other_root)
-        self.assertEqual(["keep.txt", "skip.txt", "src/"], list(groups))
+        self.assertEqual(["build/", "keep.txt", "skip.txt", "src/"], list(groups))
         self.assertNotIn("src/main.txt", groups)
         selected = MODULE.expand_package_groups(groups, ["src/"])
         self.assertIn("src/CMakeLists.txt", selected)
         self.assertIn("src/config/robot.yaml", selected)
         self.assertIn("src/main.txt", selected)
-        self.assertIn("src/vendor/ignored.bin", selected)
+        self.assertNotIn("src/vendor/ignored.bin", selected)
         repository = MODULE.initialize_repository(
             other_root, "v0.0.1", "initial", selected
         )
@@ -2296,6 +2295,8 @@ class BackgroundProgressTest(unittest.TestCase):
                 window = mock.Mock()
                 window.busy = False
                 window.branch_generation = 0
+                window.background_generation = 0
+                window.background_alive = True
                 operation = mock.Mock(return_value=result)
                 with mock.patch.object(MODULE.GLib, "timeout_add_seconds", return_value=42), \
                      mock.patch.object(MODULE.GLib, "idle_add") as idle_add, \
@@ -2305,14 +2306,16 @@ class BackgroundProgressTest(unittest.TestCase):
                     )
                     thread.call_args.kwargs["target"]()
 
-                idle_add.assert_called_once_with(
-                    window._background_complete, result or "默认成功提示", False
-                )
+                callback, delivered, error = idle_add.call_args.args
+                callback(delivered, error)
+                window._background_complete.assert_called_once_with(result or "默认成功提示", False, False)
 
     def test_background_timer_updates_elapsed_time_and_is_removed_after_completion(self):
         window = mock.Mock()
         window.busy = False
         window.branch_generation = 0
+        window.background_generation = 0
+        window.background_alive = True
         window.background_timer = None
         operation = mock.Mock()
         with mock.patch.object(MODULE.time, "monotonic", side_effect=[100, 105]), \
@@ -2524,6 +2527,8 @@ class DownloadChangelogTest(unittest.TestCase):
             with self.subTest(error=error):
                 self.window.busy = False
                 self.window.branch_generation = 0
+                self.window.background_generation = 0
+                self.window.background_alive = True
                 self.window.repository.download_changelog.side_effect = error
                 self.window.run_background.side_effect = lambda *args: MODULE.VersionManagerWindow.run_background(
                     self.window, *args,
@@ -2534,7 +2539,10 @@ class DownloadChangelogTest(unittest.TestCase):
                     MODULE.VersionManagerWindow.on_download_changelog(self.window, None)
                     self.window.repository.download_changelog.assert_not_called()
                     thread.call_args.kwargs["target"]()
-                idle_add.assert_called_once_with(self.window._background_failed, str(error))
+                callback, result, message = idle_add.call_args.args
+                callback(result, message)
+                self.window._background_failed.assert_called_once_with(str(error), False)
+                self.window._background_failed.reset_mock()
                 self.window.repository.download_changelog.reset_mock()
                 self.assertFalse(self.destination.exists())
 

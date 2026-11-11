@@ -5,7 +5,7 @@
 		<Items>
 			<TDirCompareSession>
 				<Filters>
-					<NameFilter Value="*;*;-.git\;-*.zip;-__pycache__/"/>
+					<NameFilter Value="*;*;-.git\;-*.zip;-__pycache__/;-*.py[cod];-*.swp;-.pytest_cache/"/>
 				</Filters>
 				<Rules>
 					<UseSizeComparison Value="True"/>

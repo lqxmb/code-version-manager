@@ -214,6 +214,42 @@ class MergeComparisonTest(unittest.TestCase):
             self.repo.launch_merge_comparison(session)
         self.repo.abort_merge()
 
+    def test_damaged_session_structure_blocks_writeback_and_preserves_copy_on_cancel(self):
+        session, directory, data = self.begin()
+        before_refs = self.repo._local_refs()
+        before_source = (self.path / "shared.txt").read_bytes()
+        path = directory / "session.json"
+        cases = [[], {**data, "editable": "shared.txt"}, {**data, "write_modes": []},
+                 {**data, "snapshot": []}, {**data, "left": {"../escape": {}}},
+                 {**data, "right": {"shared.txt": {"kind": "file", "mode": 0o644, "sha256": []}}}]
+        for damaged in cases:
+            with self.subTest(damaged=damaged):
+                path.write_text(json.dumps(damaged))
+                with self.assertRaises(MODULE.GitError):
+                    self.repo.prepare_merge_comparison()
+                with self.assertRaises(MODULE.GitError):
+                    self.repo.merge_comparison_result(session)
+                self.assertEqual(before_refs, self.repo._local_refs())
+                self.assertEqual(before_source, (self.path / "shared.txt").read_bytes())
+        message = self.repo.abort_merge()
+        self.assertIn("已保留", message)
+        self.assertTrue(directory.is_dir())
+        self.assertFalse((self.repo.metadata_path / "merge.json").exists())
+
+    def test_damaged_merge_field_types_block_completion_and_keep_safe_cancel(self):
+        session, directory, _data = self.begin()
+        path = self.repo.metadata_path / "merge.json"
+        original = json.loads(path.read_text())
+        for key, value in (("local_refs", [1]), ("comparison_session", []), ("source_oid", 1),
+                           ("source", "../escape"), ("tool_closed", "yes"), ("output_signature", [])):
+            with self.subTest(key=key):
+                path.write_text(json.dumps({**original, key: value}))
+                self.assertFalse(self.repo.merge_state().ready)
+                with self.assertRaises(MODULE.GitError):
+                    self.repo.complete_merge()
+        self.repo.abort_merge()
+        self.assertEqual(self.refs_before, self.repo._local_refs())
+
 
 class MergeComparisonUITest(unittest.TestCase):
     def test_merge_preview_describes_manual_workflow(self):

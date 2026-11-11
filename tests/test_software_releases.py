@@ -102,7 +102,7 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
         if self.cancel.is_set():
             raise MODULE.UpdateCancelled('发布已取消。')
         if arguments[-1] == '--help':
-            return 0, b'--hostname --method --input --web --git-protocol --skip-ssh-key --verify-tag --draft --notes-file', b''
+            return 0, b'--hostname --method --input --header --public --private --web --git-protocol --skip-ssh-key --verify-tag --draft --notes-file', b''
         if arguments[:2] == ['auth', 'status']:
             return 0, b'', b''
         if arguments[:2] == ['release', 'create']:
@@ -110,8 +110,8 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
             record['name'] = arguments[arguments.index('--title') + 1]
             record['body'] = Path(arguments[arguments.index('--notes-file') + 1]).read_text()
             return 0, b'', b''
-        if arguments[:2] == ['release', 'upload']:
-            path = Path(arguments[3])
+        if arguments[0] == 'api' and '--input' in arguments and any(str(value).startswith('https://uploads.github.com/') for value in arguments):
+            path = Path(arguments[arguments.index('--input') + 1])
             if self.fail_upload == path.name:
                 return 1, b'', b'upload failed'
             record = next(item for item in self.records if item['tag_name'] == self.package.tag)
@@ -119,7 +119,7 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
             record['updated_at'] = str(int(record['updated_at']) + 1)
             if self.cancel_after_upload:
                 self.cancel.set()
-            return 0, b'', b''
+            return 0, json.dumps(record['assets'][-1]).encode(), b''
         if arguments[0] == 'api' and output is not None:
             asset_id = int(arguments[arguments.index('--method') + 2].rsplit('/', 1)[1])
             asset = next(asset for item in self.records for asset in item['assets'] if asset['id'] == asset_id)
@@ -310,9 +310,9 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
         draft.update(name='Old title', body='Old notes')
         result = self.publisher.publish(self.preview())
         self.assertTrue(result.confirmed)
-        uploads = [call for call in self.publisher.calls if call[:2] == ('release', 'upload')]
+        uploads = [call for call in self.publisher.calls if call[0] == 'api' and '--input' in call]
         self.assertEqual(1, len(uploads))
-        self.assertEqual(str(self.package.checksum_path), uploads[0][3])
+        self.assertEqual(str(self.package.checksum_path), uploads[0][uploads[0].index('--input') + 1])
         self.assertEqual('Notes', draft['body'])
 
     def test_hash_fallback_downloads_existing_asset(self):
@@ -385,7 +385,7 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
         original = self.publisher._run
         def run(arguments, **kwargs):
             result = original(arguments, **kwargs)
-            if arguments[:2] == ['release', 'upload']:
+            if arguments[0] == 'api' and '--input' in arguments and any(str(value).startswith('https://uploads.github.com/') for value in arguments):
                 self.publisher.tag_oid = 'c' * 40
             return result
         with mock.patch.object(self.publisher, '_run', side_effect=run):
@@ -491,12 +491,12 @@ class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
         self.assertEqual(4, len(publisher.records[0]['assets']))
         self.assertEqual('https://api.github.com/repos/lqxmb/p7_lane_editor/releases/latest',
                          publisher.public_request_url)
-        uploads = [call for call in publisher.calls if call[:2] == ('release', 'upload')]
+        uploads = [call for call in publisher.calls if call[0] == 'api' and '--input' in call]
         self.assertEqual(4, len(uploads))
-        self.assertTrue(all(call[-1] == 'github.com/lqxmb/p7_lane_editor' for call in uploads))
+        self.assertTrue(all(any(str(value).startswith('https://uploads.github.com/repos/lqxmb/p7_lane_editor/releases/12/assets?name=') for value in call) for call in uploads))
         expected = {'custom_editor-1.2.3-x86_64.deb', 'custom_editor-1.2.3-x86_64.deb.sha256',
                     'custom_editor-1.2.3-aarch64.deb', 'custom_editor-1.2.3-aarch64.deb.sha256'}
-        self.assertEqual(expected, {Path(call[3]).name for call in uploads})
+        self.assertEqual(expected, {Path(call[call.index('--input') + 1]).name for call in uploads})
         self.assertEqual(expected, {asset['name'] for asset in publisher.records[0]['assets']})
 
     def test_unicode_original_filename_publishes_and_missing_checksum_is_generated(self):
@@ -519,7 +519,7 @@ class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
         with self.assertRaisesRegex(MODULE.GitError, '额外附件'):
             self.preview()
         self.assertEqual(before, draft)
-        self.assertFalse(any(call[:2] == ('release', 'upload') for call in self.publisher.calls))
+        self.assertFalse(any(call[0] == 'api' and '--input' in call for call in self.publisher.calls))
 
     def test_batch_rejects_mixed_names_versions_duplicate_architectures_and_cleans_up(self):
         for other in (self.make_deb(name='different-package'), self.make_deb(version='0.4.11'), self.source):
@@ -650,7 +650,7 @@ class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
         original = self.publisher._run
         def run(arguments, **kwargs):
             result = original(arguments, **kwargs)
-            if arguments[:2] == ['release', 'upload']:
+            if arguments[0] == 'api' and '--input' in arguments and any(str(value).startswith('https://uploads.github.com/') for value in arguments):
                 self.publisher.private = True
             return result
         with mock.patch.object(self.publisher, '_run', side_effect=run):
