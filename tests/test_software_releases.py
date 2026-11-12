@@ -31,10 +31,13 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
         self.permission = True
         self.calls = []
         self.fail_upload = None
+        self.fail_delete_asset = None
         self.public_timeout = False
         self.public_no_effect = False
         self.cancel_after_upload = False
+        self.cancel_after_delete = False
         self.public_count = 0
+        self.deleted_asset_ids = []
         self.repository_id = 1
         self.private = False
         self.default_branch = 'main'
@@ -46,6 +49,13 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
         record = {'id': 12, 'tag_name': self.package.tag, 'draft': True, 'prerelease': False,
                   'name': 'Title', 'body': 'Notes', 'updated_at': '1', 'assets': list(assets)}
         self.records.append(record)
+        return record
+
+    def existing_release(self, *, draft=False, prerelease=False, assets=(), release_id=12):
+        record = self.draft(assets)
+        record['id'] = release_id
+        record['draft'] = draft
+        record['prerelease'] = prerelease
         return record
 
     def asset(self, path, number=20):
@@ -87,14 +97,26 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
             if 'draft' in payload:
                 self.public_count += 1
                 if not self.public_no_effect:
-                    record.update(draft=False, prerelease=False)
-                    self.latest_id = record['id']
+                    record.update(draft=payload['draft'], prerelease=payload['prerelease'],
+                                  name=payload['name'], body=payload['body'])
+                    if payload['make_latest'] == 'true':
+                        self.latest_id = record['id']
                 if self.public_timeout:
                     raise MODULE.GitError('GitHub 操作超时。')
-            else:
-                record.update(name=payload['name'], body=payload['body'])
             record['updated_at'] = str(int(record['updated_at']) + 1)
             return copy.deepcopy(record)
+        if method == 'DELETE' and '/releases/assets/' in path:
+            asset_id = int(path.rsplit('/', 1)[1])
+            if self.fail_delete_asset == asset_id:
+                raise MODULE.GitError('模拟附件删除失败。')
+            record = next(item for item in self.records
+                          if any(asset['id'] == asset_id for asset in item['assets']))
+            record['assets'] = [asset for asset in record['assets'] if asset['id'] != asset_id]
+            record['updated_at'] = str(int(record['updated_at']) + 1)
+            self.deleted_asset_ids.append(asset_id)
+            if self.cancel_after_delete:
+                self.cancel.set()
+            return None
         raise AssertionError((method, path, payload))
 
     def _run(self, arguments, data=None, output=None, timeout=120, raw_command=False):
@@ -130,7 +152,9 @@ class FakePublisher(MODULE.SoftwareReleasePublisher):
 
     def _verify_public_release(self, plan, state):
         self.public_reads += 1
-        record = copy.deepcopy(next(item for item in self.records if item['id'] == self.latest_id))
+        expected_id = (plan.existing_release.release_id if plan.existing_release is not None
+                       else self.latest_id)
+        record = copy.deepcopy(next(item for item in self.records if item['id'] == expected_id))
         for asset in record['assets']:
             asset['browser_download_url'] = (f'https://github.com/{self.repository}/releases/download/'
                 + MODULE.quote(plan.batch.tag, safe='') + '/' + MODULE.quote(asset['name'], safe=''))
@@ -265,7 +289,7 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
         plan = self.preview()
         self.assertEqual('a' * 40, plan.tag_oid)
         self.assertEqual('b' * 40, plan.commit_oid)
-        self.assertIsNone(plan.draft)
+        self.assertIsNone(plan.existing_release)
         self.publisher.missing_tag = True
         plan = self.preview()
         self.assertEqual('', plan.tag_oid)
@@ -275,15 +299,48 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
         with self.assertRaisesRegex(MODULE.GitError, '发布权限'):
             self.preview()
 
-    def test_public_or_duplicate_releases_rejected(self):
-        draft = self.publisher.draft()
-        draft['draft'] = False
-        with self.assertRaisesRegex(MODULE.GitError, '禁止覆盖'):
-            self.preview()
-        draft['draft'] = True
-        self.publisher.draft()
+    def test_existing_release_states_are_accepted_and_snapshotted(self):
+        for draft, prerelease in ((True, False), (False, True), (False, False)):
+            self.publisher.records = []
+            old = self.publisher.asset(self.package.path)
+            record = self.publisher.existing_release(draft=draft, prerelease=prerelease, assets=[old])
+            plan = self.preview()
+            self.assertEqual(record['id'], plan.existing_release.release_id)
+            self.assertEqual((draft, prerelease),
+                             (plan.existing_release.draft, plan.existing_release.prerelease))
+            self.assertEqual((old['id'],), tuple(asset.asset_id for asset in plan.existing_release.assets))
+
+    def test_duplicate_release_records_remain_rejected(self):
+        self.publisher.existing_release()
+        self.publisher.existing_release(release_id=13)
         with self.assertRaisesRegex(MODULE.GitError, '多份'):
             self.preview()
+
+    def test_same_tag_replacement_can_target_an_older_release_without_moving_latest(self):
+        old = self.publisher.existing_release(draft=False, assets=[self.publisher.asset(self.package.path)])
+        latest = self.publisher.existing_release(draft=False, release_id=99)
+        latest['tag_name'] = 'v0.4.11'
+        self.publisher.latest_id = latest['id']
+        plan = self.preview()
+        self.assertEqual(old['id'], plan.existing_release.release_id)
+        result = self.publisher.publish(plan)
+        self.assertTrue(result.confirmed, result.message)
+        self.assertEqual(99, self.publisher.latest_id)
+        self.assertTrue(self.publisher.public_request_url.endswith('/releases/tags/v0.4.10'))
+        final = next(item for item in self.publisher.records if item['id'] == old['id'])
+        self.assertFalse(final['draft'])
+        self.assertFalse(final['prerelease'])
+
+    def test_replacing_newer_prerelease_promotes_it_to_latest(self):
+        prerelease = self.publisher.existing_release(prerelease=True)
+        latest = self.publisher.existing_release(draft=False, release_id=99)
+        latest['tag_name'] = 'v0.4.9'
+        self.publisher.latest_id = latest['id']
+        plan = self.preview()
+        result = self.publisher.publish(plan)
+        self.assertTrue(result.confirmed, result.message)
+        self.assertEqual(prerelease['id'], self.publisher.latest_id)
+        self.assertTrue(self.publisher.public_request_url.endswith('/releases/tags/v0.4.10'))
 
     def test_version_must_be_higher_than_latest(self):
         latest = self.publisher.draft()
@@ -305,32 +362,127 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
         for call in self.publisher.calls:
             self.assertNotIn('--clobber', call)
 
-    def test_resume_draft_reuses_matching_assets_and_updates_notes(self):
-        draft = self.publisher.draft([self.publisher.asset(self.package.path)])
+    def test_replacement_removes_every_old_asset_for_all_release_states(self):
+        for state, draft, prerelease in (("draft", True, False), ("prerelease", False, True),
+                                         ("published", False, False)):
+            publisher = FakePublisher(self.package)
+            conflicting = publisher.asset(self.package.path, 101)
+            conflicting['digest'] = 'sha256:' + '0' * 64
+            extra_path = self.root / f'{state}-extra.bin'
+            extra_path.write_bytes(b'old attachment')
+            extra = publisher.asset(extra_path, 102)
+            record = publisher.existing_release(draft=draft, prerelease=prerelease,
+                                                assets=[conflicting, extra])
+            if state == 'published':
+                publisher.latest_id = record['id']
+            plan = publisher.preview(self.package, 'Replacement title', 'Replacement notes')
+            self.assertEqual({101, 102}, {asset.asset_id for asset in plan.existing_release.assets})
+            result = publisher.publish(plan)
+            self.assertTrue(result.confirmed, result.message)
+            final = publisher.records[0]
+            self.assertEqual({path.name for path in publisher.package.assets},
+                             {asset['name'] for asset in final['assets']})
+            self.assertEqual({101, 102}, set(publisher.deleted_asset_ids))
+            self.assertEqual('Replacement title', final['name'])
+            self.assertEqual('Replacement notes', final['body'])
+            self.assertFalse(final['draft'])
+            self.assertFalse(final['prerelease'])
+
+    def test_replacement_delete_failure_reports_confirmed_remaining_assets(self):
+        first = self.publisher.asset(self.package.path, 101)
+        extra_path = self.root / 'z-extra.bin'
+        extra_path.write_bytes(b'old attachment')
+        second = self.publisher.asset(extra_path, 102)
+        record = self.publisher.existing_release(draft=False, assets=[first, second])
+        self.publisher.latest_id = record['id']
+        self.publisher.fail_delete_asset = second['id']
+        with self.assertRaisesRegex(MODULE.GitError, '最后确认剩余附件') as raised:
+            self.publisher.publish(self.preview())
+        self.assertIn(second['name'], str(raised.exception))
+        self.assertIn(record['tag_name'], str(raised.exception))
+        self.assertEqual([first['id']], self.publisher.deleted_asset_ids)
+        self.assertEqual([second['name']], [asset['name'] for asset in record['assets']])
+
+    def test_replacement_cancellation_after_delete_reports_partial_state(self):
+        first = self.publisher.asset(self.package.path, 101)
+        extra_path = self.root / 'z-extra.bin'
+        extra_path.write_bytes(b'old attachment')
+        second = self.publisher.asset(extra_path, 102)
+        record = self.publisher.existing_release(draft=False, assets=[first, second])
+        self.publisher.latest_id = record['id']
+        self.publisher.cancel_after_delete = True
+        with self.assertRaisesRegex(MODULE.GitError, '最后确认剩余附件') as raised:
+            self.publisher.publish(self.preview())
+        self.assertIn(second['name'], str(raised.exception))
+        self.assertEqual([second['name']], [asset['name'] for asset in record['assets']])
+
+    def test_replacement_stops_before_next_delete_when_tag_changes(self):
+        first = self.publisher.asset(self.package.path, 101)
+        second = self.publisher.asset(self.package.checksum_path, 102)
+        record = self.publisher.existing_release(draft=False, assets=[first, second])
+        self.publisher.latest_id = record['id']
+        plan = self.preview()
+        original = self.publisher._api
+
+        def api(method, path, **kwargs):
+            response = original(method, path, **kwargs)
+            if method == 'DELETE':
+                self.publisher.tag_oid = 'c' * 40
+            return response
+
+        with mock.patch.object(self.publisher, '_api', side_effect=api):
+            with self.assertRaisesRegex(MODULE.GitError, '远程标签发生变化'):
+                self.publisher.publish(plan)
+        self.assertEqual([first['id']], self.publisher.deleted_asset_ids)
+        self.assertEqual([second['id']], [asset['id'] for asset in record['assets']])
+        self.assertEqual(0, self.publisher.public_count)
+
+    def test_replacement_upload_failure_is_retryable_and_reports_new_assets(self):
+        old = self.publisher.asset(self.package.path, 101)
+        record = self.publisher.existing_release(draft=False, assets=[old])
+        self.publisher.latest_id = record['id']
+        self.publisher.fail_upload = self.package.checksum_path.name
+        with self.assertRaisesRegex(MODULE.GitError, '最后确认剩余附件') as raised:
+            self.publisher.publish(self.preview())
+        self.assertIn(self.package.path.name, str(raised.exception))
+        self.assertEqual([self.package.path.name], [asset['name'] for asset in record['assets']])
+        self.assertEqual(0, self.publisher.public_count)
+        self.publisher.fail_upload = None
+        result = self.publisher.publish(self.preview())
+        self.assertTrue(result.confirmed, result.message)
+        self.assertEqual({path.name for path in self.package.assets},
+                         {asset['name'] for asset in record['assets']})
+
+    def test_replace_draft_reuploads_selected_assets_and_updates_notes(self):
+        old_asset = self.publisher.asset(self.package.path)
+        draft = self.publisher.draft([old_asset])
         draft.update(name='Old title', body='Old notes')
         result = self.publisher.publish(self.preview())
         self.assertTrue(result.confirmed)
         uploads = [call for call in self.publisher.calls if call[0] == 'api' and '--input' in call]
-        self.assertEqual(1, len(uploads))
-        self.assertEqual(str(self.package.checksum_path), uploads[0][uploads[0].index('--input') + 1])
+        self.assertEqual(2, len(uploads))
+        self.assertEqual({path.name for path in self.package.assets},
+                         {Path(call[call.index('--input') + 1]).name for call in uploads})
+        self.assertEqual([old_asset['id']], self.publisher.deleted_asset_ids)
         self.assertEqual('Notes', draft['body'])
 
-    def test_hash_fallback_downloads_existing_asset(self):
+    def test_replacement_does_not_download_old_assets_before_deletion(self):
         asset = self.publisher.asset(self.package.path)
         asset['digest'] = None
         self.publisher.draft([asset])
-        self.assertIsNotNone(self.preview().draft)
-        self.assertTrue(any(call[0] == 'api' for call in self.publisher.calls))
+        self.assertIsNotNone(self.preview().existing_release)
+        self.assertFalse(any(call[0] == 'api' and 'releases/assets/' in str(call)
+                             for call in self.publisher.calls))
 
-    def test_extra_conflicting_duplicate_unfinished_assets_stop(self):
+    def test_replacement_accepts_conflicting_or_extra_assets_but_duplicate_asset_ids_stop(self):
         for changes in ({'name': 'extra.zip'}, {'digest': 'sha256:' + '0' * 64},
                         {'state': 'starter'}, {'size': 1}):
             self.publisher.records = []
             asset = self.publisher.asset(self.package.path)
             asset.update(changes)
-            self.publisher.draft([asset])
-            with self.assertRaises(MODULE.GitError):
-                self.preview()
+            existing = self.publisher.draft([asset])
+            plan = self.preview()
+            self.assertEqual(existing['id'], plan.existing_release.release_id)
         self.publisher.records = []
         asset = self.publisher.asset(self.package.path)
         self.publisher.draft([asset, copy.deepcopy(asset)])
@@ -352,6 +504,16 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
             with self.assertRaisesRegex(MODULE.GitError, '确认后'):
                 publisher.publish(plan)
             self.assertFalse(any(call[:2] == ('release', 'create') and '--help' not in call for call in publisher.calls))
+
+    def test_existing_release_change_after_confirmation_blocks_all_writes(self):
+        old = self.publisher.asset(self.package.path)
+        record = self.publisher.draft([old])
+        plan = self.preview()
+        record['body'] = 'concurrent edit'
+        with self.assertRaisesRegex(MODULE.GitError, '确认后'):
+            self.publisher.publish(plan)
+        self.assertEqual([], self.publisher.deleted_asset_ids)
+        self.assertFalse(any(call[0] == 'api' and '--input' in call for call in self.publisher.calls))
 
     def test_upload_failure_and_cancellation_leave_draft_unpublished(self):
         for cancel in (False, True):
@@ -380,7 +542,7 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
             self.publisher.publish(plan)
         self.assertEqual([], self.publisher.records)
 
-    def test_tag_changes_during_upload_preserve_complete_unpublished_draft(self):
+    def test_tag_changes_during_upload_stop_before_next_attachment(self):
         plan = self.preview()
         original = self.publisher._run
         def run(arguments, **kwargs):
@@ -392,7 +554,7 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
             with self.assertRaisesRegex(MODULE.GitError, '上传期间远程标签'):
                 self.publisher.publish(plan)
         self.assertTrue(self.publisher.records[0]['draft'])
-        self.assertEqual(2, len(self.publisher.records[0]['assets']))
+        self.assertEqual(1, len(self.publisher.records[0]['assets']))
         self.assertEqual(0, self.publisher.public_count)
 
     def test_current_workspace_and_user_config_are_unchanged(self):
@@ -420,6 +582,8 @@ class SoftwareReleaseBackendTest(ReleaseFixtures, unittest.TestCase):
         result = self.publisher.publish(self.preview())
         self.assertFalse(result.confirmed)
         self.assertIn('待确认', result.message)
+        self.assertIn('最后确认的附件', result.message)
+        self.assertIn(self.package.path.name, result.message)
         self.assertEqual(1, self.publisher.public_count)
         self.publisher = FakePublisher(self.package)
         with mock.patch.object(self.publisher, '_verify_public_release', side_effect=MODULE.GitError('匿名接口未显示版本')):
@@ -499,6 +663,22 @@ class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
         self.assertEqual(expected, {Path(call[call.index('--input') + 1]).name for call in uploads})
         self.assertEqual(expected, {asset['name'] for asset in publisher.records[0]['assets']})
 
+    def test_multiarchitecture_replacement_replaces_the_full_asset_set(self):
+        batch = self.batch()
+        publisher = FakePublisher(batch, 'lqxmb/p7_lane_editor')
+        legacy_path = self.root / 'legacy-package.bin'
+        legacy_path.write_bytes(b'legacy')
+        legacy = publisher.asset(legacy_path, 50)
+        release = publisher.existing_release(draft=False, assets=[legacy])
+        publisher.latest_id = release['id']
+        result = publisher.publish(publisher.preview(batch, 'Title', 'Notes'))
+        self.assertTrue(result.confirmed, result.message)
+        expected = {path.name for path in batch.assets}
+        self.assertEqual(expected, {asset['name'] for asset in release['assets']})
+        self.assertEqual([legacy['id']], publisher.deleted_asset_ids)
+        self.assertEqual(4, len([call for call in publisher.calls
+                                if call[0] == 'api' and '--input' in call]))
+
     def test_unicode_original_filename_publishes_and_missing_checksum_is_generated(self):
         source = self.source.rename(self.source.with_name('发布包_0.4.10.deb'))
         batch = MODULE.prepare_software_release_batch([source], threading.Event())
@@ -511,15 +691,15 @@ class GeneralSoftwareReleaseTest(ReleaseFixtures, unittest.TestCase):
         self.assertEqual(package.sha256 + '  ' + source.name + '\n',
                          package.checksum_path.read_text(encoding='utf-8'))
 
-    def test_old_renamed_draft_is_rejected_without_upload_or_replacement(self):
+    def test_old_renamed_draft_is_replaced_with_current_original_names(self):
         asset = self.publisher.asset(self.package.path)
         asset['name'] = f'{self.package.name}_{self.package.version}_{self.package.architecture}.deb'
         draft = self.publisher.draft([asset])
-        before = copy.deepcopy(draft)
-        with self.assertRaisesRegex(MODULE.GitError, '额外附件'):
-            self.preview()
-        self.assertEqual(before, draft)
-        self.assertFalse(any(call[0] == 'api' and '--input' in call for call in self.publisher.calls))
+        result = self.publisher.publish(self.preview())
+        self.assertTrue(result.confirmed, result.message)
+        self.assertEqual({path.name for path in self.package.assets},
+                         {asset['name'] for asset in draft['assets']})
+        self.assertEqual([asset['id']], self.publisher.deleted_asset_ids)
 
     def test_batch_rejects_mixed_names_versions_duplicate_architectures_and_cleans_up(self):
         for other in (self.make_deb(name='different-package'), self.make_deb(version='0.4.11'), self.source):
@@ -888,6 +1068,26 @@ class SoftwareReleaseUiTest(ReleaseFixtures, unittest.TestCase):
         worker.assert_not_called()
         self.assertFalse(self.dialog.busy)
 
+    def test_replacement_confirmation_lists_every_old_attachment_and_warning(self):
+        old = self.publisher.asset(self.package.path, 101)
+        extra_path = self.root / 'legacy-extra.bin'
+        extra_path.write_bytes(b'legacy')
+        extra = self.publisher.asset(extra_path, 102)
+        self.publisher.existing_release(draft=False, assets=[old, extra])
+        plan = self.preview()
+        self.dialog.batch = plan.batch
+        self.dialog.busy = True
+        with mock.patch.object(MODULE.Gtk, 'MessageDialog') as confirmation, \
+                mock.patch.object(self.dialog, '_worker') as worker:
+            confirmation.return_value.run.return_value = MODULE.Gtk.ResponseType.CANCEL
+            self.dialog._preview_ready(plan, '')
+        text = confirmation.return_value.format_secondary_text.call_args.args[0]
+        self.assertIn('将整版替换已有正式版', text)
+        self.assertIn(old['name'], text)
+        self.assertIn(extra['name'], text)
+        self.assertIn('可能暂时缺少部分附件', text)
+        worker.assert_not_called()
+
     def test_completion_and_error_recovery_and_web_link(self):
         self.dialog._published(MODULE.SoftwareReleaseResult('https://github.com/lqxmb/code-version-manager/releases/tag/v0.4.10', False, '公开结果待确认'), '')
         self.assertIn('核对', self.dialog.link.get_label())
@@ -1123,6 +1323,13 @@ class SoftwareReleaseProcessTest(unittest.TestCase):
         self.assertIn('--input', record['args'])
         with self.assertRaisesRegex(MODULE.GitError, '其他发布目标'):
             self.publisher._api('POST', 'repos/other/project/releases', payload)
+
+    def test_delete_asset_api_accepts_empty_204_response(self):
+        path = self.publisher.api_path + '/releases/assets/42'
+        with mock.patch.object(self.publisher, '_run', return_value=(0, b'', b'')) as run:
+            self.assertIsNone(self.publisher._api('DELETE', path))
+        self.assertIn('DELETE', run.call_args.args[0])
+        self.assertIn(path, run.call_args.args[0])
 
     def test_missing_refs_in_empty_repository_allow_http_409_only_for_ref_reads(self):
         with mock.patch.object(self.publisher, '_run', return_value=(1, b'', b'HTTP 409 repository empty')):

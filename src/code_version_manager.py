@@ -991,8 +991,9 @@ class SoftwareReleasePlan:
     notes: str
     tag_oid: str
     commit_oid: str
-    draft: Optional[SoftwareReleaseState]
+    existing_release: Optional[SoftwareReleaseState]
     latest: Optional[SoftwareReleaseState]
+    make_latest: bool = True
 
 
 @dataclass(frozen=True)
@@ -1213,6 +1214,9 @@ class SoftwareReleasePublisher:
             if re.search(r"HTTP (401|403)\b", message):
                 raise GitError("GitHub 登录已失效、账号无发布权限或请求受到限制，请核对登录和仓库权限。")
             raise GitError("GitHub 请求失败，请检查网络和权限后重试。")
+        if method == "DELETE" and not stdout.strip():
+            # GitHub returns an empty 204 response when deleting a release asset.
+            return None
         try:
             return json.loads(stdout.decode("utf-8"))
         except (ValueError, UnicodeError) as error:
@@ -1332,15 +1336,15 @@ class SoftwareReleasePublisher:
              "--header", "Accept: application/vnd.github+json",
              "--header", "Content-Type: application/octet-stream", "--input", str(path)], timeout=900)
         if code:
-            raise GitError("附件上传失败，已上传的附件保留在草稿中。")
+            raise GitError("附件上传失败，已完成的远程发行修改会保留。")
         try:
             asset = self._asset(json.loads(stdout.decode("utf-8")))
         except (ValueError, UnicodeError) as error:
-            raise GitError("无法解析附件上传结果，请打开草稿核对。") from error
+            raise GitError("无法解析附件上传结果，请打开 Release 核对。") from error
         if asset.name != path.name:
-            raise GitError(f"GitHub 返回的附件名称与原名不一致：预期 {path.name!r}，实际 {asset.name!r}。草稿已保留。")
+            raise GitError(f"GitHub 返回的附件名称与原名不一致：预期 {path.name!r}，实际 {asset.name!r}。")
         if asset.state != "uploaded" or asset.size != path.stat().st_size:
-            raise GitError("附件上传结果的状态或大小不一致，草稿已保留。")
+            raise GitError("附件上传结果的状态或大小不一致。")
         return asset
 
     def _find(self, tag: str) -> Optional[SoftwareReleaseState]:
@@ -1430,7 +1434,7 @@ class SoftwareReleasePublisher:
         files = {path.name: path for path in batch.assets}
         names = [asset.name for asset in state.assets]
         if len(set(names)) != len(names) or set(names) - set(files) or (complete and set(names) != set(files)):
-            raise GitError("草稿附件不完整、重复或有额外附件，请到网页处理后重试。\n" + state.url)
+            raise GitError("Release 附件不完整、重复或有额外附件，请到网页处理后重试。\n" + state.url)
         for asset in state.assets:
             path = files[asset.name]
             expected = _release_file_hash(path)
@@ -1445,14 +1449,14 @@ class SoftwareReleasePublisher:
                          f"{self.api_path}/releases/assets/{asset.asset_id}",
                          "--header", "Accept: application/octet-stream"], output=output, timeout=900)
                     if code or output.tell() != asset.size:
-                        raise GitError("无法校验草稿中的已有附件，请重试。")
+                        raise GitError("无法校验 Release 中的附件，请重试。")
                     output.seek(0)
                     digest = hashlib.sha256()
                     for block in iter(lambda: output.read(1024 * 1024), b""):
                         digest.update(block)
                     actual = "sha256:" + digest.hexdigest()
             if actual != "sha256:" + expected:
-                raise GitError("同名附件内容不一致，禁止覆盖；请到网页处理。\n" + state.url)
+                raise GitError("同名附件内容不一致，请到网页处理。\n" + state.url)
 
     def preview(self, batch: SoftwareReleaseBatch, title: str, notes: str) -> SoftwareReleasePlan:
         if isinstance(batch, SoftwareReleasePackage):
@@ -1466,22 +1470,55 @@ class SoftwareReleasePublisher:
         self._verify_package(batch)
         tag_oid, commit_oid = self._tag(batch.tag)
         target = self._target(needs_branch=not tag_oid)
-        draft = self._find(batch.tag)
-        if draft is not None and (not draft.draft or draft.prerelease):
-            raise GitError("该版本已公开或标为预发布，禁止覆盖。\n" + draft.url)
+        existing_release = self._find(batch.tag)
+        if existing_release is not None and not tag_oid:
+            raise GitError("已有 Release 对应的 Git 标签不存在，无法安全覆盖。\n" + existing_release.url)
         latest = self._latest()
+        make_latest = True
         if latest is not None:
-            if not latest.tag.startswith("v") or not application_version_is_newer(batch.version, latest.tag[1:]):
+            newer_than_latest = (latest.tag.startswith("v")
+                                 and application_version_is_newer(batch.version, latest.tag[1:]))
+            if not latest.tag.startswith("v") or (existing_release is None and not newer_than_latest):
                 raise GitError("正式新版必须高于 GitHub 当前最新正式发行版。")
-        if draft is not None:
-            self._verify_assets(draft, batch)
-        return SoftwareReleasePlan(batch, target, title, notes, tag_oid, commit_oid, draft, latest)
+            if existing_release is not None and existing_release.release_id != latest.release_id:
+                make_latest = newer_than_latest
+        return SoftwareReleasePlan(batch, target, title, notes, tag_oid, commit_oid,
+                                   existing_release, latest, make_latest)
 
     def _unchanged(self, expected: SoftwareReleaseState) -> SoftwareReleaseState:
         current = self._find(expected.tag)
-        if current != expected or not current.draft:
-            raise GitError("确认后草稿或附件发生变化，请重新检查。")
+        if current != expected:
+            raise GitError("确认后 Release 或附件发生变化，请重新检查。")
         return current
+
+    @staticmethod
+    def _replacement_is_latest(plan: SoftwareReleasePlan) -> bool:
+        return bool(plan.existing_release and plan.latest
+                    and plan.existing_release.release_id == plan.latest.release_id)
+
+    def _assert_release_snapshot(self, plan: SoftwareReleasePlan,
+                                 expected: SoftwareReleaseState) -> SoftwareReleaseState:
+        self._assert_target(plan.target)
+        current = self._unchanged(expected)
+        if self._tag(plan.batch.tag) != (plan.tag_oid, plan.commit_oid):
+            raise GitError("确认后远程标签发生变化，请重新检查。")
+        latest = self._latest()
+        expected_latest = current if self._replacement_is_latest(plan) else plan.latest
+        if latest != expected_latest:
+            raise GitError("确认后最新正式发行版发生变化，请重新检查。")
+        return current
+
+    def _expected_latest_after_publish(self, plan: SoftwareReleasePlan,
+                                       state: SoftwareReleaseState) -> Optional[SoftwareReleaseState]:
+        if plan.make_latest:
+            return state
+        return plan.latest
+
+    def _make_latest_value(self, plan: SoftwareReleasePlan) -> str:
+        return "true" if plan.make_latest else "false"
+
+    def _delete_asset(self, asset: SoftwareReleaseAsset) -> None:
+        self._api("DELETE", f"{self.api_path}/releases/assets/{asset.asset_id}")
 
     def _assert_target(self, target: SoftwareReleaseTarget, needs_branch: bool = False) -> None:
         expected = target if needs_branch else replace(target, branch_oid="")
@@ -1511,7 +1548,12 @@ class SoftwareReleasePublisher:
         return oid
 
     def _verify_public_release(self, plan: SoftwareReleasePlan, state: SoftwareReleaseState) -> None:
-        url = f"https://api.github.com/{self.api_path}/releases/latest"
+        releases_path = self.api_path + "/releases"
+        if plan.existing_release is not None:
+            releases_path += "/tags/" + quote(plan.batch.tag, safe="")
+        else:
+            releases_path += "/latest"
+        url = f"https://api.github.com/{releases_path}"
 
         class ReleaseRedirectHandler(HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -1528,7 +1570,7 @@ class SoftwareReleasePublisher:
         try:
             record = json.loads(raw.decode("utf-8"))
             if self._state(record) != state:
-                raise GitError("匿名更新接口尚未显示确认的正式发行。")
+                raise GitError("匿名发行接口尚未显示确认的 Release。")
             files = {path.name: path for path in plan.batch.assets}
             for asset in record["assets"]:
                 expected_url = (f"https://github.com/{self.repository}/releases/download/"
@@ -1541,15 +1583,16 @@ class SoftwareReleasePublisher:
 
     def publish(self, plan: SoftwareReleasePlan) -> SoftwareReleaseResult:
         batch = plan.batch
-        current = plan.draft
+        current = plan.existing_release
         public_request = False
+        destructive_started = False
         stage = "重新检查发布确认"
         prepared = []
         tag_oid, commit_oid = plan.tag_oid, plan.commit_oid
         try:
             if (plan.target.repository.lower() != self.repository.lower()
                     or self.preview(batch, plan.title, plan.notes) != plan):
-                raise GitError("确认后目标、标签、草稿或最新发行版发生变化，请重新检查。")
+                raise GitError("确认后目标、标签、Release 或最新发行版发生变化，请重新检查。")
             if not tag_oid:
                 commit_oid = plan.target.branch_oid
                 if not commit_oid:
@@ -1582,65 +1625,111 @@ class SoftwareReleasePublisher:
                     raise GitError("未确认新草稿创建成功。")
                 if current.title != plan.title or current.notes != plan.notes or current.prerelease or current.assets:
                     raise GitError("新草稿与确认信息不一致，请重新检查。")
-            elif current.title != plan.title or current.notes != plan.notes:
-                self._unchanged(current)
-                changed = self._state(self._api("PATCH", f"{self.api_path}/releases/{current.release_id}",
-                                                {"name": plan.title, "body": plan.notes}))
-                if (not changed.draft or changed.prerelease or changed.tag != batch.tag
-                        or changed.release_id != current.release_id or changed.assets != current.assets
-                        or changed.title != plan.title or changed.notes != plan.notes):
-                    raise GitError("草稿状态发生变化，已停止发布。")
-                current = changed
+            else:
+                stage = "删除已有 Release 附件"
+                old_assets = current.assets
+                for position, asset in enumerate(old_assets):
+                    self._verify_package(batch)
+                    current = self._assert_release_snapshot(plan, current)
+                    if asset not in current.assets:
+                        raise GitError("确认后旧附件发生变化，请重新检查。")
+                    stage = f"删除旧附件 {position + 1}/{len(old_assets)}：{asset.name}"
+                    self.progress(stage, 0.2 + position * 0.08 / max(1, len(old_assets)))
+                    destructive_started = True
+                    self._delete_asset(asset)
+                    fresh = self._find(batch.tag)
+                    expected_assets = tuple(item for item in current.assets if item.asset_id != asset.asset_id)
+                    if (fresh is None or fresh.release_id != current.release_id or fresh.tag != batch.tag
+                            or fresh.draft != current.draft or fresh.prerelease != current.prerelease
+                            or fresh.title != current.title or fresh.notes != current.notes
+                            or fresh.assets != expected_assets):
+                        raise GitError("删除附件后 Release 状态与预期不一致，请打开网页核对。")
+                    current = fresh
+
+            def recheck_before_mutation():
+                nonlocal current
+                if plan.existing_release is not None:
+                    current = self._assert_release_snapshot(plan, current)
+                else:
+                    self._assert_target(plan.target)
+                    current = self._unchanged(current)
+                    if (self._tag(batch.tag) != (tag_oid, commit_oid)
+                            or self._latest() != plan.latest):
+                        raise GitError("上传期间远程标签或最新发行版发生变化，请重新检查。")
+
             for position, path in enumerate(batch.assets):
                 self._verify_package(batch)
-                self._unchanged(current)
+                recheck_before_mutation()
                 fraction = 0.3 + position * 0.5 / len(batch.assets)
-                if any(asset.name == path.name for asset in current.assets):
-                    self.progress(f"复用已校验附件 {position + 1}/{len(batch.assets)}：{path.name}", fraction)
-                    continue
                 stage = f"上传附件 {position + 1}/{len(batch.assets)}：{path.name}"
                 self.progress(stage, fraction)
-                self._assert_target(plan.target)
+                destructive_started = True
                 uploaded = self._upload_asset(current, path)
                 fresh = self._find(batch.tag)
-                if (fresh is None or not fresh.draft or fresh.release_id != current.release_id
-                        or fresh.title != plan.title or fresh.notes != plan.notes or fresh.prerelease
-                        or tuple(asset for asset in fresh.assets if asset.name != path.name) != current.assets):
-                    raise GitError("上传期间草稿发生其他变化，请重新检查。")
+                if (fresh is None or fresh.release_id != current.release_id or fresh.tag != batch.tag
+                        or fresh.draft != current.draft or fresh.prerelease != current.prerelease
+                        or fresh.title != current.title or fresh.notes != current.notes
+                        or tuple(asset for asset in fresh.assets
+                                 if asset.asset_id != uploaded.asset_id) != current.assets):
+                    raise GitError("上传期间 Release 发生其他变化，请重新检查。")
                 if not any((asset.asset_id, asset.name, asset.size, asset.state)
                            == (uploaded.asset_id, uploaded.name, uploaded.size, uploaded.state) for asset in fresh.assets):
-                    raise GitError("草稿附件与上传返回结果不一致，请打开草稿核对。")
+                    raise GitError("Release 附件与上传返回结果不一致，请打开网页核对。")
                 self._verify_assets(fresh, batch)
                 current = fresh
-            stage = "校验完整草稿"
+            stage = "校验完整 Release 附件"
             self.progress(stage, 0.85)
-            self._unchanged(current)
+            recheck_before_mutation()
             self._verify_package(batch)
             self._verify_assets(current, batch, complete=True)
-            if self._tag(batch.tag) != (tag_oid, commit_oid) or self._latest() != plan.latest:
-                raise GitError("上传期间远程标签或最新发行版发生变化，请重新检查。")
             if self._target(False) != replace(plan.target, branch_oid=""):
                 raise GitError("上传期间目标仓库或可见性发生变化，请重新检查。")
-            self._unchanged(current)
+            if plan.existing_release is None:
+                if self._tag(batch.tag) != (tag_oid, commit_oid) or self._latest() != plan.latest:
+                    raise GitError("上传期间远程标签或最新发行版发生变化，请重新检查。")
+            else:
+                current = self._assert_release_snapshot(plan, current)
             if self.cancel.is_set():
                 raise UpdateCancelled("发布已取消。")
             stage = "发布正式 Release"
             self.progress(stage, 0.95)
             public_request = True
             self._api("PATCH", f"{self.api_path}/releases/{current.release_id}",
-                      {"draft": False, "prerelease": False, "make_latest": "true"})
+                      {"draft": False, "prerelease": False, "name": plan.title, "body": plan.notes,
+                       "make_latest": self._make_latest_value(plan)})
         except Exception as error:
             if not public_request:
-                known_assets = "、".join(asset.name for asset in current.assets) if current else "尚未确认"
-                draft_url = current.url if current else self.web_url
+                state_confirmed = bool(current)
+                if destructive_started and current is not None:
+                    old_cancel = self.cancel
+                    self.cancel = threading.Event()
+                    try:
+                        observed = self._find(batch.tag)
+                        if observed is not None and observed.release_id == current.release_id:
+                            current = observed
+                            state_confirmed = True
+                        else:
+                            state_confirmed = False
+                    except Exception:
+                        state_confirmed = False
+                    finally:
+                        self.cancel = old_cancel
+                known_assets = "、".join(asset.name for asset in current.assets) if current else "无法确认"
+                release_url = current.url if current else self.web_url
+                if plan.existing_release is not None:
+                    remaining = f"\n最后确认剩余附件：{known_assets or '无'}。" if state_confirmed else "\n当前远程附件状态无法确认。"
+                    raise GitError(f"{error}\n已执行到：{stage}。{remaining}\n"
+                                   "已有 Release 可能已部分替换；打开网页核对后可再次检查并发布。\n"
+                                   f"{release_url}") from error
                 raise GitError(f"{error}\n已执行到：{stage}。\n已确认的附件：{known_assets or '无'}。\n"
                                + "\n".join(prepared) + "\n初始化、标签和草稿若已创建将保留；"
-                               f"打开网页核对后可继续同版本草稿：{draft_url}") from error
+                               f"打开网页核对后可继续同版本草稿：{release_url}") from error
         # Once the publish request has been sent, never retry it. Cancellation
         # cannot determine its outcome, so reconcile using fresh read requests.
         old_cancel = self.cancel
         self.cancel = threading.Event()
         url = self.web_url + "/tag/" + quote(batch.tag, safe="")
+        state = None
         try:
             state = self._find(batch.tag)
             if state is not None:
@@ -1650,9 +1739,10 @@ class SoftwareReleasePublisher:
                 raise GitError("尚未确认正式发行状态。")
             self._verify_assets(state, batch, complete=True)
             latest = self._latest()
-            if (latest != state or self._tag(batch.tag) != (tag_oid, commit_oid)
+            if (latest != self._expected_latest_after_publish(plan, state)
+                    or self._tag(batch.tag) != (tag_oid, commit_oid)
                     or self._target(False) != replace(plan.target, branch_oid="")):
-                raise GitError("最新正式发行接口或标签尚未确认。")
+                raise GitError("正式发行状态、latest 指针或标签尚未确认。")
             if not plan.target.private:
                 self._verify_public_release(plan, state)
             self.progress("发布完成", 1.0)
@@ -1660,7 +1750,13 @@ class SoftwareReleasePublisher:
                           else "匿名更新接口已确认。")
             return SoftwareReleaseResult(url, True, "正式 Release 已发布，全部附件已校验。" + visibility)
         except Exception as error:
-            return SoftwareReleaseResult(url, False, f"发布结果待确认：{error} 请先打开网页核对，不要重复发布。")
+            observed = state or current
+            if observed is not None:
+                url = observed.url
+            known_assets = "、".join(asset.name for asset in observed.assets) if observed else "无法确认"
+            return SoftwareReleaseResult(
+                url, False, f"发布结果待确认：{error}\n已执行到：{stage}。\n"
+                f"最后确认的附件：{known_assets or '无'}。请先打开 Release 核对，不要重复发布。")
         finally:
             self.cancel = old_cancel
 
@@ -6388,7 +6484,7 @@ class SoftwareReleaseDialog(Gtk.Dialog):
         if self.busy:
             if response in (Gtk.ResponseType.CLOSE, Gtk.ResponseType.DELETE_EVENT, Gtk.ResponseType.CANCEL):
                 self.cancel.set()
-                self._message("正在停止操作；仓库、初始化、标签和草稿若已创建将保留，创建或发布请求若已发出将先核实结果。")
+                self._message("正在停止操作；若整版替换已开始，部分附件修改会保留；已发出的发布请求将先核实结果。")
                 self._sensitivity()
             return
         if response == Gtk.ResponseType.OK and self.batch is not None:
@@ -6401,7 +6497,7 @@ class SoftwareReleaseDialog(Gtk.Dialog):
             buffer = self.notes.get_buffer()
             notes = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
             batch, title = self.batch, self.title_entry.get_text()
-            self._message("正在检查远程标签、草稿、权限和最新正式版…")
+            self._message("正在检查远程标签、已有 Release、权限和最新正式版…")
             self._worker(lambda cancel: SoftwareReleasePublisher(repository, cancel, self._progress)
                          .preview(batch, title, notes), self._preview_ready)
         elif response != Gtk.ResponseType.CANCEL:
@@ -6424,12 +6520,30 @@ class SoftwareReleaseDialog(Gtk.Dialog):
                 setup += "将初始化空仓库，仅创建发行 README 和初始提交。\n"
             setup += (f"将创建标签 {batch.tag}，目标："
                       + (plan.target.branch_oid or "新建的初始提交") + "。\n")
+        if plan.existing_release is not None:
+            existing = plan.existing_release
+            release_kind = "草稿" if existing.draft else ("预发布版" if existing.prerelease else "正式版")
+            old_assets = "\n".join(
+                f"  {asset.name}（{format_storage_size(asset.size)}）" for asset in existing.assets
+            ) or "  （无附件）"
+            existing_summary = (f"将整版替换已有{release_kind}：{existing.url}\n"
+                                "以下现有附件都会删除，再上传本次所选附件：\n"
+                                f"{old_assets}\n"
+                                "随后使用以下标题和更新说明发布为正式版。\n"
+                                "替换期间 Release 可能暂时缺少部分附件；失败或取消后请打开网页核对。\n")
+            if plan.latest is not None and not plan.make_latest:
+                existing_summary += (f"该版本低于当前最新正式版 {plan.latest.tag}，"
+                                     "替换后不会改变 latest。\n")
+            confirmation_title = "确认整版替换并发布软件到 GitHub？"
+        else:
+            existing_summary = "将创建新草稿，附件齐全后发布正式版。\n"
+            confirmation_title = "确认发布软件到 GitHub？"
         confirmation = Gtk.MessageDialog(transient_for=self, modal=True, buttons=Gtk.ButtonsType.OK_CANCEL,
-                                         message_type=Gtk.MessageType.QUESTION, text="确认发布软件到 GitHub？")
+                                         message_type=Gtk.MessageType.QUESTION, text=confirmation_title)
         confirmation.format_secondary_text(
             f"目标：{plan.target.repository}\n{visibility}\n版本：{batch.tag}\n"
             + (f"标签对象：{plan.tag_oid}\n代码提交：{plan.commit_oid}\n" if plan.tag_oid else setup)
-            + ("将继续已有草稿：" + plan.draft.url + "\n" if plan.draft else "将创建新草稿，附件齐全后发布正式版。\n")
+            + existing_summary
             + "附件：\n" + "\n".join(f"{path.name}（{format_storage_size(path.stat().st_size)}）"
                                         for path in batch.assets) + "\n"
             + f"标题：{plan.title}\n\n{plan.notes}")
